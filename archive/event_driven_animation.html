@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>UAV Inspection Flight - Navigation</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    
+    <style>
+    #nav-panel {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        background: rgba(255,255,255,0.95);
+        border: 2px solid #4CAF50;
+        border-radius: 8px;
+        padding: 15px;
+        z-index: 1000;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        min-width: 200px;
+        font-family: Arial, sans-serif;
+    }
+    #nav-panel h3 {
+        margin: 0 0 5px 0;
+        color: #333;
+        font-size: 16px;
+        text-align: center;
+    }
+    #nav-panel .input-row {
+        margin: 8px 0;
+    }
+    #nav-panel label {
+        display: inline-block;
+        width: 25px;
+        font-weight: bold;
+        color: #555;
+    }
+    #nav-panel input {
+        width: 80px;
+        padding: 5px;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        font-size: 12px;
+    }
+    #nav-panel button {
+        width: 100%;
+        background: #4CAF50;
+        color: white;
+        border: none;
+        padding: 10px;
+        margin-top: 10px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: bold;
+    }
+    #nav-panel button:hover {
+        background: #45a049;
+    }
+    #nav-info {
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px solid #ddd;
+        font-size: 12px;
+        color: #666;
+        line-height: 1.5;
+    }
+    </style>
+    
+</head>
+<body>
+    
+    <div id="nav-panel">
+        <h3>&#23548;&#36890;&#36755;&#20837;</h3>
+        <p style="font-size:11px;color:#666;margin-bottom:10px;">
+            &#36755;&#20837;&#36215;&#28857;&#22352;&#26631;,&#31995;&#32479;&#23558;&#33258;&#21160;&#25509;&#20837;&#26368;&#36817;&#24037;&#28857;&#28982;&#21518;&#25191;&#34892;&#24037;&#26816;&#20219;&#21153;
+        </p>
+        <div class="input-row">
+            <label>X:</label>
+            <input type="number" id="input-x" value="150" step="1" placeholder="示例值">
+        </div>
+        <div class="input-row">
+            <label>Y:</label>
+            <input type="number" id="input-y" value="100" step="1" placeholder="示例值">
+        </div>
+        <div class="input-row">
+            <label>Z:</label>
+            <input type="number" id="input-z" value="100" step="1" placeholder="示例值">
+        </div>
+        <button onclick="startNavigation()">&#24320;&#22987;&#24037;&#26816;</button>
+        <div id="nav-info">
+            &#31561;&#24453;&#36755;&#20837;...
+        </div>
+    </div>
+    
+    <div>                        <script type="text/javascript">window.PlotlyConfig = {MathJaxConfig: 'local'};</script>
+        <script charset="utf-8" src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>                <div id="uav-plot" class="plotly-graph-div" style="height:800px; width:1200px;"></div>            <script type="text/javascript">                                    window.PLOTLYENV=window.PLOTLYENV || {};                                    if (document.getElementById("uav-plot")) {                    Plotly.newPlot(                        "uav-plot",                        [{"hovertemplate":"Original\u003cbr\u003eX: %{x:.0f}\u003cbr\u003eY: %{y:.0f}\u003cbr\u003eZ: %{z:.1f}m\u003cextra\u003e\u003c\u002fextra\u003e","line":{"color":"lightgray","dash":"dot","width":2},"mode":"lines","name":"Original Path","x":[0,15,25,30,45,50,60,75,90],"y":[0.0,4.5,7.5,9.0,13.5,15.0,18.0,22.5,27.0],"z":[50.0,57.97995989283243,54.78777715283165,51.12896006447894,42.179759058679224,42.328605802694895,47.76467601440859,57.50399981419791,53.29694788193405],"type":"scatter3d"},{"hovertemplate":"Execution\u003cbr\u003eX: %{x:.0f}\u003cbr\u003eY: %{y:.0f}\u003cbr\u003eZ: %{z:.1f}m\u003cextra\u003e\u003c\u002fextra\u003e","line":{"color":"green","width":4},"mode":"lines","name":"Execution Path","x":[0,15,25,30,45,50,60,75,90],"y":[0.0,4.5,7.5,9.0,13.5,15.0,18.0,22.5,27.0],"z":[50.0,57.97995989283243,54.78777715283165,51.12896006447894,42.179759058679224,42.328605802694895,47.76467601440859,57.50399981419791,53.29694788193405],"type":"scatter3d"},{"hovertemplate":"Input Point\u003cbr\u003eX: %{x:.0f}\u003cbr\u003eY: %{y:.0f}\u003cbr\u003eZ: %{z:.1f}m\u003cextra\u003e\u003c\u002fextra\u003e","marker":{"color":"purple","line":{"color":"white","width":2},"size":12,"symbol":"circle"},"mode":"markers","name":"Input Point","x":[],"y":[],"z":[],"type":"scatter3d"},{"hovertemplate":"Nearest Point\u003cbr\u003eX: %{x:.0f}\u003cbr\u003eY: %{y:.0f}\u003cbr\u003eZ: %{z:.1f}m\u003cextra\u003e\u003c\u002fextra\u003e","marker":{"color":"red","line":{"color":"yellow","width":2},"size":15,"symbol":"diamond"},"mode":"markers","name":"Nearest Inspection Point","x":[],"y":[],"z":[],"type":"scatter3d"},{"hovertemplate":"UAV\u003cbr\u003eX: %{x:.0f}\u003cbr\u003eY: %{y:.0f}\u003cbr\u003eZ: %{z:.1f}m\u003cextra\u003e\u003c\u002fextra\u003e","marker":{"color":"orange","size":5},"mode":"markers","name":"UAV","x":[0],"y":[0.0],"z":[50.0],"type":"scatter3d"}],                        {"template":{"data":{"histogram2dcontour":[{"type":"histogram2dcontour","colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]]}],"choropleth":[{"type":"choropleth","colorbar":{"outlinewidth":0,"ticks":""}}],"histogram2d":[{"type":"histogram2d","colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]]}],"heatmap":[{"type":"heatmap","colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]]}],"heatmapgl":[{"type":"heatmapgl","colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]]}],"contourcarpet":[{"type":"contourcarpet","colorbar":{"outlinewidth":0,"ticks":""}}],"contour":[{"type":"contour","colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]]}],"surface":[{"type":"surface","colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]]}],"mesh3d":[{"type":"mesh3d","colorbar":{"outlinewidth":0,"ticks":""}}],"scatter":[{"fillpattern":{"fillmode":"overlay","size":10,"solidity":0.2},"type":"scatter"}],"parcoords":[{"type":"parcoords","line":{"colorbar":{"outlinewidth":0,"ticks":""}}}],"scatterpolargl":[{"type":"scatterpolargl","marker":{"colorbar":{"outlinewidth":0,"ticks":""}}}],"bar":[{"error_x":{"color":"#2a3f5f"},"error_y":{"color":"#2a3f5f"},"marker":{"line":{"color":"#E5ECF6","width":0.5},"pattern":{"fillmode":"overlay","size":10,"solidity":0.2}},"type":"bar"}],"scattergeo":[{"type":"scattergeo","marker":{"colorbar":{"outlinewidth":0,"ticks":""}}}],"scatterpolar":[{"type":"scatterpolar","marker":{"colorbar":{"outlinewidth":0,"ticks":""}}}],"histogram":[{"marker":{"pattern":{"fillmode":"overlay","size":10,"solidity":0.2}},"type":"histogram"}],"scattergl":[{"type":"scattergl","marker":{"colorbar":{"outlinewidth":0,"ticks":""}}}],"scatter3d":[{"type":"scatter3d","line":{"colorbar":{"outlinewidth":0,"ticks":""}},"marker":{"colorbar":{"outlinewidth":0,"ticks":""}}}],"scattermapbox":[{"type":"scattermapbox","marker":{"colorbar":{"outlinewidth":0,"ticks":""}}}],"scatterternary":[{"type":"scatterternary","marker":{"colorbar":{"outlinewidth":0,"ticks":""}}}],"scattercarpet":[{"type":"scattercarpet","marker":{"colorbar":{"outlinewidth":0,"ticks":""}}}],"carpet":[{"aaxis":{"endlinecolor":"#2a3f5f","gridcolor":"white","linecolor":"white","minorgridcolor":"white","startlinecolor":"#2a3f5f"},"baxis":{"endlinecolor":"#2a3f5f","gridcolor":"white","linecolor":"white","minorgridcolor":"white","startlinecolor":"#2a3f5f"},"type":"carpet"}],"table":[{"cells":{"fill":{"color":"#EBF0F8"},"line":{"color":"white"}},"header":{"fill":{"color":"#C8D4E3"},"line":{"color":"white"}},"type":"table"}],"barpolar":[{"marker":{"line":{"color":"#E5ECF6","width":0.5},"pattern":{"fillmode":"overlay","size":10,"solidity":0.2}},"type":"barpolar"}],"pie":[{"automargin":true,"type":"pie"}]},"layout":{"autotypenumbers":"strict","colorway":["#636efa","#EF553B","#00cc96","#ab63fa","#FFA15A","#19d3f3","#FF6692","#B6E880","#FF97FF","#FECB52"],"font":{"color":"#2a3f5f"},"hovermode":"closest","hoverlabel":{"align":"left"},"paper_bgcolor":"white","plot_bgcolor":"#E5ECF6","polar":{"bgcolor":"#E5ECF6","angularaxis":{"gridcolor":"white","linecolor":"white","ticks":""},"radialaxis":{"gridcolor":"white","linecolor":"white","ticks":""}},"ternary":{"bgcolor":"#E5ECF6","aaxis":{"gridcolor":"white","linecolor":"white","ticks":""},"baxis":{"gridcolor":"white","linecolor":"white","ticks":""},"caxis":{"gridcolor":"white","linecolor":"white","ticks":""}},"coloraxis":{"colorbar":{"outlinewidth":0,"ticks":""}},"colorscale":{"sequential":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]],"sequentialminus":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]],"diverging":[[0,"#8e0152"],[0.1,"#c51b7d"],[0.2,"#de77ae"],[0.3,"#f1b6da"],[0.4,"#fde0ef"],[0.5,"#f7f7f7"],[0.6,"#e6f5d0"],[0.7,"#b8e186"],[0.8,"#7fbc41"],[0.9,"#4d9221"],[1,"#276419"]]},"xaxis":{"gridcolor":"white","linecolor":"white","ticks":"","title":{"standoff":15},"zerolinecolor":"white","automargin":true,"zerolinewidth":2},"yaxis":{"gridcolor":"white","linecolor":"white","ticks":"","title":{"standoff":15},"zerolinecolor":"white","automargin":true,"zerolinewidth":2},"scene":{"xaxis":{"backgroundcolor":"#E5ECF6","gridcolor":"white","linecolor":"white","showbackground":true,"ticks":"","zerolinecolor":"white","gridwidth":2},"yaxis":{"backgroundcolor":"#E5ECF6","gridcolor":"white","linecolor":"white","showbackground":true,"ticks":"","zerolinecolor":"white","gridwidth":2},"zaxis":{"backgroundcolor":"#E5ECF6","gridcolor":"white","linecolor":"white","showbackground":true,"ticks":"","zerolinecolor":"white","gridwidth":2}},"shapedefaults":{"line":{"color":"#2a3f5f"}},"annotationdefaults":{"arrowcolor":"#2a3f5f","arrowhead":0,"arrowwidth":1},"geo":{"bgcolor":"white","landcolor":"#E5ECF6","subunitcolor":"white","showland":true,"showlakes":true,"lakecolor":"white"},"title":{"x":0.05},"mapbox":{"style":"light"}}},"title":{"font":{"size":18,"color":"rgb(50, 50, 50)"},"text":"UAV Inspection Flight - Enter Coordinates to Start"},"scene":{"camera":{"up":{"x":0,"y":0,"z":1},"eye":{"x":1.5,"y":1.5,"z":1.2},"center":{"x":0,"y":0,"z":0}},"xaxis":{"title":{"text":"X (m)"},"showgrid":false,"showbackground":true,"backgroundcolor":"rgb(240, 240, 240)"},"yaxis":{"title":{"text":"Y (m)"},"showgrid":false,"showbackground":true,"backgroundcolor":"rgb(240, 240, 240)"},"zaxis":{"title":{"text":"Z (m)"},"showgrid":false,"showbackground":true,"backgroundcolor":"rgb(240, 240, 240)"},"dragmode":"orbit","uirevision":"lock","aspectmode":"data"},"font":{"family":"Arial","size":12},"legend":{"x":0.02,"y":0.98,"bgcolor":"rgba(255,255,255,0.8)"},"width":1200,"height":800,"paper_bgcolor":"white","plot_bgcolor":"white"},                        {"responsive": true}                    )                };                            </script>        </div>
+    
+    <script>
+    // 嵌入的数据
+    window.UAV_DATA = {
+        path: [[0.0, 0.0, 50.0], [5.0, 1.5, 53.835404308833624], [10.0, 3.0, 56.731767878463174], [15.0, 4.5, 57.97995989283243], [20.0, 6.0, 57.274379414605455], [25.0, 7.5, 54.78777715283165], [30.0, 9.0, 51.12896006447894], [35.0, 10.5, 47.19373417848304], [40.0, 12.0, 43.94558003753657], [45.0, 13.5, 42.179759058679224], [50.0, 15.0, 42.328605802694895], [55.0, 16.5, 44.355677395436864], [60.0, 18.0, 47.76467601440859], [65.0, 19.5, 51.720959904702525], [70.0, 21.0, 55.25589278975031], [75.0, 22.5, 57.50399981419791], [80.0, 24.0, 57.91486597298705], [85.0, 25.5, 56.387896900987926], [90.0, 27.0, 53.29694788193405], [95.0, 28.5, 49.398791036305525]],
+        inspectionPoints: [{"index": 0, "position": [0, 0.0, 50.0], "isPhoto": true}, {"index": 5, "position": [25, 7.5, 54.78777715283165], "isPhoto": true}, {"index": 10, "position": [50, 15.0, 42.328605802694895], "isPhoto": true}, {"index": 15, "position": [75, 22.5, 57.50399981419791], "isPhoto": true}],
+        photoIndices: [0, 5, 10, 15],
+        connectionPoints: 8,
+        downsampleStep: 3
+    };
+
+    // 全局状态
+    window.UAV_STATE = {
+        hasStarted: false,
+        animationFrames: []
+    };
+    </script>
+    
+    
+    <script>
+    // 1. 找最近巡检点
+    function findNearestInspectionPoint(inputPos) {
+        var photoPoints = UAV_DATA.inspectionPoints.filter(p => p.isPhoto);
+        var minDist = Infinity;
+        var nearest = null;
+
+        photoPoints.forEach(function(p) {
+            var dist = Math.sqrt(
+                Math.pow(inputPos[0] - p.position[0], 2) +
+                Math.pow(inputPos[1] - p.position[1], 2) +
+                Math.pow(inputPos[2] - p.position[2], 2)
+            );
+            if (dist < minDist) {
+                minDist = dist;
+                nearest = p;
+            }
+        });
+        return {point: nearest, distance: minDist};
+    }
+
+    // 2. 生成连接段（线性插值）
+    function generateConnectionSegment(inputPos, targetPos, numPoints) {
+        var segment = [];
+        for (var i = 1; i <= numPoints; i++) {
+            var t = i / (numPoints + 1);
+            segment.push([
+                inputPos[0] + t * (targetPos[0] - inputPos[0]),
+                inputPos[1] + t * (targetPos[1] - inputPos[1]),
+                inputPos[2] + t * (targetPos[2] - inputPos[2])
+            ]);
+        }
+        segment.push([targetPos[0], targetPos[1], targetPos[2]]);
+        return segment;
+    }
+
+    // 3. 构建完整执行路径
+    function buildExecutionPath(inputPos, nearestPoint) {
+        var connection = generateConnectionSegment(
+            inputPos,
+            nearestPoint.position,
+            UAV_DATA.connectionPoints
+        );
+        var remaining = UAV_DATA.path.slice(nearestPoint.index);
+        return connection.concat(remaining.slice(1));
+    }
+
+    // 4. 重新生成动画帧（分段判断拍照点）
+    function regenerateAnimationFrames(execPath, startIndex) {
+        var frames = [];
+        var connectionLength = UAV_DATA.connectionPoints + 1;  // +1 包含目标点
+
+        // 遍历执行路径，分段判断
+        execPath.forEach(function(point, i) {
+            var isPhoto;
+            var originalIdx;
+            var color;
+            var size;
+            var text;
+
+            if (i < connectionLength) {
+                // 接入段：不是拍照点
+                isPhoto = false;
+                originalIdx = -1;
+                color = (i === connectionLength - 1) ? 'red' : 'orange';  // 到达点用红色
+                size = 5;
+                text = (i === connectionLength - 1) ? 'Arrived' : 'Connecting...';
+            } else {
+                // 巡检段：计算原始路径索引
+                originalIdx = startIndex + (i - connectionLength);
+                isPhoto = UAV_DATA.photoIndices.includes(originalIdx);
+
+                if (isPhoto) {
+                    color = 'red';
+                    size = 8;
+                    text = 'WP ' + originalIdx + ' - Photo';
+                } else {
+                    color = 'orange';
+                    size = 5;
+                    text = 'WP ' + originalIdx;
+                }
+            }
+
+            // 创建帧
+            frames.push({
+                data: [{
+                    x: [point[0]],
+                    y: [point[1]],
+                    z: [point[2]],
+                    mode: 'markers' + (isPhoto || text === 'Arrived' ? '+text' : ''),
+                    marker: {size: size, color: color},
+                    text: [text],
+                    textposition: 'top center',
+                    textfont: {size: 10, color: 'black'}
+                }],
+                traces: [4],  // UAV trace index
+                name: 'Frame ' + (i + 1)
+            });
+
+            // 拍照点停顿效果
+            if (isPhoto) {
+                frames.push(frames[frames.length - 1]);
+            }
+        });
+
+        return frames;
+    }
+
+    // 5. 更新可视化
+    function updateVisualization(inputPos, nearestPoint, execPath) {
+        // 准备数据
+        var inputX = [inputPos[0]], inputY = [inputPos[1]], inputZ = [inputPos[2]];
+        var nearestX = [nearestPoint.position[0]];
+        var nearestY = [nearestPoint.position[1]];
+        var nearestZ = [nearestPoint.position[2]];
+        var execX = execPath.map(p => p[0]);
+        var execY = execPath.map(p => p[1]);
+        var execZ = execPath.map(p => p[2]);
+
+        // 更新 traces
+        Plotly.react('uav-plot',
+            [
+                // Trace 0: 原始路径（不变）
+                {x: UAV_DATA.path.map(p => p[0]), y: UAV_DATA.path.map(p => p[1]), z: UAV_DATA.path.map(p => p[2]),
+                 mode: 'lines', line: {color: 'lightgray', width: 2, dash: 'dot'}, name: 'Original Path',
+                 hovertemplate: 'Original<br>X: %{x:.0f}<br>Y: %{y:.0f}<br>Z: %{z:.1f}m<extra></extra>', type: 'scatter3d'},
+
+                // Trace 1: 执行路径（绿色加粗）
+                {x: execX, y: execY, z: execZ,
+                 mode: 'lines', line: {color: 'green', width: 4}, name: 'Execution Path',
+                 hovertemplate: 'Execution<br>X: %{x:.0f}<br>Y: %{y:.0f}<br>Z: %{z:.1f}m<extra></extra>', type: 'scatter3d'},
+
+                // Trace 2: 输入点（紫色）
+                {x: inputX, y: inputY, z: inputZ,
+                 mode: 'markers', marker: {size: 12, color: 'purple', symbol: 'circle', line: {color: 'white', width: 2}},
+                 name: 'Input Point', type: 'scatter3d'},
+
+                // Trace 3: 最近巡检点（红色）
+                {x: nearestX, y: nearestY, z: nearestZ,
+                 mode: 'markers', marker: {size: 15, color: 'red', symbol: 'diamond', line: {color: 'yellow', width: 2}},
+                 name: 'Nearest Inspection Point', type: 'scatter3d'},
+
+                // Trace 4: UAV（初始在输入点）
+                {x: [inputPos[0]], y: [inputPos[1]], z: [inputPos[2]],
+                 mode: 'markers', marker: {size: 5, color: 'orange'}, name: 'UAV', type: 'scatter3d'}
+            ],
+            {
+                title: {text: 'UAV Inspection Flight - Executing...'},
+                scene: {
+                    dragmode: 'orbit', uirevision: 'lock', aspectmode: 'data',
+                    camera: {up: {x: 0, y: 0, z: 1}, eye: {x: 1.5, y: 1.5, z: 1.2}, center: {x: 0, y: 0, z: 0}},
+                    xaxis: {title: 'X (m)', showgrid: false, showbackground: true, backgroundcolor: 'rgb(240, 240, 240)'},
+                    yaxis: {title: 'Y (m)', showgrid: false, showbackground: true, backgroundcolor: 'rgb(240, 240, 240)'},
+                    zaxis: {title: 'Z (m)', showgrid: false, showbackground: true, backgroundcolor: 'rgb(240, 240, 240)'}
+                },
+                width: 1200, height: 800,
+                paper_bgcolor: 'white', plot_bgcolor: 'white',
+                font: {family: 'Arial', size: 12},
+                legend: {x: 0.02, y: 0.98, bgcolor: 'rgba(255,255,255,0.8)'}
+            },
+            {displayModeBar: true, displaylogo: false}
+        );
+    }
+
+    // 6. 主函数：开始导航
+    function startNavigation() {
+        // 读取输入
+        var inputX = parseFloat(document.getElementById('input-x').value);
+        var inputY = parseFloat(document.getElementById('input-y').value);
+        var inputZ = parseFloat(document.getElementById('input-z').value);
+
+        if (isNaN(inputX) || isNaN(inputY) || isNaN(inputZ)) {
+            document.getElementById('nav-info').innerHTML = '<span style="color:red;">&#35831;&#36755;&#20837;&#26377;&#25928;&#30340;&#22352;&#26631;</span>';
+            return;
+        }
+
+        var inputPos = [inputX, inputY, inputZ];
+
+        // 找最近巡检点
+        var result = findNearestInspectionPoint(inputPos);
+        if (!result.point) {
+            document.getElementById('nav-info').innerHTML = '<span style="color:red;">&#26410;&#25214;&#21040;&#24037;&#28857;</span>';
+            return;
+        }
+
+        // 构建执行路径
+        var execPath = buildExecutionPath(inputPos, result.point);
+
+        // 更新图表
+        updateVisualization(inputPos, result.point, execPath);
+
+        // 生成动画帧
+        var frames = regenerateAnimationFrames(execPath, result.point.index);
+
+        // 清理旧帧并添加新帧
+        Plotly.addFrames('uav-plot', frames);
+
+        // 播放动画
+        Plotly.animate('uav-plot', frames, {
+            frame: {duration: 50, redraw: false, fromcurrent: true},
+            transition: {duration: 0}
+        });
+
+        // 更新信息面板
+        var remainingPhotos = UAV_DATA.photoIndices.filter(i => i >= result.point.index).length;
+        document.getElementById('nav-info').innerHTML =
+            '<strong>&#25191;&#34892;&#20013;</strong><br><br>' +
+            '&#25509;&#20837;&#28857;&#32034;&#24341;: ' + result.point.index + '<br>' +
+            '&#25509;&#20837;&#36317;&#31163;: ' + result.distance.toFixed(1) + 'm<br>' +
+            '&#21171;&#20313;&#25293;&#28857;: ' + remainingPhotos + '<br>' +
+            '&#25191;&#34892;&#33258;&#28857;: ' + execPath.length;
+
+        // 标记已开始
+        UAV_STATE.hasStarted = true;
+    }
+    </script>
+    
+</body>
+</html>
