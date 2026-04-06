@@ -1,11 +1,35 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# IDE
 .vscode/
 .idea/
-result/latest/inspection_images/
+
+# OS
+.DS_Store
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# Media
 *.mp4
 *.jpg
 *.png
-*.log
+
+# Result outputs
+result/
+
+# 临时备份文件
+*.old
+
+# 可选（如果你有）
+*.json.bak
+*.html.bak

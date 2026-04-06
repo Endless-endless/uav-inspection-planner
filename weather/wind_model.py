@@ -31,6 +31,285 @@ References:
 """
 
 import numpy as np
+from typing import Dict, List, Tuple, Optional
+
+
+# =====================================================
+# Weather Scene Configuration
+# =====================================================
+
+WEATHER_PROFILES = {
+    "calm": {
+        "scene": "calm",
+        "label": "微风",
+        "wind_speed": 2.0,
+        "wind_direction": 0.0,
+        "gust_factor": 1.1,
+        "risk_level": "low",
+        "energy_factor": 1.0,
+        "description": "微风条件，适合正常巡检"
+    },
+    "crosswind": {
+        "scene": "crosswind",
+        "label": "侧风",
+        "wind_speed": 6.0,
+        "wind_direction": 90.0,
+        "gust_factor": 1.2,
+        "risk_level": "medium",
+        "energy_factor": 1.15,
+        "description": "中等侧风，需注意稳定性"
+    },
+    "headwind_strong": {
+        "scene": "headwind_strong",
+        "label": "强逆风",
+        "wind_speed": 10.0,
+        "wind_direction": 180.0,
+        "gust_factor": 1.3,
+        "risk_level": "high",
+        "energy_factor": 1.35,
+        "description": "逆风明显，建议谨慎规划连接段"
+    },
+    "tailwind_efficient": {
+        "scene": "tailwind_efficient",
+        "label": "顺风高效",
+        "wind_speed": 8.0,
+        "wind_direction": 0.0,
+        "gust_factor": 1.15,
+        "risk_level": "low",
+        "energy_factor": 0.85,
+        "description": "顺风条件，能耗较低"
+    },
+    "gusty_high_risk": {
+        "scene": "gusty_high_risk",
+        "label": "强阵风高风险",
+        "wind_speed": 12.0,
+        "wind_direction": 135.0,
+        "gust_factor": 1.5,
+        "risk_level": "high",
+        "energy_factor": 1.4,
+        "description": "强风阵风，高风险建议谨慎规划"
+    }
+}
+
+
+def get_weather_profile(scene_name: str) -> Dict:
+    """
+    获取指定天气场景的配置 profile
+
+    Args:
+        scene_name: 天气场景名称 (calm, crosswind, headwind_strong, tailwind_efficient, gusty_high_risk)
+
+    Returns:
+        天气 profile 字典，包含 wind_speed, wind_direction, gust_factor, risk_level, energy_factor 等
+    """
+    scene_name = scene_name.lower().strip()
+    if scene_name not in WEATHER_PROFILES:
+        print(f"[WARNING] 未知的天气场景 '{scene_name}'，使用默认 'calm' 场景")
+        scene_name = "calm"
+
+    profile = WEATHER_PROFILES[scene_name].copy()
+    return profile
+
+
+def list_weather_profiles() -> Dict[str, Dict]:
+    """
+    列出所有可用的天气场景
+
+    Returns:
+        字典，key 为场景名，value 为对应的 profile
+    """
+    return WEATHER_PROFILES.copy()
+
+
+def build_wind_vector_from_profile(profile: Dict) -> Tuple[float, float, float]:
+    """
+    从天气 profile 构建风向量
+
+    Args:
+        profile: 天气 profile，包含 wind_speed 和 wind_direction
+
+    Returns:
+        (w_x, w_y, w_z) 风向量，单位 m/s
+    """
+    wind_speed = profile.get("wind_speed", 0.0)
+    wind_direction_deg = profile.get("wind_direction", 0.0)
+
+    # 将角度转换为弧度
+    wind_direction_rad = np.deg2rad(wind_direction_deg)
+
+    # 计算风向量
+    w_x = wind_speed * np.cos(wind_direction_rad)
+    w_y = wind_speed * np.sin(wind_direction_rad)
+    w_z = 0.0  # 假设水平风
+
+    return (w_x, w_y, w_z)
+
+
+def estimate_weather_risk(profile: Dict) -> Dict:
+    """
+    评估天气风险等级
+
+    Args:
+        profile: 天气 profile
+
+    Returns:
+        包含 risk_level, risk_score, message 的字典
+    """
+    risk_level = profile.get("risk_level", "unknown")
+    gust_factor = profile.get("gust_factor", 1.0)
+    wind_speed = profile.get("wind_speed", 0.0)
+
+    # 计算风险评分 (0-100)
+    risk_score = 0.0
+
+    # 基础风速风险
+    if wind_speed < 3:
+        risk_score += 10
+    elif wind_speed < 6:
+        risk_score += 30
+    elif wind_speed < 10:
+        risk_score += 50
+    else:
+        risk_score += 70
+
+    # 阵风因子风险
+    if gust_factor > 1.2:
+        risk_score += 15
+    elif gust_factor > 1.4:
+        risk_score += 30
+
+    # 能耗因子风险
+    energy_factor = profile.get("energy_factor", 1.0)
+    if energy_factor > 1.3:
+        risk_score += 10
+
+    # 限制在 0-100
+    risk_score = max(0, min(100, risk_score))
+
+    # 生成风险消息
+    if risk_level == "low":
+        message = "天气条件良好，适合正常巡检"
+    elif risk_level == "medium":
+        message = "天气条件一般，需注意安全"
+    elif risk_level == "high":
+        message = "天气条件较差，建议谨慎规划"
+    else:
+        message = "未知天气条件"
+
+    return {
+        "risk_level": risk_level,
+        "risk_score": round(risk_score, 2),
+        "message": message
+    }
+
+
+def compute_segment_weather_penalty(
+    p1: np.ndarray,
+    p2: np.ndarray,
+    profile: Dict,
+    turn_angle_deg: Optional[float] = None
+) -> Dict:
+    """
+    计算路径段在给定天气条件下的惩罚代价细分
+
+    Args:
+        p1: 起点 (x, y, z)
+        p2: 终点 (x, y, z)
+        profile: 天气 profile
+        turn_angle_deg: 转向角度（度），None 表示直线
+
+    Returns:
+        包含 base_cost, wind_penalty, gust_penalty, risk_penalty, total 的字典
+    """
+    # 构建运动向量
+    move_vector = np.array(p2) - np.array(p1)
+    distance = np.linalg.norm(move_vector)
+
+    if distance < 0.001:
+        return {
+            "base_cost": 0.0,
+            "wind_penalty": 0.0,
+            "gust_penalty": 0.0,
+            "risk_penalty": 0.0,
+            "total": 0.0
+        }
+
+    # 基础距离代价
+    base_cost = distance
+
+    # 构建风向量
+    wind_vector = build_wind_vector_from_profile(profile)
+
+    # 计算风向量代价（使用物理驱动方法）
+    from weather.wind_model import compute_wind_cost_physics
+    wind_cost = compute_wind_cost_physics(move_vector, wind_vector)
+
+    # 转换为惩罚系数
+    wind_penalty = wind_cost * distance * 0.1  # 缩放因子
+
+    # 阵风惩罚
+    gust_factor = profile.get("gust_factor", 1.0)
+    gust_penalty = wind_penalty * (gust_factor - 1.0) * 0.5
+
+    # 风险惩罚
+    energy_factor = profile.get("energy_factor", 1.0)
+    risk_penalty = base_cost * (energy_factor - 1.0) * 0.2
+
+    # 转向惩罚（如果有转向）
+    if turn_angle_deg is not None:
+        turn_penalty = abs(turn_angle_deg) / 180.0 * distance * 0.05
+    else:
+        turn_penalty = 0.0
+
+    # 总惩罚
+    total_penalty = base_cost + wind_penalty + gust_penalty + risk_penalty + turn_penalty
+
+    return {
+        "base_cost": round(base_cost, 3),
+        "wind_penalty": round(wind_penalty, 3),
+        "gust_penalty": round(gust_penalty, 3),
+        "risk_penalty": round(risk_penalty, 3),
+        "turn_penalty": round(turn_penalty, 3),
+        "total": round(total_penalty, 3)
+    }
+
+
+def summarize_weather_for_mission(profile: Dict, total_length: float) -> Dict:
+    """
+    为整个任务生成天气摘要
+
+    Args:
+        profile: 天气 profile
+        total_length: 任务总长度（像素）
+
+    Returns:
+        天气摘要字典
+    """
+    wind_speed = profile.get("wind_speed", 0.0)
+    wind_direction = profile.get("wind_direction", 0.0)
+    gust_factor = profile.get("gust_factor", 1.0)
+    energy_factor = profile.get("energy_factor", 1.0)
+
+    # 评估风险
+    risk_info = estimate_weather_risk(profile)
+
+    # 估算天气惩罚（粗略估计）
+    estimated_penalty_per_100px = total_length / 100.0 * (energy_factor - 1.0) * 10.0
+    total_weather_penalty = total_length / 100.0 * estimated_penalty_per_100px
+
+    return {
+        "scene": profile.get("scene", "unknown"),
+        "label": profile.get("label", "未知"),
+        "wind_speed": round(wind_speed, 2),
+        "wind_direction": round(wind_direction, 2),
+        "gust_factor": round(gust_factor, 3),
+        "risk_level": risk_info["risk_level"],
+        "energy_factor": round(energy_factor, 3),
+        "weather_risk_score": risk_info["risk_score"],
+        "weather_message": risk_info["message"],
+        "estimated_energy_score": round(100 / energy_factor, 2),
+        "weather_penalty_total": round(total_weather_penalty, 3)
+    }
 
 
 class WindField:

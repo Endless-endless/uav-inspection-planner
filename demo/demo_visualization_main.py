@@ -4,19 +4,22 @@ UAV 电网巡检 - 主展示页入口（交互式版本）
 =====================================================
 
 功能：
-1. 执行拓扑规划并生成 3D 巡检路径
-2. 导出标准 mission JSON
-3. 创建交互式主展示页（基于 Plotly layout.images）
-4. 显示：真实地图底图 + 巡检路径 + inspection points（可交互）
+1. 清理旧数据，确保生成全新的初始任务版本
+2. 执行拓扑规划并生成 3D 巡检路径
+3. 导出标准 mission JSON
+4. 创建交互式主展示页（基于 Plotly layout.images）
+5. 显示：真实地图底图 + 巡检路径 + inspection points（可交互）
 
 使用方式：
     python demo/demo_visualization_main.py
 
 输出：
-    result/latest/mission_output.json - 标准任务 JSON
+    result/latest/mission_output.json - 标准任务 JSON（初始版本）
     result/latest/main_view_interactive.html - 交互式主展示页
 
 特点：
+- 每次运行都会清理旧数据并生成全新的初始任务版本
+- 不会重用之前重规划的结果
 - 使用 Plotly layout.images 显示真实地图（data/test.png）
 - 路径和 inspection points 支持 hover 交互
 - 图层控制（sample points 可通过图例开关）
@@ -46,15 +49,71 @@ def main():
     print()
 
     # =====================================================
+    # Phase -1: 清理旧数据，确保生成全新的初始任务版本
+    # =====================================================
+    print("Phase -1: 清理旧数据（确保全新初始任务版本）...")
+    print("-"*70)
+
+    import shutil
+    from pathlib import Path
+
+    # 定义需要清理的文件
+    files_to_clean = [
+        "result/latest/mission_output.json",
+        "result/latest/mission_output_before_replan.json",
+        "result/latest/main_view_interactive.html"
+    ]
+
+    cleaned_count = 0
+    for file_path in files_to_clean:
+        path = Path(file_path)
+        if path.exists():
+            # 备份到 .old 文件（可选，便于调试）
+            backup_path = Path(str(path) + ".old")
+            try:
+                shutil.copy(path, backup_path)
+                path.unlink()
+                print(f"  [清理] 已移除并备份: {file_path} -> {backup_path.name}")
+                cleaned_count += 1
+            except Exception as e:
+                print(f"  [WARN] 无法清理 {file_path}: {e}")
+
+    if cleaned_count == 0:
+        print("  [信息] 无旧数据需要清理")
+    else:
+        print(f"  [完成] 已清理 {cleaned_count} 个旧文件")
+    print()
+
+    # =====================================================
+    # Phase 0: 天气场景配置
+    # =====================================================
+    print("Phase 0: 天气场景配置...")
+    print("-"*70)
+
+    # 设置天气场景（可选：calm, crosswind, headwind_strong, tailwind_efficient, gusty_high_risk）
+    weather_scene = "calm"  # 默认：微风
+
+    planner = PowerlinePlannerV3(
+        image_path='data/test.png',
+        flight_height=30,
+        weather_scene=weather_scene
+    )
+
+    # 获取并显示天气信息
+    weather_info = planner.get_weather_info()
+    print(f"[当前天气场景] {weather_info.get('label', '未知')} ({weather_info.get('scene', 'unknown')})")
+    print(f"  - 风速: {weather_info.get('wind_speed', 0):.1f} m/s")
+    print(f"  - 风向: {weather_info.get('wind_direction', 0):.1f}°")
+    print(f"  - 阵风因子: {weather_info.get('gust_factor', 1.0):.2f}")
+    print(f"  - 风险等级: {weather_info.get('risk_level', 'unknown')}")
+    print(f"  - 能耗因子: {weather_info.get('energy_factor', 1.0):.2f}")
+    print()
+
+    # =====================================================
     # Phase 1: 执行完整规划流程
     # =====================================================
     print("Phase 1: 执行拓扑规划...")
     print("-"*70)
-
-    planner = PowerlinePlannerV3(
-        image_path='data/test.png',
-        flight_height=30
-    )
 
     # 执行图像处理和线路识别
     planner.step1_extract_redline_hsv()
@@ -115,12 +174,24 @@ def main():
     print("Phase 2.5: 导出任务 JSON...")
     print("-"*70)
 
+    # 合并天气统计信息到 weather_info
+    if hasattr(planner, 'stats') and planner.stats:
+        weather_info_for_export = dict(weather_info)  # 创建副本
+        # 添加天气统计信息
+        if 'weather_penalty_total' in planner.stats:
+            weather_info_for_export['weather_penalty_total'] = planner.stats['weather_penalty_total']
+        if 'estimated_energy_score' in planner.stats:
+            weather_info_for_export['estimated_energy_score'] = planner.stats['estimated_energy_score']
+    else:
+        weather_info_for_export = weather_info
+
     json_path = export_grouped_mission_to_json(
         mission=mission,
         edge_tasks=edge_tasks,
         line_inspection_points_by_line=planner.line_inspection_points_by_line,
         output_path="result/latest/mission_output.json",
-        terrain_3d=planner.terrain_3d
+        terrain_3d=planner.terrain_3d,
+        weather_info=weather_info_for_export  # 传入天气信息（包含统计）
     )
 
     print(f"[完成] JSON 已导出: {json_path}")
@@ -158,11 +229,12 @@ def main():
     try:
         from demo.generate_interactive_main_view import create_interactive_main_view
 
-        # 生成交互式主展示页
+        # 生成交互式主展示页，传递当前天气信息
         html_path = create_interactive_main_view(
             map_image_path='data/test.png',
             mission_json_path=json_path,
-            output_html_path='result/latest/main_view_interactive.html'
+            output_html_path='result/latest/main_view_interactive.html',
+            weather=weather_info  # 直接使用当前 weather_scene 对应的天气字典
         )
 
         print(f"[完成] 交互式主展示页已生成: {html_path}")
@@ -225,11 +297,16 @@ def main():
     # 完成
     # =====================================================
     print("="*70)
-    print("处理完成！")
+    print("处理完成！已生成全新的初始任务版本")
     print("="*70)
     print()
+    print("[重要说明]")
+    print("  本次运行已生成全新的初始任务版本，未使用任何重规划结果。")
+    print("  如需重规划，请使用交互式主展示页中的起点输入功能，或启动重规划服务：")
+    print("    python scripts/replan_service.py")
+    print()
     print("[输出文件]")
-    print("  - result/latest/mission_output.json (标准任务 JSON)")
+    print("  - result/latest/mission_output.json (标准任务 JSON - 初始版本)")
     print("  - result/latest/main_view_interactive.html (主展示页 - 基于 data/test.png 地图底图)")
     print("  - result/latest/map_overlay_test.png (2D地图叠加 - 基于 data/test.png)")
     print("  - result/latest/map_overlay_test_with_coords.png (2D地图叠加 - 带坐标)")

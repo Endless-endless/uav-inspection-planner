@@ -10,12 +10,42 @@
 
 import numpy as np
 from PIL import Image, ImageFilter, ImageDraw
-from skimage.morphology import skeletonize, dilation
-from skimage.color import rgb2hsv
 from collections import defaultdict, deque
-from scipy.ndimage import gaussian_filter
-from scipy.interpolate import splprep, splev
 import os
+
+# 外部依赖容错处理
+try:
+    from skimage.morphology import skeletonize, dilation, erosion
+except ImportError:
+    print("[WARN] skimage.morphology 未安装，骨架化和膨胀功能将降级")
+    skeletonize = None
+    dilation = None
+    erosion = None
+
+try:
+    from skimage.color import rgb2hsv
+except ImportError:
+    print("[WARN] skimage.color 未安装，HSV转换功能将降级")
+    rgb2hsv = None
+
+try:
+    from skimage.transform import resize
+except ImportError:
+    print("[WARN] skimage.transform 未安装，图像缩放功能将降级")
+    resize = None
+
+try:
+    from scipy.ndimage import gaussian_filter
+except ImportError:
+    print("[WARN] scipy.ndimage 未安装，高斯滤波功能将降级")
+    gaussian_filter = None
+
+try:
+    from scipy.interpolate import splprep, splev
+except ImportError:
+    print("[WARN] scipy.interpolate 未安装，样条插值功能将降级")
+    splprep = None
+    splev = None
 
 
 class PowerlinePlannerV3:
@@ -31,7 +61,8 @@ class PowerlinePlannerV3:
 
     def __init__(self, image_path, flight_height=30, smooth_window=5,
                  use_spline=False, add_flight_fluctuation=True,
-                 wind_direction=0, wind_speed=5):
+                 wind_direction=0, wind_speed=5,
+                 weather_scene="calm", weather_profile=None):
         """
         初始化规划器
 
@@ -43,6 +74,8 @@ class PowerlinePlannerV3:
             add_flight_fluctuation: 是否添加飞行波动
             wind_direction: 风向角度（0-360°，0=东风）
             wind_speed: 风速（m/s）
+            weather_scene: 天气场景名称（calm, crosswind, headwind_strong, tailwind_efficient, gusty_high_risk）
+            weather_profile: 天气配置字典（优先使用，如果提供则忽略 weather_scene）
         """
         self.image_path = image_path
         self.flight_height = flight_height
@@ -51,6 +84,27 @@ class PowerlinePlannerV3:
         self.add_flight_fluctuation = add_flight_fluctuation
         self.wind_direction = wind_direction
         self.wind_speed = wind_speed
+
+        # 天气相关
+        self.weather_scene = weather_scene
+        if weather_profile is not None:
+            self.weather_profile = weather_profile
+        else:
+            # 根据 weather_scene 自动获取 profile
+            from weather.wind_model import get_weather_profile
+            self.weather_profile = get_weather_profile(weather_scene)
+
+        # 记录天气信息到 mission_wind
+        self.mission_wind = {
+            "scene": self.weather_profile.get("scene", weather_scene),
+            "label": self.weather_profile.get("label", "未知"),
+            "wind_speed": self.weather_profile.get("wind_speed", wind_speed),
+            "wind_direction": self.weather_profile.get("wind_direction", wind_direction),
+            "gust_factor": self.weather_profile.get("gust_factor", 1.0),
+            "risk_level": self.weather_profile.get("risk_level", "unknown"),
+            "energy_factor": self.weather_profile.get("energy_factor", 1.0),
+            "description": self.weather_profile.get("description", "")
+        }
 
         # 数据容器
         self.image = None
@@ -93,7 +147,7 @@ class PowerlinePlannerV3:
         self.g_path_2d = []  # List[Tuple], 全局2D路径
         self.g_path_3d = []  # List[Tuple], 全局3D路径
         self.g_stats = {}  # Dict, 全局统计
-        self.mission_wind = None  # 保存风向信息
+        # self.mission_wind 已在天气初始化部分设置，不要覆盖
 
         # =====================================================
         # 阶段2可视化适配层（增量）
@@ -128,11 +182,20 @@ class PowerlinePlannerV3:
         print(f"  图片尺寸: {self.width}x{self.height}")
 
         self.img_array = np.array(self.image).astype(np.float32) / 255.0
-        hsv = rgb2hsv(self.img_array)
 
-        mask1 = (hsv[:, :, 0] <= 0.028) & (hsv[:, :, 1] > 0.3) & (hsv[:, :, 2] > 0.2)
-        mask2 = (hsv[:, :, 0] >= 0.94) & (hsv[:, :, 1] > 0.3) & (hsv[:, :, 2] > 0.2)
-        self.mask = (mask1 | mask2).astype(np.uint8) * 255
+        # HSV转换（降级处理）
+        if rgb2hsv is not None:
+            try:
+                hsv = rgb2hsv(self.img_array)
+                mask1 = (hsv[:, :, 0] <= 0.028) & (hsv[:, :, 1] > 0.3) & (hsv[:, :, 2] > 0.2)
+                mask2 = (hsv[:, :, 0] >= 0.94) & (hsv[:, :, 1] > 0.3) & (hsv[:, :, 2] > 0.2)
+                self.mask = (mask1 | mask2).astype(np.uint8) * 255
+            except Exception as e:
+                print(f"[WARN] HSV转换失败: {e}，使用简单RGB阈值")
+                self.mask = self._simple_red_threshold()
+        else:
+            print("[WARN] skimage.color 未安装，使用简单RGB阈值")
+            self.mask = self._simple_red_threshold()
 
         pixel_count = np.sum(self.mask > 0)
         print(f"  提取红色像素: {pixel_count} 个")
@@ -143,6 +206,13 @@ class PowerlinePlannerV3:
 
         return self.mask
 
+    def _simple_red_threshold(self):
+        """简单RGB红色阈值提取（降级方案）"""
+        # 简单的红色通道检测
+        img = np.array(self.image)
+        red_mask = (img[:, :, 0] > 150) & (img[:, :, 1] < 100) & (img[:, :, 2] < 100)
+        return red_mask.astype(np.uint8) * 255
+
     def step2_fix_breaks(self):
         """STEP 2: 修复断裂（膨胀+腐蚀操作）"""
         print("[STEP 2] 修复断裂（膨胀+腐蚀操作）...")
@@ -150,13 +220,24 @@ class PowerlinePlannerV3:
         if self.mask is None:
             self.step1_extract_redline_hsv()
 
-        # 膨胀连接断裂
-        self.mask = dilation(self.mask > 0, footprint=np.ones((3, 3), dtype=bool)).astype(np.uint8) * 255
-        self.mask = dilation(self.mask > 0, footprint=np.ones((3, 3), dtype=bool)).astype(np.uint8) * 255
+        # 膨胀连接断裂（降级处理）
+        if dilation is not None:
+            try:
+                self.mask = dilation(self.mask > 0, footprint=np.ones((3, 3), dtype=bool)).astype(np.uint8) * 255
+                self.mask = dilation(self.mask > 0, footprint=np.ones((3, 3), dtype=bool)).astype(np.uint8) * 255
+            except Exception as e:
+                print(f"[WARN] 膨胀操作失败: {e}，跳过断裂修复")
+        else:
+            print("[WARN] skimage.morphology 未安装，跳过膨胀操作")
 
-        # 轻微腐蚀恢复宽度
-        from skimage.morphology import erosion
-        self.mask = erosion(self.mask > 0, footprint=np.ones((2, 2), dtype=bool)).astype(np.uint8) * 255
+        # 轻微腐蚀恢复宽度（降级处理）
+        if erosion is not None:
+            try:
+                self.mask = erosion(self.mask > 0, footprint=np.ones((2, 2), dtype=bool)).astype(np.uint8) * 255
+            except Exception as e:
+                print(f"[WARN] 腐蚀操作失败: {e}，保持膨胀后状态")
+        else:
+            print("[WARN] erosion 未安装，跳过腐蚀操作")
 
         pixel_count = np.sum(self.mask > 0)
         print(f"  修复后像素: {pixel_count} 个")
@@ -173,12 +254,20 @@ class PowerlinePlannerV3:
         if self.mask is None:
             self.step2_fix_breaks()
 
-        # 收缩mask（去除毛边，减少噪点）
-        from skimage.morphology import erosion
-        binary = erosion(self.mask > 0, footprint=np.ones((2, 2), dtype=bool))
+        # 检查依赖是否可用
+        if erosion is None or skeletonize is None:
+            print("[WARN] skimage 未安装，跳过骨架化步骤，使用原始mask")
+            self.skeleton = self.mask.astype(np.uint8)
+            return self.skeleton
 
-        # 骨架化
-        self.skeleton = skeletonize(binary).astype(np.uint8) * 255
+        # 收缩mask（去除毛边，减少噪点）
+        try:
+            binary = erosion(self.mask > 0, footprint=np.ones((2, 2), dtype=bool))
+            # 骨架化
+            self.skeleton = skeletonize(binary).astype(np.uint8) * 255
+        except Exception as e:
+            print(f"[WARN] 骨架化失败: {e}，使用原始mask")
+            self.skeleton = self.mask.astype(np.uint8)
 
         skeleton_pixels = np.sum(self.skeleton > 0)
         print(f"  骨架像素: {skeleton_pixels} 个")
@@ -306,16 +395,28 @@ class PowerlinePlannerV3:
         """
         print("[STEP 6] 地形平滑（增强版）...")
 
-        # 高斯模糊
-        self.height_map_smooth = gaussian_filter(terrain_raw.astype(np.float32), sigma=gaussian_sigma)
+        # 高斯模糊（降级处理）
+        if gaussian_filter is not None:
+            try:
+                self.height_map_smooth = gaussian_filter(terrain_raw.astype(np.float32), sigma=gaussian_sigma)
+            except Exception as e:
+                print(f"[WARN] 高斯滤波失败: {e}，使用原始地形")
+                self.height_map_smooth = terrain_raw.astype(np.float32)
+        else:
+            print("[WARN] scipy.ndimage 未安装，使用原始地形（无平滑）")
+            self.height_map_smooth = terrain_raw.astype(np.float32)
 
         # 可选：提高分辨率
-        if enhance_resolution:
-            from skimage.transform import resize
-            h, w = self.height_map_smooth.shape
-            self.height_map_smooth = resize(self.height_map_smooth, (h*2, w*2),
-                                           preserve_range=True, order=1)
-            print(f"  分辨率提升: {w}x{h} → {w*2}x{h*2}")
+        if enhance_resolution and resize is not None:
+            try:
+                h, w = self.height_map_smooth.shape
+                self.height_map_smooth = resize(self.height_map_smooth, (h*2, w*2),
+                                               preserve_range=True, order=1)
+                print(f"  分辨率提升: {w}x{h} → {w*2}x{h*2}")
+            except Exception as e:
+                print(f"[WARN] 分辨率提升失败: {e}")
+        elif enhance_resolution and resize is None:
+            print("[WARN] skimage.transform 未安装，跳过分辨率提升")
 
         print(f"  平滑前范围: [{terrain_raw.min():.1f}, {terrain_raw.max():.1f}]")
         print(f"  平滑后范围: [{self.height_map_smooth.min():.1f}, {self.height_map_smooth.max():.1f}]")
@@ -392,6 +493,81 @@ class PowerlinePlannerV3:
         print(f"  总风成本: {total_cost:.3f}")
 
         return waypoints_with_cost
+
+    def apply_weather_profile_to_cost(self, path_points, alpha=0.1):
+        """
+        应用天气 profile 到路径代价计算（增强版）
+
+        Args:
+            path_points: 路径点列表 [(x, y), ...]
+            alpha: 天气影响系数（默认0.1）
+
+        Returns:
+            list: [(x, y, enhanced_cost), ...] 带天气增强代价的航点列表
+        """
+        if not path_points:
+            return []
+
+        print(f"[天气] 应用天气 profile: {self.weather_profile.get('label', '未知')}")
+        print(f"  场景: {self.weather_profile.get('scene', 'unknown')}")
+        print(f"  风速: {self.weather_profile.get('wind_speed', 0):.1f} m/s")
+        print(f"  风向: {self.weather_profile.get('wind_direction', 0):.1f}°")
+        print(f"  阵风因子: {self.weather_profile.get('gust_factor', 1.0):.2f}")
+        print(f"风险等级: {self.weather_profile.get('risk_level', 'unknown')}")
+        print(f"  能耗因子: {self.weather_profile.get('energy_factor', 1.0):.2f}")
+
+        from weather.wind_model import build_wind_vector_from_profile, compute_segment_weather_penalty
+
+        # 构建风向量
+        wind_vector = build_wind_vector_from_profile(self.weather_profile)
+
+        waypoints_with_enhanced_cost = []
+        total_base_cost = 0
+        total_weather_penalty = 0
+
+        for i in range(len(path_points) - 1):
+            p1 = np.array([path_points[i][0], path_points[i][1], 0])
+            p2 = np.array([path_points[i+1][0], path_points[i+1][1], 0])
+
+            # 计算天气惩罚
+            penalty_info = compute_segment_weather_penalty(p1, p2, self.weather_profile)
+
+            base_cost = penalty_info['base_cost']
+            total_penalty = penalty_info['total']
+
+            waypoints_with_enhanced_cost.append((path_points[i][0], path_points[i][1], total_penalty))
+
+            total_base_cost += base_cost
+            total_weather_penalty += (total_penalty - base_cost)
+
+        # 添加最后一个点
+        if len(path_points) > 0:
+            waypoints_with_enhanced_cost.append((path_points[-1][0], path_points[-1][1], 1.0))
+
+        avg_cost = np.mean([pt[2] for pt in waypoints_with_enhanced_cost]) if waypoints_with_enhanced_cost else 0
+
+        print(f"  平均代价: {avg_cost:.3f}")
+        print(f"  天气惩罚总计: {total_weather_penalty:.3f}")
+
+        # 更新天气统计信息
+        if hasattr(self, 'stats'):
+            self.stats['weather_scene'] = self.weather_profile.get('scene', 'unknown')
+            self.stats['weather_label'] = self.weather_profile.get('label', '未知')
+            self.stats['weather_penalty_total'] = round(total_weather_penalty, 3)
+            self.stats['weather_risk_level'] = self.weather_profile.get('risk_level', 'unknown')
+
+        return waypoints_with_enhanced_cost
+
+    def get_weather_info(self):
+        """
+        获取当前天气信息（用于导出到 mission JSON）
+
+        Returns:
+            dict: 天气信息字典
+        """
+        if hasattr(self, 'mission_wind') and self.mission_wind is not None:
+            return dict(self.mission_wind)  # 创建副本
+        return {}
 
     def optimize_path_with_wind(self, waypoints, alpha=0.05, beta=0.5):
         """
@@ -613,6 +789,11 @@ class PowerlinePlannerV3:
             numpy.ndarray: 平滑后的路径
         """
         print(f"[平滑] Spline插值（平滑因子={smooth_factor}）...")
+
+        # 检查依赖是否可用
+        if splprep is None or splev is None:
+            print("[WARN] scipy.interpolate 未安装，使用滑动平均")
+            return self.smooth_path_moving_average(path)
 
         path = np.array(path)
 
@@ -900,6 +1081,18 @@ class PowerlinePlannerV3:
             'energy_cost': energy_result['total_energy'],
             'avg_energy_per_meter': energy_result['avg_energy_per_meter']
         }
+
+        # 添加天气统计信息
+        if hasattr(self, 'weather_profile') and self.weather_profile:
+            self.stats['weather_scene'] = self.weather_profile.get('scene', 'unknown')
+            self.stats['weather_label'] = self.weather_profile.get('label', '未知')
+            self.stats['weather_risk_level'] = self.weather_profile.get('risk_level', 'unknown')
+            # 如果 weather_penalty_total 还没有设置，初始化为 0
+            if 'weather_penalty_total' not in self.stats:
+                self.stats['weather_penalty_total'] = 0.0
+            # 计算能耗评分（基于能耗因子和路径长度）
+            energy_factor = self.weather_profile.get('energy_factor', 1.0)
+            self.stats['estimated_energy_score'] = round(energy_result['total_energy'] * energy_factor, 2)
 
         print(f"  航点数量: {self.stats['waypoint_count']}")
         print(f"  电塔数量: {self.stats['tower_count']}")

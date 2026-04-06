@@ -3771,7 +3771,8 @@ def export_grouped_mission_to_json(
     edge_tasks: List[EdgeTask],
     line_inspection_points_by_line: Dict[str, List],
     output_path: str = "result/latest/mission_output.json",
-    terrain_3d: Optional[np.ndarray] = None
+    terrain_3d: Optional[np.ndarray] = None,
+    weather_info: Optional[dict] = None
 ) -> str:
     """
     将分组连续任务导出为标准 JSON 格式
@@ -3782,6 +3783,7 @@ def export_grouped_mission_to_json(
         line_inspection_points_by_line: {line_id: [巡检点列表]}
         output_path: 输出文件路径
         terrain_3d: 3D地形数组（可选，用于生成3D坐标）
+        weather_info: 天气信息字典（可选，包含scene, label, wind_speed, wind_direction, gust_factor, risk_level, energy_factor等）
 
     Returns:
         str: 输出文件的完整路径
@@ -3826,6 +3828,20 @@ def export_grouped_mission_to_json(
         "intra_group_connect_length": float(round(mission.intra_group_connect_length, 2)),
         "inter_group_connect_length": float(round(mission.inter_group_connect_length, 2))
     }
+
+    # 添加天气信息到统计数据（如果提供）
+    if weather_info:
+        stats["weather_scene"] = weather_info.get("scene", "unknown")
+        stats["weather_label"] = weather_info.get("label", "未知")
+        stats["wind_speed"] = float(weather_info.get("wind_speed", 0.0))
+        stats["wind_direction"] = float(weather_info.get("wind_direction", 0.0))
+        stats["gust_factor"] = float(weather_info.get("gust_factor", 1.0))
+        stats["risk_level"] = weather_info.get("risk_level", "unknown")
+        stats["energy_factor"] = float(weather_info.get("energy_factor", 1.0))
+        # 添加天气统计信息
+        stats["weather_risk_level"] = weather_info.get("risk_level", "unknown")
+        stats["weather_penalty_total"] = float(weather_info.get("weather_penalty_total", 0.0))
+        stats["estimated_energy_score"] = float(weather_info.get("estimated_energy_score", 0.0))
 
     # 3. Groups 信息
     groups_data = []
@@ -4041,6 +4057,19 @@ def export_grouped_mission_to_json(
         "inspection_points": inspection_points_data,
         "full_path": full_path_data
     }
+
+    # 添加顶层天气信息（如果提供）
+    if weather_info:
+        output_data["weather"] = {
+            "scene": weather_info.get("scene", "unknown"),
+            "label": weather_info.get("label", "未知"),
+            "wind_speed": float(weather_info.get("wind_speed", 0.0)),
+            "wind_direction": float(weather_info.get("wind_direction", 0.0)),
+            "gust_factor": float(weather_info.get("gust_factor", 1.0)),
+            "risk_level": weather_info.get("risk_level", "unknown"),
+            "energy_factor": float(weather_info.get("energy_factor", 1.0)),
+            "description": weather_info.get("description", "")
+        }
 
     # 确保输出目录存在
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
