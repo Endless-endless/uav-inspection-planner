@@ -1,0 +1,60 @@
+{
+  "lines": [
+    {
+      "id": "line_001",
+      "points": [
+        [120.0, 200.0],
+        [180.0, 240.0],
+        [260.0, 280.0],
+        [340.0, 310.0]
+      ],
+      "voltage_level": "110kV",
+      "metadata": {
+        "source": "sample",
+        "note": "示例折线，坐标为图像像素系"
+      }
+    },
+    {
+      "id": "line_002",
+      "points": [
+        [500.0, 150.0],
+        [560.0, 220.0],
+        [620.0, 300.0]
+      ],
+      "voltage_level": "220kV",
+      "metadata": {}
+    }
+  ],
+  "towers": [
+    {
+      "id": "tower_001",
+      "position": [120.0, 200.0],
+      "metadata": {
+        "line_id": "line_001",
+        "role": "start"
+      }
+    },
+    {
+      "id": "tower_002",
+      "position": [340.0, 310.0],
+      "metadata": {
+        "line_id": "line_001",
+        "role": "end"
+      }
+    }
+  ],
+  "weather": {
+    "wind_speed": 2.0,
+    "wind_direction": 90.0,
+    "visibility": "good"
+  },
+  "uav": {
+    "max_speed": 10.0,
+    "battery_capacity": 100.0,
+    "safe_distance": 5.0
+  },
+  "metadata": {
+    "schema_version": "1.0",
+    "description": "统一输入接口示例（未接入路径规划）"
+  }
+}

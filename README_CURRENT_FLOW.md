@@ -298,27 +298,45 @@ weather_scene = "calm"  # calm, crosswind, headwind_strong, tailwind_efficient, 
 
 ## 九、快速开始
 
-### 9.1 环境依赖
+### 9.1 安装依赖
 
 ```bash
-# 核心依赖
-pip install numpy scipy matplotlib pillow
-
-# 可选依赖（用于高级功能）
-pip install scikit-learn  # DBSCAN 分组
-pip install scikit-image  # 图像处理
-pip install plotly        # 交互式可视化
+pip install -r requirements.txt
 ```
+
+主要包含：`numpy`、`scipy`、`Pillow`、`scikit-image`、`scikit-learn`、`matplotlib`、`plotly`、`fastapi`、`uvicorn`（后两者用于重规划服务）。
 
 ### 9.2 运行示例
 
 ```bash
-# 完整流程（推荐）
+# 统一输入接口测试（第一阶段）
+python demo/demo_unified_input.py
+
+# 统一输入适配器测试（第二阶段）
+python demo/demo_unified_adapter.py
+
+# 统一输入 → TopoGraph 桥接测试（第三阶段）
+python demo/demo_unified_topo_bridge.py
+
+# 统一输入 → EdgeTask 测试（第四阶段，输出 result/unified_edge_tasks/）
+python demo/demo_unified_edge_tasks.py
+
+# 统一输入 → Mission 完整闭环（第五阶段，输出 result/unified_mission/）
+python demo/demo_unified_mission.py
+python demo/demo_unified_mission_visualization.py
+
+# Mission 拓扑感知优化对比（第六阶段）
+python demo/demo_mission_compare.py
+python demo/demo_unified_mission_visualization.py
+
+# 完整流程（推荐，图像 → 拓扑 → 任务 JSON）
 python demo/demo_visualization_main.py
 
-# 查看结果
-# 输出文件在 result/latest/ 目录
+# 重规划 HTTP 服务（需 fastapi / uvicorn）
+python scripts/replan_service.py
 ```
+
+输出目录：`result/latest/`（`mission_output.json`、`main_view_interactive.html` 等）。
 
 ### 9.3 代码示例
 
