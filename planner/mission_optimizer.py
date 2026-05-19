@@ -151,6 +151,7 @@ def build_optimized_unified_mission(
     groups: Optional[dict] = None,
     eps: float = 150.0,
     start_edge_id: Optional[str] = None,
+    connect_planner: str = "bfs",
 ):
     """
     基于优化边序构建 GroupedContinuousMission。
@@ -181,5 +182,6 @@ def build_optimized_unified_mission(
         edge_task_map,
         groups,
         adjacency,
+        connect_planner=connect_planner,
     )
     return mission, edge_order, edge_directions

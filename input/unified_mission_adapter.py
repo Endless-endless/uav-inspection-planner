@@ -16,6 +16,7 @@ from core.topo_global_optimizer import plan_global_topology_optimized_mission
 from core.topo_task import EdgeTask
 from input.unified_input import UnifiedInput
 from input.unified_task_adapter import unified_input_to_edge_tasks
+from planner.mission_optimizer import build_optimized_unified_mission
 
 DEFAULT_MISSION_OUTPUT_DIR = "result/unified_mission"
 DEFAULT_MISSION_JSON = "result/unified_mission/mission_output.json"
@@ -119,6 +120,42 @@ def export_unified_mission(
         f.write("\n")
 
     return str(output_path.resolve())
+
+
+def unified_input_to_mission_optimized(
+    unified_input: UnifiedInput,
+    spacing: float = 50.0,
+    merge_thresh: float = 25.0,
+    eps: float = 150.0,
+    connect_planner: str = "dijkstra",
+    start_edge_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    UnifiedInput → Mission（topology-aware 边序 + 可选 connect_planner）。
+
+    connect_planner: 'bfs' | 'dijkstra'（dijkstra 失败时 connect 段 fallback BFS）
+    """
+    topo_graph, edge_tasks, line_inspection_points_by_line = unified_input_to_edge_tasks(
+        unified_input,
+        spacing=spacing,
+        merge_thresh=merge_thresh,
+    )
+
+    mission, _order, _dirs = build_optimized_unified_mission(
+        topo_graph,
+        edge_tasks,
+        eps=eps,
+        start_edge_id=start_edge_id,
+        connect_planner=connect_planner,
+    )
+
+    return {
+        "topo_graph": topo_graph,
+        "edge_tasks": edge_tasks,
+        "line_inspection_points_by_line": line_inspection_points_by_line,
+        "mission": mission,
+        "connect_planner": connect_planner,
+    }
 
 
 def print_mission_summary(mission_result: Dict[str, Any]) -> None:

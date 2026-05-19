@@ -329,6 +329,11 @@ python demo/demo_unified_mission_visualization.py
 python demo/demo_mission_compare.py
 python demo/demo_unified_mission_visualization.py
 
+# 拓扑连接 Dijkstra vs BFS（第七阶段，输出 result/dijkstra_test/）
+python demo/demo_dijkstra_topo_compare.py
+python demo/demo_mission_bfs_vs_dijkstra.py
+python demo/demo_dijkstra_visualization.py
+
 # 完整流程（推荐，图像 → 拓扑 → 任务 JSON）
 python demo/demo_visualization_main.py
 

@@ -556,7 +556,8 @@ def build_optimized_mission(
     topo_graph: TopoGraph,
     edge_task_map: Dict[str, EdgeTask],
     groups: Dict[str, EdgeGroup],
-    adjacency: dict
+    adjacency: dict,
+    connect_planner: str = "bfs",
 ) -> GroupedContinuousMission:
     """
     根据优化后的顺序构建任务
@@ -617,10 +618,18 @@ def build_optimized_mission(
             print(f"  [{i+1}] {edge_id} ({direction}) - 起点")
             continue
 
-        # 生成 connect 段
-        connect_geo, connect_len = generate_connection_segment_along_topo(
-            current_end_point, geo[0], topo_graph, edge_task_map
-        )
+        # 生成 connect 段（默认 BFS；可选 dijkstra）
+        if connect_planner and connect_planner.lower() == "dijkstra":
+            from planner.topo_dijkstra import generate_connection_segment_with_planner
+
+            connect_geo, connect_len = generate_connection_segment_with_planner(
+                current_end_point, geo[0], topo_graph, edge_task_map,
+                connect_planner="dijkstra",
+            )
+        else:
+            connect_geo, connect_len = generate_connection_segment_along_topo(
+                current_end_point, geo[0], topo_graph, edge_task_map
+            )
 
         # 插值密集路径点
         connect_geo_dense = interpolate_geometry(connect_geo, step_size=10.0, min_points=20)
