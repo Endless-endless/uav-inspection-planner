@@ -19,17 +19,30 @@ env/
 # Logs
 *.log
 
-# Media
-*.mp4
-*.jpg
-*.png
-
-# Result outputs
+# Run outputs
 result/
 
-# 临时备份文件
-*.old
+# Generated visualization
+figures/
+*.html
+!docs/**/*.html
 
-# 可选（如果你有）
+# Demo media (local only)
+/media/demos/*.mp4
+/media/demos/*.avi
+/media/demos/*.mov
+/*.mp4
+/*.avi
+/*.mov
+
+# Temp / backup
+*.old
+*.bak
 *.json.bak
 *.html.bak
+
+# Generated images: ignore by default, keep data/ inputs
+*.png
+*.jpg
+!data/**/*.png
+!data/**/*.jpg
