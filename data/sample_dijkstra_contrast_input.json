@@ -1,0 +1,79 @@
+{
+  "lines": [
+    {
+      "id": "line_highway",
+      "points": [
+        [0.0, 0.0],
+        [600.0, 700.0],
+        [1000.0, 0.0]
+      ],
+      "voltage_level": "220kV",
+      "metadata": {
+        "role": "highway",
+        "note": "2-hop path ~1727px: BFS prefers fewer hops"
+      }
+    },
+    {
+      "id": "line_detour_1",
+      "points": [
+        [0.0, 0.0],
+        [200.0, 0.0]
+      ],
+      "voltage_level": "110kV",
+      "metadata": { "role": "detour", "segment": 1 }
+    },
+    {
+      "id": "line_detour_2",
+      "points": [
+        [200.0, 0.0],
+        [400.0, 0.0]
+      ],
+      "voltage_level": "110kV",
+      "metadata": { "role": "detour", "segment": 2 }
+    },
+    {
+      "id": "line_detour_3",
+      "points": [
+        [400.0, 0.0],
+        [600.0, 0.0]
+      ],
+      "voltage_level": "110kV",
+      "metadata": { "role": "detour", "segment": 3 }
+    },
+    {
+      "id": "line_detour_4",
+      "points": [
+        [600.0, 0.0],
+        [1000.0, 0.0]
+      ],
+      "voltage_level": "110kV",
+      "metadata": { "role": "detour", "bridge": true, "len": 400 }
+    }
+  ],
+  "towers": [
+    {
+      "id": "tower_start",
+      "position": [0.0, 0.0],
+      "metadata": { "role": "start" }
+    },
+    {
+      "id": "tower_goal",
+      "position": [1000.0, 0.0],
+      "metadata": { "role": "goal" }
+    }
+  ],
+  "weather": {
+    "wind_speed": 0.0,
+    "wind_direction": 0.0,
+    "visibility": "good"
+  },
+  "uav": {
+    "max_speed": 10.0,
+    "battery_capacity": 100.0,
+    "safe_distance": 5.0
+  },
+  "metadata": {
+    "schema_version": "1.0",
+    "description": "Dijkstra contrast: BFS favors 2-hop highway (~1727px), Dijkstra favors 4-hop detour (1000px)"
+  }
+}
