@@ -258,6 +258,7 @@ async def _run_image_replan(
         spacing=planning_spacing,
         map_background=map_bg,
         coordinate_mode="image_fixed",
+        root=ROOT,
         extra_metadata={
             "planner": "start_end_replan",
             "start": replan_meta.get("start", start),
@@ -463,6 +464,7 @@ async def _plan_unified_pipeline(req: PlanRequest) -> Dict[str, Any]:
         output_files=output_files,
         extra_metadata={"planner_name": meta_planner_name},
         map_mode=unified_map_mode,
+        root=ROOT,
     )
     dashboard["metadata"]["requested_map_mode"] = req.map_mode
     if req.map_mode == "image_overlay":
@@ -502,6 +504,39 @@ async def api_map_background():
     if not map_path.exists():
         raise HTTPException(status_code=404, detail="Map image not found: data/test.png")
     return FileResponse(map_path, media_type="image/png")
+
+
+INSPECTION_SAMPLE_IMAGES = [
+    ROOT / "data" / "section1" / "1.png",
+    ROOT / "data" / "section1" / "2.png",
+    ROOT / "data" / "section1" / "3.png",
+]
+
+
+@app.get("/api/inspection-sample/{idx}")
+async def api_inspection_sample(idx: int):
+    """Dashboard 巡检点示例图（无 image_ref 时轮换展示）。"""
+    paths = [p for p in INSPECTION_SAMPLE_IMAGES if p.exists()]
+    if not paths:
+        raise HTTPException(status_code=404, detail="No inspection sample images")
+    path = paths[idx % len(paths)]
+    return FileResponse(path, media_type="image/png")
+
+
+@app.get("/api/inspection-file")
+async def api_inspection_file(path: str):
+    """安全提供项目内巡检图片（相对 ROOT）。"""
+    safe = Path(path).as_posix().lstrip("/")
+    if ".." in safe.split("/"):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    target = (ROOT / safe).resolve()
+    try:
+        target.relative_to(ROOT.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Path outside project") from None
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(target)
 
 
 @app.get("/api/image-mission/status")

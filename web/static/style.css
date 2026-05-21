@@ -122,6 +122,140 @@ body {
   min-height: 420px;
 }
 
+.map-inspect-row {
+  display: grid;
+  grid-template-columns: 1fr 300px;
+  gap: 0.75rem;
+  align-items: stretch;
+}
+
+@media (max-width: 1100px) {
+  .map-inspect-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.playback-panel .btn-sm-play {
+  width: 100%;
+  margin-bottom: 0.45rem;
+}
+
+.playback-progress {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-top: 0.5rem;
+}
+
+.inspect-info-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 0.85rem;
+  min-width: 0;
+  max-height: 620px;
+  overflow-y: auto;
+}
+
+.inspect-info-card.hidden {
+  display: none;
+}
+
+.inspect-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.65rem;
+}
+
+.inspect-card-header h3 {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.inspect-status {
+  font-size: 0.68rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.inspect-status.idle {
+  background: var(--surface2);
+  color: var(--muted);
+}
+
+.inspect-status.shooting {
+  background: rgba(59, 130, 246, 0.2);
+  color: #93c5fd;
+  animation: pulse 1s ease infinite;
+}
+
+.inspect-status.done {
+  background: rgba(34, 197, 94, 0.2);
+  color: #86efac;
+}
+
+@keyframes pulse {
+  50% { opacity: 0.65; }
+}
+
+.inspect-meta {
+  display: grid;
+  grid-template-columns: 4.5em 1fr;
+  gap: 0.25rem 0.5rem;
+  font-size: 0.78rem;
+  margin-bottom: 0.65rem;
+}
+
+.inspect-meta dt {
+  color: var(--muted);
+}
+
+.inspect-meta dd {
+  color: var(--text);
+  word-break: break-all;
+}
+
+.inspect-img-wrap img {
+  width: 100%;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #0f172a;
+  aspect-ratio: 16/10;
+  object-fit: cover;
+}
+
+.inspect-img-hint {
+  font-size: 0.7rem;
+  color: var(--muted);
+  margin-top: 0.35rem;
+  text-align: center;
+}
+
+.modal-map-wrap {
+  display: flex;
+  flex: 1;
+  gap: 0.75rem;
+  min-height: 0;
+  position: relative;
+}
+
+.modal-panel .plot-area-fs {
+  flex: 1;
+  height: auto;
+  min-height: 0;
+}
+
+.inspect-float {
+  width: 280px;
+  flex-shrink: 0;
+  max-height: 100%;
+  z-index: 2;
+}
+
 .panel-stats {
   grid-column: 2;
 }
@@ -317,6 +451,7 @@ body {
   max-width: none;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);

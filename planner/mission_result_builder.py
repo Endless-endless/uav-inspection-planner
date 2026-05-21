@@ -122,8 +122,114 @@ def _segments_from_json(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return segments
 
 
-def _inspection_points_from_json(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    inspection_points = []
+def _edge_to_segment_map(segments: List[Dict[str, Any]]) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for seg in segments:
+        sid = seg.get("segment_id")
+        eid = seg.get("edge_id")
+        if seg.get("type") == "inspect" and sid:
+            if eid:
+                mapping[eid] = sid
+            mapping[sid] = sid
+    return mapping
+
+
+def _resolve_inspection_image_url(
+    pt: Dict[str, Any],
+    index: int,
+    root: Optional[Path] = None,
+) -> Optional[str]:
+    """解析巡检点图片 URL；无图时返回 None（前端用占位图）。"""
+    ref = pt.get("image_url") or pt.get("image_path") or pt.get("image_ref")
+    if not ref or not isinstance(ref, str):
+        return None
+    ref = ref.strip()
+    if ref.startswith(("http://", "https://", "/")):
+        return ref
+    if root is not None:
+        candidate = root / ref
+        if candidate.is_file():
+            rel = candidate.relative_to(root).as_posix()
+            return f"/api/inspection-file?path={rel}"
+    return None
+
+
+def enrich_inspection_points_for_dashboard(
+    points: List[Dict[str, Any]],
+    segments: List[Dict[str, Any]],
+    *,
+    root: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    """扩展 Dashboard 巡检点字段（含 segment_id、priority、image_url 等）。"""
+    edge_map = _edge_to_segment_map(segments)
+    placeholders = [
+        "/static/inspection_placeholder.svg",
+        "/static/inspection_placeholder_1.svg",
+        "/static/inspection_placeholder_2.svg",
+    ]
+    sample_urls = ["/api/inspection-sample/0", "/api/inspection-sample/1", "/api/inspection-sample/2"]
+
+    enriched: List[Dict[str, Any]] = []
+    for i, pt in enumerate(points):
+        eid = pt.get("edge_id")
+        sid = pt.get("segment_id") or (edge_map.get(eid) if eid else None)
+        image_url = _resolve_inspection_image_url(pt, i, root)
+        if not image_url:
+            image_url = sample_urls[i % len(sample_urls)]
+
+        status = pt.get("status") or "pending"
+        priority = pt.get("priority") or (
+            "high" if (pt.get("point_type") or "") in ("endpoint", "start", "end") else "normal"
+        )
+        description = pt.get("description") or pt.get("source_reason") or ""
+
+        enriched.append({
+            "id": pt.get("id") or pt.get("point_id") or f"ip_{i:04d}",
+            "point_id": pt.get("point_id") or pt.get("id") or f"ip_{i:04d}",
+            "x": pt["x"],
+            "y": pt["y"],
+            "segment_id": sid,
+            "edge_id": eid,
+            "point_type": pt.get("point_type") or "sample",
+            "priority": priority,
+            "image_path": pt.get("image_path"),
+            "image_url": image_url,
+            "image_placeholder": placeholders[i % len(placeholders)],
+            "description": description,
+            "status": status,
+            "metadata": {
+                k: v
+                for k, v in pt.items()
+                if k
+                not in (
+                    "x",
+                    "y",
+                    "point_id",
+                    "id",
+                    "edge_id",
+                    "segment_id",
+                    "point_type",
+                    "priority",
+                    "image_path",
+                    "image_url",
+                    "image_placeholder",
+                    "description",
+                    "status",
+                    "metadata",
+                )
+            },
+        })
+    return enriched
+
+
+def _inspection_points_from_json(
+    data: Dict[str, Any],
+    segments: Optional[List[Dict[str, Any]]] = None,
+    *,
+    root: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
+    segments = segments or _segments_from_json(data)
+    raw_points: List[Dict[str, Any]] = []
     for pt in data.get("inspection_points", []):
         pos = (
             pt.get("pixel_position")
@@ -134,14 +240,26 @@ def _inspection_points_from_json(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             pos = [pt["x"], pt["y"]]
         if not pos or len(pos) < 2:
             continue
-        inspection_points.append({
+        raw_points.append({
             "point_id": pt.get("point_id"),
+            "id": pt.get("point_id"),
             "edge_id": pt.get("edge_id"),
+            "segment_id": pt.get("segment_id"),
             "x": float(pos[0]),
             "y": float(pos[1]),
             "point_type": pt.get("point_type") or pt.get("type") or "sample",
+            "priority": pt.get("priority"),
+            "image_path": pt.get("image_path"),
+            "image_url": pt.get("image_url"),
+            "image_ref": pt.get("image_ref"),
+            "description": pt.get("description") or pt.get("source_reason"),
+            "status": pt.get("status"),
+            "group_id": pt.get("group_id"),
+            "line_id": pt.get("line_id"),
+            "visit_order": pt.get("visit_order"),
+            "source_reason": pt.get("source_reason"),
         })
-    return inspection_points
+    return enrich_inspection_points_for_dashboard(raw_points, segments, root=root)
 
 
 def _statistics_from_json(data: Dict[str, Any], inspection_points: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -187,10 +305,11 @@ def build_dashboard_from_mission_json(
     coordinate_mode: str = "auto_fit",
     output_files: Optional[Dict[str, str]] = None,
     extra_metadata: Optional[Dict[str, Any]] = None,
+    root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """从已导出的 mission_output.json 构建 Dashboard 结构。"""
     segments = _segments_from_json(data)
-    inspection_points = _inspection_points_from_json(data)
+    inspection_points = _inspection_points_from_json(data, segments, root=root)
     statistics = _statistics_from_json(data, inspection_points)
 
     visit = data.get("visit_order", {})
@@ -275,6 +394,7 @@ def build_image_pipeline_dashboard(
             "background": map_rel,
             "map_image": map_rel,
         },
+        root=root,
     )
 
 
@@ -289,6 +409,7 @@ def build_dashboard_payload(
     output_files: Optional[Dict[str, str]] = None,
     extra_metadata: Optional[Dict[str, Any]] = None,
     map_mode: str = "topology_only",
+    root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Unified 管线：从实时规划结果构建 Dashboard（不绑定 test.png）。"""
     mission = mission_result["mission"]
@@ -300,7 +421,9 @@ def build_dashboard_payload(
         _segment_to_dict(seg, i)
         for i, seg in enumerate(getattr(mission, "segments", []) or [])
     ]
-    inspection_points = _collect_inspection_points(mission_result)
+    inspection_points = enrich_inspection_points_for_dashboard(
+        _collect_inspection_points(mission_result), segments, root=root
+    )
     markers = _start_end_from_segments(segments)
 
     statistics = {

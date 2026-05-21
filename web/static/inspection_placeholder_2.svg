@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200" viewBox="0 0 320 200">
+  <rect width="320" height="200" fill="#172554"/>
+  <polygon points="160,50 220,150 100,150" fill="none" stroke="#fbbf24" stroke-width="3"/>
+  <text x="160" y="175" text-anchor="middle" fill="#fde68a" font-family="Segoe UI,sans-serif" font-size="13">��:� #2</text>
+</svg>

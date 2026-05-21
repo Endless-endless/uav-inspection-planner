@@ -37,6 +37,7 @@ const state = {
   pickPhase: null,
   plotReady: { mapPlot: false, mapPlotFs: false },
 };
+window.state = state;
 
 function getPipeline() {
   return $("pipelineSelect")?.value || "image";
@@ -662,7 +663,10 @@ function buildMissionLayout(result, options = {}) {
 }
 
 function buildPlotFromMission(result, options = {}) {
-  const traces = buildMissionTraces(result);
+  let traces = buildMissionTraces(result);
+  if (typeof window.appendPlaybackTraces === "function") {
+    traces = window.appendPlaybackTraces(traces, result);
+  }
   const layout = buildMissionLayout(result, options);
   return {
     traces,
@@ -673,6 +677,12 @@ function buildPlotFromMission(result, options = {}) {
       scrollZoom: true,
     },
   };
+}
+
+function onMissionLoaded(result) {
+  if (typeof window.onMissionLoadedForPlayback === "function") {
+    window.onMissionLoadedForPlayback(result);
+  }
 }
 
 function bindMapClick(plotId) {
@@ -732,12 +742,19 @@ function renderMission(result, targetId = "mapPlot", options = {}) {
     if (options.fullscreen) Plotly.Plots.resize(targetId);
   };
 
+  const afterDraw = () => {
+    draw();
+    if (typeof window.resetPlayback === "function" && state.lastResult && targetId === "mapPlot") {
+      window.resetPlayback(state.lastResult);
+    }
+  };
+
   if (state.plotReady[targetId] && el.data) {
-    Plotly.react(targetId, plot.traces, plot.layout, plot.config).then(draw);
+    Plotly.react(targetId, plot.traces, plot.layout, plot.config).then(afterDraw);
   } else {
     Plotly.newPlot(targetId, plot.traces, plot.layout, plot.config).then(() => {
       state.plotReady[targetId] = true;
-      draw();
+      afterDraw();
     });
   }
 }
@@ -802,6 +819,7 @@ async function runReplan() {
     renderStats(dashboard.statistics);
     renderVisitOrder(dashboard.visit_order);
     renderMission(dashboard);
+    onMissionLoaded(dashboard);
     renderMeta(dashboard.metadata || {});
     updateDownloadLinks(dashboard.output_files || {}, "image");
 
@@ -869,6 +887,7 @@ async function runPlanning() {
     renderStats(state.lastResult.statistics);
     renderVisitOrder(state.lastResult.visit_order);
     renderMission(state.lastResult);
+    onMissionLoaded(state.lastResult);
     renderMeta(data.metadata || {});
     updateDownloadLinks(data.output_files || {}, pipeline);
 
@@ -929,6 +948,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     applyPipelineUi();
     state.lastResult = null;
     state.plotReady.mapPlot = false;
+    if (typeof window.resetInspectionPlayback === "function") window.resetInspectionPlayback();
     setStatus("就绪", "");
   });
 

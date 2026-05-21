@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200" viewBox="0 0 320 200">
+  <rect width="320" height="200" fill="#1e293b"/>
+  <rect x="24" y="24" width="272" height="152" rx="8" fill="#334155" stroke="#64748b" stroke-width="2"/>
+  <circle cx="160" cy="88" r="28" fill="none" stroke="#94a3b8" stroke-width="3"/>
+  <path d="M148 88 L156 96 L176 72" fill="none" stroke="#38bdf8" stroke-width="4" stroke-linecap="round"/>
+  <text x="160" y="140" text-anchor="middle" fill="#94a3b8" font-family="Segoe UI,sans-serif" font-size="14">��`M�</text>
+</svg>
