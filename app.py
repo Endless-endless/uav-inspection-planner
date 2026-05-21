@@ -511,6 +511,8 @@ INSPECTION_SAMPLE_IMAGES = [
     ROOT / "data" / "section1" / "2.png",
     ROOT / "data" / "section1" / "3.png",
 ]
+INSPECTION_IMAGE_DIR = ROOT / "figures" / "inspection_images"
+INSPECTION_PLACEHOLDER = STATIC_DIR / "inspection_placeholder.svg"
 
 
 @app.get("/api/inspection-sample/{idx}")
@@ -537,6 +539,34 @@ async def api_inspection_file(path: str):
     if not target.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(target)
+
+
+@app.get("/api/inspection-image/{filename}")
+async def api_inspection_image(filename: str):
+    """
+    返回 figures/inspection_images 中的巡检图。
+    若文件不存在，返回 placeholder。
+    """
+    safe = Path(filename).name
+    if safe != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    ext = Path(safe).suffix.lower()
+    if ext not in (".jpg", ".jpeg", ".png"):
+        raise HTTPException(status_code=400, detail="Unsupported image type")
+
+    path = (INSPECTION_IMAGE_DIR / safe).resolve()
+    try:
+        path.relative_to(INSPECTION_IMAGE_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid image path") from None
+
+    if path.is_file():
+        media = "image/png" if ext == ".png" else "image/jpeg"
+        return FileResponse(path, media_type=media)
+
+    if INSPECTION_PLACEHOLDER.exists():
+        return FileResponse(INSPECTION_PLACEHOLDER, media_type="image/svg+xml")
+    raise HTTPException(status_code=404, detail=f"Inspection image not found: {safe}")
 
 
 @app.get("/api/image-mission/status")

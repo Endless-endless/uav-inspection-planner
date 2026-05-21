@@ -163,6 +163,17 @@ def build_optimized_unified_mission(
     与 build_grouped_continuous_mission 组内二次贪心不同，可保留拓扑贪心顺序。
     返回类型仍为 GroupedContinuousMission。
     """
+    required_edge_tasks = [t for t in edge_tasks if (t.num_points or 0) > 0]
+    skipped_edges = [t for t in edge_tasks if (t.num_points or 0) <= 0]
+    for t in skipped_edges:
+        print(
+            f"[DEBUG] dead-end branch skipped/truncated edge={t.edge_id} "
+            "reason=no_required_inspection_points"
+        )
+    edge_tasks = required_edge_tasks
+    if not edge_tasks:
+        raise ValueError("No required inspection edges after filtering edge_tasks")
+
     edge_task_map = {t.edge_id: t for t in edge_tasks}
     adjacency = build_edge_adjacency_simple(topo_graph)
 

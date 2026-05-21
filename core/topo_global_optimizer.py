@@ -27,6 +27,7 @@ from core.topo_plan import (
     EdgeGroup, GroupedContinuousMission, MissionSegment,
     build_edge_adjacency_simple, compute_transition_cost_simple,
     get_edge_geometry_with_direction, interpolate_geometry,
+    get_edge_inspection_geometry_with_direction,
     generate_connection_segment_along_topo
 )
 
@@ -378,7 +379,9 @@ def evaluate_order_cost(
             continue
 
         # 获取当前边的几何
-        geo = get_edge_geometry_with_direction(edge, direction)
+        geo = get_edge_inspection_geometry_with_direction(edge, direction)
+        if len(geo) < 2:
+            continue
 
         if i == 0:
             # 第一个边，设置起点
@@ -592,7 +595,10 @@ def build_optimized_mission(
             current_group = group_id
 
         # 获取当前边的几何
-        geo = get_edge_geometry_with_direction(edge, direction)
+        geo = get_edge_inspection_geometry_with_direction(edge, direction, debug=True)
+        if len(geo) < 2:
+            print(f"[DEBUG] dead-end branch skipped/truncated edge={edge_id} reason=empty_trimmed_inspect_geometry")
+            continue
 
         if i == 0:
             # 第一个边：直接添加 inspect 段
@@ -601,10 +607,18 @@ def build_optimized_mission(
                 from_edge_id=None,
                 to_edge_id=edge_id,
                 geometry=geo,
-                length=edge.len2d,
+                length=float(np.sum(np.linalg.norm(np.diff(np.array(geo), axis=0), axis=1))),
                 edge_id=edge_id
             ))
             mission.visit_order.append(edge_id)
+            print(
+                f"[DEBUG] visit target edge={edge_id} type=inspection_point "
+                f"start={geo[0]} end={geo[-1]}"
+            )
+            print(
+                f"[DEBUG] segment generated type=inspect edge={edge_id} "
+                f"length={mission.segments[-1].length:.2f} reason=required_inspection_points_only"
+            )
 
             current_end_point = geo[-1]
             current_edge_id = edge_id
@@ -647,6 +661,10 @@ def build_optimized_mission(
             length=connect_len
         )
         mission.segments.append(connect_segment)
+        print(
+            f"[DEBUG] segment generated type=connect from={current_edge_id} to={edge_id} "
+            f"length={connect_len:.2f} reason=connect_next_required_inspection"
+        )
 
         # 统计跨组/内组连接
         if is_inter_group:
@@ -660,10 +678,18 @@ def build_optimized_mission(
             from_edge_id=current_edge_id,
             to_edge_id=edge_id,
             geometry=geo,
-            length=edge.len2d,
+            length=float(np.sum(np.linalg.norm(np.diff(np.array(geo), axis=0), axis=1))),
             edge_id=edge_id
         ))
         mission.visit_order.append(edge_id)
+        print(
+            f"[DEBUG] visit target edge={edge_id} type=inspection_point "
+            f"start={geo[0]} end={geo[-1]}"
+        )
+        print(
+            f"[DEBUG] segment generated type=inspect edge={edge_id} "
+            f"length={mission.segments[-1].length:.2f} reason=trimmed_to_last_required_point"
+        )
 
         # 添加到 group
         if group_id and group_id in groups:
@@ -738,7 +764,19 @@ def plan_global_topology_optimized_mission(
     print("[全局拓扑优化] 开始规划...")
     print("="*70)
 
-    # 1. 构建辅助数据结构
+    # 1. 仅保留有巡检任务的边，避免无任务端点往返
+    required_edge_tasks = [t for t in edge_tasks if (t.num_points or 0) > 0]
+    skipped_edges = [t for t in edge_tasks if (t.num_points or 0) <= 0]
+    for t in skipped_edges:
+        print(
+            f"[DEBUG] dead-end branch skipped/truncated edge={t.edge_id} "
+            "reason=no_required_inspection_points"
+        )
+    edge_tasks = required_edge_tasks
+    if not edge_tasks:
+        print("[WARN] 无可巡检边任务（全部 edge 均无 inspection_points）")
+        return GroupedContinuousMission()
+
     edge_task_map = {task.edge_id: task for task in edge_tasks}
     adjacency = build_edge_adjacency_simple(topo_graph)
 

@@ -24,6 +24,7 @@
     totalInspectCount: 0,
     usingPlaceholder: false,
     debug: null,
+    imageCache: new Map(),
   };
 
   function dist(a, b) {
@@ -357,6 +358,10 @@
       if (img) img.src = "/static/inspection_placeholder.svg";
       const hint = $(`inspectCardImgHint${p}`);
       if (hint) hint.textContent = "";
+      const uav = $(`inspectCardUavStatus${p}`);
+      if (uav) uav.textContent = "待命";
+      const time = $(`inspectCardTime${p}`);
+      if (time) time.textContent = "—";
       const st = $(`inspectCardStatus${p}`);
       if (st) {
         st.textContent = "待命";
@@ -380,10 +385,34 @@
     set("inspectCardType", point.point_type || "sample");
     set("inspectCardPriority", point.priority || "normal");
     set("inspectCardProgress", `${index} / ${Math.max(total, 1)}`);
+    set("inspectCardUavStatus", "正在巡检");
+    set("inspectCardTime", new Date().toLocaleTimeString("zh-CN"));
     const img = $(`inspectCardImg${p}`);
-    if (img) img.src = "/static/inspection_placeholder.svg";
+    const imageUrl =
+      point.image_url ||
+      point.image_path ||
+      point.image_placeholder ||
+      "/static/inspection_placeholder.svg";
+    const finalUrl = PLAYBACK.imageCache.get(imageUrl) || imageUrl;
+    if (img) {
+      img.onerror = () => {
+        img.src = point.image_placeholder || "/static/inspection_placeholder.svg";
+        PLAYBACK.usingPlaceholder = true;
+      };
+      img.src = finalUrl;
+    }
+    if (!PLAYBACK.imageCache.has(imageUrl)) {
+      const preload = new Image();
+      preload.onload = () => PLAYBACK.imageCache.set(imageUrl, imageUrl);
+      preload.src = imageUrl;
+    }
     const hint = $(`inspectCardImgHint${p}`);
-    if (hint) hint.textContent = "暂无巡检图片，显示占位图";
+    if (hint) {
+      hint.textContent =
+        point.image_available && point.image_url
+          ? "巡检图片已加载"
+          : "暂无巡检图片，显示占位图";
+    }
     const st = $(`inspectCardStatus${p}`);
     if (st) {
       st.textContent = "正在拍照";
@@ -411,13 +440,27 @@
   function buildPlaybackTraces() {
     return [
       {
+        name: "UAV Glow",
+        x: [],
+        y: [],
+        mode: "markers",
+        marker: {
+          size: 26,
+          color: "rgba(34, 211, 238, 0.23)",
+          symbol: "circle",
+          line: { width: 0, color: "rgba(0,0,0,0)" },
+        },
+        showlegend: false,
+        hoverinfo: "skip",
+      },
+      {
         name: "UAV",
         x: [],
         y: [],
         mode: "markers",
         marker: {
-          size: 15,
-          color: "#22d3ee",
+          size: 16,
+          color: "#7dd3fc",
           symbol: "triangle-up",
           line: { width: 2, color: "#0e7490" },
         },
@@ -463,6 +506,14 @@
     /* 改为按 name 动态查找，无需预注册 */
   };
 
+  window.getPlaybackVisualState = function () {
+    return {
+      status: PLAYBACK.status,
+      currentPointId: PLAYBACK.currentPointId,
+      visitedIds: new Set(PLAYBACK.visitedIds),
+    };
+  };
+
   function getTraceIndices(plotId) {
     const el = document.getElementById(plotId);
     if (!el?.data?.length) return null;
@@ -470,6 +521,7 @@
     const uav = idx("UAV");
     if (uav < 0) return null;
     return {
+      glow: idx("UAV Glow"),
       uav,
       current: idx("Current Inspect"),
       visited: idx("Visited"),
@@ -483,6 +535,19 @@
     if (!idx || idx.uav < 0) return;
 
     try {
+      if (idx.glow >= 0) {
+        Plotly.restyle(
+          plotId,
+          PLAYBACK.uavPos
+            ? {
+                x: [[PLAYBACK.uavPos.x]],
+                y: [[PLAYBACK.uavPos.y]],
+              }
+            : { x: [[]], y: [[]] },
+          [idx.glow]
+        );
+      }
+
       Plotly.restyle(
         plotId,
         PLAYBACK.uavPos

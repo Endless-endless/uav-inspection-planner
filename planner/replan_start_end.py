@@ -54,6 +54,80 @@ def _path_length(polyline: List[Point]) -> float:
     return sum(_dist(polyline[i], polyline[i + 1]) for i in range(len(polyline) - 1))
 
 
+def _point_at_distance(polyline: List[Point], target: float) -> Point:
+    if not polyline:
+        return (0.0, 0.0)
+    if len(polyline) == 1:
+        return (float(polyline[0][0]), float(polyline[0][1]))
+    remain = max(0.0, target)
+    for i in range(len(polyline) - 1):
+        p0 = polyline[i]
+        p1 = polyline[i + 1]
+        seg_len = _dist(p0, p1)
+        if seg_len < 1e-9:
+            continue
+        if remain <= seg_len:
+            t = remain / seg_len
+            return (
+                p0[0] + t * (p1[0] - p0[0]),
+                p0[1] + t * (p1[1] - p0[1]),
+            )
+        remain -= seg_len
+    return (float(polyline[-1][0]), float(polyline[-1][1]))
+
+
+def _project_to_polyline_distance(point: Point, polyline: List[Point]) -> Optional[float]:
+    if len(polyline) < 2:
+        return None
+    px, py = point
+    best_d = float("inf")
+    best_s = 0.0
+    cum = 0.0
+    for i in range(len(polyline) - 1):
+        x1, y1 = polyline[i]
+        x2, y2 = polyline[i + 1]
+        vx, vy = (x2 - x1), (y2 - y1)
+        seg_len = math.hypot(vx, vy)
+        if seg_len < 1e-9:
+            continue
+        wx, wy = (px - x1), (py - y1)
+        t = (wx * vx + wy * vy) / (seg_len * seg_len)
+        t = max(0.0, min(1.0, t))
+        qx, qy = (x1 + t * vx, y1 + t * vy)
+        d = math.hypot(px - qx, py - qy)
+        if d < best_d:
+            best_d = d
+            best_s = cum + t * seg_len
+        cum += seg_len
+    return best_s
+
+
+def _slice_polyline(polyline: List[Point], s0: float, s1: float) -> List[Point]:
+    total = _path_length(polyline)
+    if total < 1e-9:
+        return list(polyline)
+    start_s = max(0.0, min(total, s0))
+    end_s = max(0.0, min(total, s1))
+    if end_s < start_s:
+        start_s, end_s = end_s, start_s
+    start_pt = _point_at_distance(polyline, start_s)
+    end_pt = _point_at_distance(polyline, end_s)
+    out: List[Point] = [start_pt]
+    cum = 0.0
+    for i in range(len(polyline) - 1):
+        seg_len = _dist(polyline[i], polyline[i + 1])
+        if seg_len < 1e-9:
+            continue
+        if cum > start_s + 1e-9 and cum < end_s - 1e-9:
+            out.append((float(polyline[i][0]), float(polyline[i][1])))
+        cum += seg_len
+    if _dist(out[-1], end_pt) > 1e-6:
+        out.append(end_pt)
+    if len(out) == 1:
+        out.append(end_pt)
+    return out
+
+
 def _interpolate_line(p0: Point, p1: Point, step: float = 5.0) -> List[Point]:
     """Dense connect polyline for display (similar to legacy mission connects)."""
     total = _dist(p0, p1)
@@ -111,6 +185,14 @@ def _sample_polyline(
 
 
 def _extract_inspect_tasks(base_mission: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    edge_points: Dict[str, List[Point]] = {}
+    for pt in base_mission.get("inspection_points", []) or []:
+        edge_id = pt.get("edge_id")
+        pos = pt.get("pixel_position") or [pt.get("x"), pt.get("y")]
+        if not edge_id or not pos or len(pos) < 2:
+            continue
+        edge_points.setdefault(edge_id, []).append((float(pos[0]), float(pos[1])))
+
     tasks: Dict[str, Dict[str, Any]] = {}
     for seg in base_mission.get("segments", []):
         if seg.get("type") != "inspect":
@@ -124,6 +206,24 @@ def _extract_inspect_tasks(base_mission: Dict[str, Any]) -> Dict[str, Dict[str, 
         ]
         if len(polyline) < 2:
             continue
+        required_points = edge_points.get(eid, [])
+        if required_points:
+            projected = [
+                _project_to_polyline_distance(pt, polyline)
+                for pt in required_points
+            ]
+            projected = [s for s in projected if s is not None]
+            if projected:
+                s_min = min(projected)
+                s_max = max(projected)
+                trimmed = _slice_polyline(polyline, s_min, s_max)
+                if len(trimmed) >= 2:
+                    print(
+                        f"[DEBUG] dead-end branch skipped/truncated edge={eid} "
+                        f"slice=({s_min:.2f},{s_max:.2f}) full={_path_length(polyline):.2f} "
+                        f"trimmed={_path_length(trimmed):.2f}"
+                    )
+                    polyline = trimmed
         tasks[eid] = {
             "edge_id": eid,
             "polyline": polyline,

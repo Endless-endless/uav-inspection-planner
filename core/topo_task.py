@@ -20,9 +20,8 @@ EdgeTask：
 """
 
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
+from typing import Any, List, Tuple, Dict, Optional
 import numpy as np
-from scipy.spatial.distance import euclidean
 
 
 # =====================================================
@@ -84,80 +83,62 @@ def map_points_to_edges(topo_graph, line_inspection_points_by_line: Dict[str, Li
     """
     print("[点边映射] 开始将巡检点映射到拓扑边...")
 
-    edge_points = {}  # {edge_id: [points]}
+    edge_points = {edge_id: [] for edge_id in topo_graph.edges}  # {edge_id: [points]}
 
-    # 遍历所有拓扑边
+    # 按线路组织边，确保巡检点只在同线路候选边内匹配
+    line_to_edges: Dict[str, List[Tuple[str, Any]]] = {}
     for edge_id, edge in topo_graph.edges.items():
-        line_id = edge.line_id
+        line_to_edges.setdefault(edge.line_id, []).append((edge_id, edge))
 
-        # 获取该线路的所有巡检点
-        if line_id not in line_inspection_points_by_line:
+    # 每个点仅分配给“最近的一条边”，避免端点/连接点被多条边重复收录
+    for line_id, points in line_inspection_points_by_line.items():
+        candidates = line_to_edges.get(line_id, [])
+        if not candidates or not points:
             continue
-
-        points = line_inspection_points_by_line[line_id]
-        if not points:
-            continue
-
-        # 获取该边的polyline（骨架点）
-        polyline = np.array(edge.polyline)
-
-        # 为每条边分配点
-        edge_points[edge_id] = []
 
         for point in points:
-            # 获取点的2D位置 (LineInspectionPoint dataclass)
-            if hasattr(point, 'pixel_position'):
+            if hasattr(point, "pixel_position"):
                 pt_pos = point.pixel_position
+                point_type = getattr(point, "point_type", "unknown")
+                source_reason = getattr(point, "source_reason", "")
             elif isinstance(point, dict):
-                pt_pos = point.get('pos2d', point.get('position', None))
+                pt_pos = point.get("pixel_position") or point.get("pos2d") or point.get("position")
+                point_type = point.get("point_type", point.get("type", "unknown"))
+                source_reason = point.get("source_reason", "")
             else:
                 pt_pos = None
+                point_type = "unknown"
+                source_reason = ""
 
             if pt_pos is None:
                 continue
 
-            # 计算点到polyline的距离
-            distances = []
-            for i in range(len(polyline) - 1):
-                # 计算点到线段的距离
-                p1 = polyline[i]
-                p2 = polyline[i + 1]
-                dist = point_to_line_segment_distance(pt_pos, p1, p2)
-                distances.append((dist, i))
+            best_edge_id = None
+            best_dist = float("inf")
 
-            if distances:
-                # 找最近的线段
-                min_dist, _ = min(distances)
-
-                # 如果距离合理（比如 < 10px），认为该点属于这条边
-                if min_dist < 10.0:
-                    edge_points[edge_id].append(point)
-
-        # 如果该边没有点，检查端点
-        if not edge_points[edge_id]:
-            # 检查该边的端点是否有巡检点
-            u_node = topo_graph.get_node(edge.u)
-            v_node = topo_graph.get_node(edge.v)
-
-            # 检查line_id对应的巡检点
-            for point in points:
-                if hasattr(point, 'pixel_position'):
-                    pt_pos = point.pixel_position
-                elif isinstance(point, dict):
-                    pt_pos = point.get('pos2d', point.get('position', None))
-                else:
+            for edge_id, edge in candidates:
+                polyline = np.array(edge.polyline)
+                if len(polyline) < 2:
                     continue
+                for i in range(len(polyline) - 1):
+                    p1 = polyline[i]
+                    p2 = polyline[i + 1]
+                    dist = point_to_line_segment_distance(pt_pos, p1, p2)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_edge_id = edge_id
 
-                if pt_pos is None:
-                    continue
-
-                # 检查是否是端点
-                u_dist = euclidean(pt_pos, u_node.pos2d)
-                v_dist = euclidean(pt_pos, v_node.pos2d)
-
-                if u_dist < 10.0 or v_dist < 10.0:
-                    edge_points[edge_id].append(point)
-                    break
+            if best_edge_id is not None and best_dist < 10.0:
+                edge_points[best_edge_id].append(point)
+                print(
+                    f"[DEBUG] visit target point_type={point_type} mapped_edge={best_edge_id} "
+                    f"coord=({pt_pos[0]:.2f},{pt_pos[1]:.2f}) reason={source_reason or 'nearest_edge'}"
+                )
+                if point_type in ("endpoint", "start", "end"):
+                    print(
+                        f"[DEBUG] endpoint added reason edge={best_edge_id} "
+                        f"point_type={point_type} source={source_reason or 'n/a'}"
+                    )
 
     # 统计
     total_mapped = sum(len(pts) for pts in edge_points.values())

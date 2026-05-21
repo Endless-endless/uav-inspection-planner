@@ -30,7 +30,7 @@ const state = {
   lastResult: null,
   mapConfig: null,
   imageMissionAvailable: false,
-  showBackground: true,
+  showBackground: false,
   showInspect: true,
   showConnect: true,
   pointMode: "key",
@@ -174,7 +174,7 @@ function syncStateToUi() {
 
 function applyLayerDefaultsForPipeline() {
   if (isImagePipeline()) {
-    state.showBackground = true;
+    state.showBackground = false;
     state.pointMode = "key";
   } else {
     state.showBackground = false;
@@ -304,11 +304,8 @@ function updateMapModeHint() {
   const hint = $("mapModeHint");
   if (!hint) return;
   if (isImagePipeline()) {
-    const sz = state.mapConfig?.available
-      ? `${state.mapConfig.width}×${state.mapConfig.height}`
-      : "—";
     const avail = state.imageMissionAvailable ? "mission 已就绪" : "将自动生成 mission";
-    hint.textContent = `图像主线 · ${avail} · 底图 ${sz}`;
+    hint.textContent = `图像主线 · ${avail} · 默认无底图`;
     $("mapPlot")?.classList.add("overlay-mode");
   } else {
     hint.textContent =
@@ -474,22 +471,117 @@ function buildMissionTraces(result) {
   );
   if (visiblePts.length) {
     const isAll = state.pointMode === "all";
-    traces.push({
-      x: visiblePts.map((p) => p.x),
-      y: visiblePts.map((p) => p.y),
-      mode: "markers",
-      name: "Inspection Points",
-      marker: {
-        size: isAll ? 4 : 8,
-        color: MAP_STYLES.pointColor,
-        opacity: isAll ? 0.45 : 0.88,
-        line: { width: isAll ? 0.5 : 1.5, color: MAP_STYLES.pointLine },
-      },
-      text: visiblePts.map((p) => p.point_id || p.edge_id || "point"),
-      hovertemplate: "%{text}<extra></extra>",
-      showlegend: true,
-      legendgroup: "points",
+    const playbackVisual = typeof window.getPlaybackVisualState === "function"
+      ? window.getPlaybackVisualState()
+      : null;
+    const visited = playbackVisual?.visitedIds || new Set();
+    const currentId = playbackVisual?.currentPointId || null;
+    const totalPoints = (result.inspection_points || []).length || visiblePts.length;
+    const unvisited = [];
+    const visitedPts = [];
+    let currentPt = null;
+
+    visiblePts.forEach((p, idx) => {
+      const pid = p.id || p.point_id || `point_${idx}`;
+      const isCurrent = currentId && pid === currentId;
+      const isVisited = visited.has(pid);
+      const cd = [
+        p.segment_id || p.edge_id || "—",
+        p.image_available ? "real image" : "placeholder",
+        `${p.progress_index || idx + 1}/${totalPoints}`,
+        p.point_id || p.id || `point_${idx}`,
+      ];
+      const item = { p, cd };
+      if (isCurrent) currentPt = item;
+      else if (isVisited) visitedPts.push(item);
+      else unvisited.push(item);
     });
+
+    if (unvisited.length) {
+      traces.push({
+        x: unvisited.map((v) => v.p.x),
+        y: unvisited.map((v) => v.p.y),
+        mode: "markers",
+        name: "Inspection Points",
+        marker: {
+          size: isAll ? 5 : 6,
+          color: "#38bdf8",
+          opacity: isAll ? 0.5 : 0.82,
+          line: { width: isAll ? 0.8 : 1.2, color: "#dbeafe" },
+        },
+        text: unvisited.map((v) => v.cd[3]),
+        customdata: unvisited.map((v) => v.cd),
+        hovertemplate:
+          "<b>%{text}</b><br>" +
+          "segment: %{customdata[0]}<br>" +
+          "image: %{customdata[1]}<br>" +
+          "progress: %{customdata[2]}<extra></extra>",
+        showlegend: true,
+        legendgroup: "points",
+      });
+    }
+
+    if (visitedPts.length) {
+      traces.push({
+        x: visitedPts.map((v) => v.p.x),
+        y: visitedPts.map((v) => v.p.y),
+        mode: "markers",
+        name: "Visited Points",
+        marker: {
+          size: isAll ? 5 : 7,
+          color: "#22c55e",
+          opacity: 0.62,
+          line: { width: 1, color: "#14532d" },
+        },
+        text: visitedPts.map((v) => v.cd[3]),
+        customdata: visitedPts.map((v) => v.cd),
+        hovertemplate:
+          "<b>%{text}</b><br>" +
+          "segment: %{customdata[0]}<br>" +
+          "image: %{customdata[1]}<br>" +
+          "progress: %{customdata[2]}<extra></extra>",
+        showlegend: true,
+        legendgroup: "points",
+      });
+    }
+
+    if (currentPt) {
+      traces.push({
+        x: [currentPt.p.x],
+        y: [currentPt.p.y],
+        mode: "markers",
+        name: "Current Point",
+        marker: {
+          size: 22,
+          color: "rgba(250, 204, 21, 0.26)",
+          line: { width: 0, color: "rgba(0,0,0,0)" },
+        },
+        hoverinfo: "skip",
+        showlegend: false,
+        legendgroup: "points",
+      });
+      traces.push({
+        x: [currentPt.p.x],
+        y: [currentPt.p.y],
+        mode: "markers",
+        name: "Current Point",
+        marker: {
+          size: 12,
+          color: "#facc15",
+          opacity: 1,
+          line: { width: 2.2, color: "#ffffff" },
+        },
+        text: [currentPt.cd[3]],
+        customdata: [currentPt.cd],
+        hovertemplate:
+          "<b>%{text}</b><br>" +
+          "segment: %{customdata[0]}<br>" +
+          "image: %{customdata[1]}<br>" +
+          "progress: %{customdata[2]}<extra></extra>",
+        showlegend: true,
+        legendgroup: "points",
+      });
+    }
   }
 
   const markers = result.markers || {};
@@ -537,7 +629,20 @@ function buildMissionTraces(result) {
   return traces;
 }
 
-function buildLegendLayout() {
+function buildLegendLayout(fullscreen = false) {
+  if (fullscreen) {
+    return {
+      orientation: "h",
+      y: 0.01,
+      x: 0.5,
+      xanchor: "center",
+      yanchor: "bottom",
+      bgcolor: "rgba(15, 23, 42, 0.45)",
+      bordercolor: "rgba(148,163,184,0.2)",
+      borderwidth: 1,
+      font: { size: 10 },
+    };
+  }
   return {
     orientation: "h",
     y: -0.12,
@@ -554,17 +659,18 @@ function getFullscreenPlotSize() {
   const panel = document.querySelector(".modal-panel");
   const plotEl = $("mapPlotFs");
   if (panel && plotEl) {
-    const pr = panel.getBoundingClientRect();
+    const stage = plotEl.closest(".plot-stage-fs") || plotEl.parentElement;
+    const pr = (stage || panel).getBoundingClientRect();
     const header = panel.querySelector(".modal-header");
-    const headerH = header ? header.offsetHeight + 12 : 40;
+    const headerH = stage ? 0 : (header ? header.offsetHeight + 8 : 34);
     return {
-      width: Math.max(320, Math.floor(pr.width - 24)),
-      height: Math.max(320, Math.floor(pr.height - headerH - 16)),
+      width: Math.max(380, Math.floor(pr.width - 4)),
+      height: Math.max(360, Math.floor(pr.height - headerH - 4)),
     };
   }
   return {
-    width: Math.floor(window.innerWidth * 0.96),
-    height: Math.floor(window.innerHeight * 0.9) - 64,
+    width: Math.floor(window.innerWidth * 0.99),
+    height: Math.floor(window.innerHeight * 0.97) - 32,
   };
 }
 
@@ -602,12 +708,13 @@ function buildMissionLayout(result, options = {}) {
     plot_bgcolor: isImage ? "rgba(255,255,255,0.06)" : "#243044",
     font: { color: "#e6edf3", size: 11 },
     margin: fullscreen
-      ? { l: 56, r: 20, t: 40, b: 72 }
-      : { l: 52, r: 12, t: 40, b: 72 },
-    legend: buildLegendLayout(),
+      ? { l: 16, r: 16, t: 8, b: 14 }
+      : { l: 48, r: 48, t: 34, b: 68 },
+    legend: buildLegendLayout(fullscreen),
     hovermode: "closest",
     images: buildBackgroundImages(result),
     uirevision: "mission-map-v3",
+    autosize: true,
   };
 
   if (isImage) {
@@ -615,6 +722,7 @@ function buildMissionLayout(result, options = {}) {
     layout.xaxis = {
       title: "X (px)",
       range: [0, width],
+      domain: fullscreen ? [0.001, 0.999] : [0.01, 0.99],
       autorange: false,
       fixedrange: true,
       constrain: "domain",
@@ -625,6 +733,7 @@ function buildMissionLayout(result, options = {}) {
     layout.yaxis = {
       title: "Y (px)",
       range: [height, 0],
+      domain: fullscreen ? [0.001, 0.999] : [0.01, 0.99],
       autorange: false,
       fixedrange: true,
       scaleanchor: "x",
@@ -638,6 +747,7 @@ function buildMissionLayout(result, options = {}) {
     layout.xaxis = {
       title: "x (px)",
       range: b.x_range,
+      domain: fullscreen ? [0.001, 0.999] : [0.01, 0.99],
       autorange: false,
       gridcolor: "#2d3a4f",
       zeroline: false,
@@ -645,6 +755,7 @@ function buildMissionLayout(result, options = {}) {
     layout.yaxis = {
       title: "y (px)",
       range: b.y_range,
+      domain: fullscreen ? [0.001, 0.999] : [0.01, 0.99],
       scaleanchor: "x",
       scaleratio: 1,
       gridcolor: "#2d3a4f",
@@ -762,6 +873,7 @@ function renderMission(result, targetId = "mapPlot", options = {}) {
 function openFullscreen() {
   if (!state.lastResult) return;
   const modal = $("mapFullscreenModal");
+  document.body.classList.add("fullscreen-active");
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
   requestAnimationFrame(() => {
@@ -771,6 +883,7 @@ function openFullscreen() {
 
 function closeFullscreen() {
   const modal = $("mapFullscreenModal");
+  document.body.classList.remove("fullscreen-active");
   modal.classList.add("hidden");
   modal.setAttribute("aria-hidden", "true");
   try {

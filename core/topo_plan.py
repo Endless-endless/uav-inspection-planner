@@ -943,6 +943,11 @@ def plan_topo_mission_greedy(
     unvisited = set(all_edge_ids)
 
     # 选择起始边
+    if start_edge_id not in unvisited:
+        if start_edge_id is not None:
+            print(f"[DEBUG] start edge adjusted: {start_edge_id} -> first_required_edge")
+        start_edge_id = None
+
     if start_edge_id is None:
         start_edge_id = all_edge_ids[0] if all_edge_ids else None
 
@@ -1205,7 +1210,7 @@ def print_mission_details(mission: TopoMission):
 # =====================================================
 
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Literal
+from typing import List, Tuple, Dict, Literal, Optional
 
 
 @dataclass
@@ -1296,6 +1301,171 @@ def get_edge_geometry_with_direction(edge_task, direction: str = 'forward') -> L
     else:
         # 正向：保持原样
         return list(polyline)
+
+
+def _polyline_length(polyline: List[Tuple[float, float]]) -> float:
+    if len(polyline) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(len(polyline) - 1):
+        total += float(np.linalg.norm(np.array(polyline[i + 1]) - np.array(polyline[i])))
+    return total
+
+
+def _point_xy_from_inspection_point(point) -> Optional[Tuple[float, float]]:
+    if hasattr(point, "pixel_position"):
+        pos = point.pixel_position
+    elif isinstance(point, dict):
+        pos = point.get("pixel_position") or point.get("position_2d") or point.get("pos2d")
+    else:
+        pos = None
+    if not pos or len(pos) < 2:
+        return None
+    return float(pos[0]), float(pos[1])
+
+
+def _project_point_to_polyline_distance(
+    point: Tuple[float, float],
+    polyline: List[Tuple[float, float]],
+) -> Optional[float]:
+    if len(polyline) < 2:
+        return None
+    p = np.array(point, dtype=np.float64)
+    cum = 0.0
+    best_dist = float("inf")
+    best_s = 0.0
+    for i in range(len(polyline) - 1):
+        a = np.array(polyline[i], dtype=np.float64)
+        b = np.array(polyline[i + 1], dtype=np.float64)
+        ab = b - a
+        seg_len = float(np.linalg.norm(ab))
+        if seg_len < 1e-9:
+            continue
+        t = float(np.dot(p - a, ab) / (seg_len * seg_len))
+        t = max(0.0, min(1.0, t))
+        proj = a + t * ab
+        d = float(np.linalg.norm(p - proj))
+        if d < best_dist:
+            best_dist = d
+            best_s = cum + t * seg_len
+        cum += seg_len
+    return best_s
+
+
+def _point_at_polyline_distance(
+    polyline: List[Tuple[float, float]],
+    target_s: float,
+) -> Tuple[float, float]:
+    if not polyline:
+        return (0.0, 0.0)
+    if len(polyline) == 1:
+        return (float(polyline[0][0]), float(polyline[0][1]))
+    remain = max(0.0, float(target_s))
+    for i in range(len(polyline) - 1):
+        p0 = np.array(polyline[i], dtype=np.float64)
+        p1 = np.array(polyline[i + 1], dtype=np.float64)
+        seg = p1 - p0
+        seg_len = float(np.linalg.norm(seg))
+        if seg_len < 1e-9:
+            continue
+        if remain <= seg_len:
+            t = remain / seg_len
+            pt = p0 + t * seg
+            return (float(pt[0]), float(pt[1]))
+        remain -= seg_len
+    tail = polyline[-1]
+    return (float(tail[0]), float(tail[1]))
+
+
+def _slice_polyline_by_distance(
+    polyline: List[Tuple[float, float]],
+    start_s: float,
+    end_s: float,
+) -> List[Tuple[float, float]]:
+    total = _polyline_length(polyline)
+    if total < 1e-9:
+        return [tuple(polyline[0])] if polyline else []
+    s0 = max(0.0, min(float(start_s), total))
+    s1 = max(0.0, min(float(end_s), total))
+    if s1 < s0:
+        s0, s1 = s1, s0
+    start_pt = _point_at_polyline_distance(polyline, s0)
+    end_pt = _point_at_polyline_distance(polyline, s1)
+    out: List[Tuple[float, float]] = [start_pt]
+    cum = 0.0
+    for i in range(len(polyline) - 1):
+        p0 = np.array(polyline[i], dtype=np.float64)
+        p1 = np.array(polyline[i + 1], dtype=np.float64)
+        seg_len = float(np.linalg.norm(p1 - p0))
+        next_cum = cum + seg_len
+        if seg_len >= 1e-9 and cum > s0 + 1e-9 and cum < s1 - 1e-9:
+            out.append((float(p0[0]), float(p0[1])))
+        cum = next_cum
+    if np.linalg.norm(np.array(out[-1]) - np.array(end_pt)) > 1e-6:
+        out.append(end_pt)
+    if len(out) == 1:
+        out.append(end_pt)
+    return out
+
+
+def get_edge_inspection_geometry_with_direction(
+    edge_task,
+    direction: str = "forward",
+    *,
+    debug: bool = False,
+) -> List[Tuple[float, float]]:
+    """
+    仅保留覆盖该 edge 必须巡检点的几何区间。
+    - 无巡检点：返回空，调用方应跳过该 edge。
+    - 有巡检点：截断到 [first_required_point, last_required_point] 区间。
+    """
+    polyline = list(getattr(edge_task, "polyline", None) or [])
+    if len(polyline) < 2:
+        return []
+    points = list(getattr(edge_task, "inspection_points", None) or [])
+    if not points:
+        if debug:
+            print(
+                f"[DEBUG] dead-end branch skipped/truncated edge={getattr(edge_task, 'edge_id', None)} "
+                "reason=no_inspection_points"
+            )
+        return []
+
+    projected: List[float] = []
+    for p in points:
+        pos = _point_xy_from_inspection_point(p)
+        if pos is None:
+            continue
+        s = _project_point_to_polyline_distance(pos, polyline)
+        if s is not None:
+            projected.append(s)
+
+    if not projected:
+        if debug:
+            print(
+                f"[DEBUG] dead-end branch skipped/truncated edge={getattr(edge_task, 'edge_id', None)} "
+                "reason=points_unprojectable"
+            )
+        return []
+
+    s_min = min(projected)
+    s_max = max(projected)
+    geom = _slice_polyline_by_distance(polyline, s_min, s_max)
+    if direction == "reverse":
+        geom = list(reversed(geom))
+
+    if debug:
+        print(
+            f"[DEBUG] dead-end branch skipped/truncated edge={getattr(edge_task, 'edge_id', None)} "
+            f"slice=({s_min:.2f},{s_max:.2f}) total={_polyline_length(polyline):.2f} "
+            f"result_len={_polyline_length(geom):.2f}"
+        )
+    return geom
+
+
+def get_edge_inspection_length(edge_task) -> float:
+    geom = get_edge_inspection_geometry_with_direction(edge_task, "forward")
+    return _polyline_length(geom)
 
 
 def find_nearest_topo_node(point: Tuple[float, float], topo_graph: TopoGraph) -> str:
@@ -1501,7 +1671,7 @@ def evaluate_transition_with_geometry(
         return None
 
     # 获取当前边的结束点
-    current_geo = get_edge_geometry_with_direction(current_edge, current_direction)
+    current_geo = get_edge_inspection_geometry_with_direction(current_edge, current_direction)
     current_end_point = current_geo[-1] if current_geo else None
 
     # 尝试两种方向，选择更优的
@@ -1510,7 +1680,7 @@ def evaluate_transition_with_geometry(
 
     for next_direction in ['forward', 'reverse']:
         # 获取下一条边的起始点
-        next_geo = get_edge_geometry_with_direction(candidate_edge, next_direction)
+        next_geo = get_edge_inspection_geometry_with_direction(candidate_edge, next_direction)
         next_start_point = next_geo[0] if next_geo else None
 
         if current_end_point is None or next_start_point is None:
@@ -1522,7 +1692,8 @@ def evaluate_transition_with_geometry(
         )
 
         # 总增量代价 = 连接长度 + 下一条边长度
-        total_incremental_cost = connect_len + candidate_edge.len2d
+        candidate_inspect_len = _polyline_length(next_geo)
+        total_incremental_cost = connect_len + candidate_inspect_len
 
         if total_incremental_cost < min_cost:
             min_cost = total_incremental_cost
@@ -1531,6 +1702,7 @@ def evaluate_transition_with_geometry(
                 'next_direction': next_direction,
                 'connect_geometry': connect_geo,
                 'connect_length': connect_len,
+                'inspect_length': candidate_inspect_len,
                 'total_incremental_cost': total_incremental_cost,
                 'current_end_point': current_end_point,
                 'next_start_point': next_start_point
@@ -1621,7 +1793,13 @@ def build_mission_segments(
 
     # 构建边任务映射
     edge_task_map = {task.edge_id: task for task in edge_tasks}
-    all_edge_ids = list(edge_task_map.keys())
+    all_edge_ids = [
+        eid for eid, task in edge_task_map.items()
+        if len(getattr(task, "inspection_points", None) or []) > 0
+    ]
+    skipped = [eid for eid in edge_task_map if eid not in all_edge_ids]
+    for eid in skipped:
+        print(f"[DEBUG] dead-end branch skipped/truncated edge={eid} reason=no_required_inspection_point")
     unvisited = set(all_edge_ids)
 
     # 选择起始边
@@ -1649,12 +1827,15 @@ def build_mission_segments(
     print(f"[Continuous Planner] 待访问边数: {len(unvisited)}")
 
     # 添加起始 inspect segment
-    start_geo = get_edge_geometry_with_direction(start_edge, start_direction)
+    start_geo = get_edge_inspection_geometry_with_direction(start_edge, start_direction, debug=True)
+    if len(start_geo) < 2:
+        print(f"[Continuous Planner] ERROR: 起始边 {start_edge_id} 无有效巡检几何")
+        return mission
     mission.add_segment(MissionSegment(
         type='inspect',
         edge_id=start_edge_id,
         geometry=start_geo,
-        length=start_edge.len2d,
+        length=_polyline_length(start_geo),
         direction=start_direction
     ))
     unvisited.remove(start_edge_id)
@@ -1691,13 +1872,17 @@ def build_mission_segments(
 
         # 添加下一条边的 inspect segment
         next_edge = edge_task_map[next_edge_id]
-        next_geo = get_edge_geometry_with_direction(next_edge, next_direction)
+        next_geo = get_edge_inspection_geometry_with_direction(next_edge, next_direction, debug=True)
+        if len(next_geo) < 2:
+            print(f"[DEBUG] dead-end branch skipped/truncated edge={next_edge_id} reason=empty_trimmed_inspect_geometry")
+            unvisited.remove(next_edge_id)
+            continue
 
         mission.add_segment(MissionSegment(
             type='inspect',
             edge_id=next_edge_id,
             geometry=next_geo,
-            length=next_edge.len2d,
+            length=_polyline_length(next_geo),
             direction=next_direction
         ))
         unvisited.remove(next_edge_id)
@@ -1707,7 +1892,7 @@ def build_mission_segments(
         adj_mark = "(adj)" if connect_len < 10 else f"(connect={connect_len:.1f}px)"
         dir_mark = '+' if next_direction == 'forward' else '-'
         print(f"  Segment {segment_count-1}: Connect [{current_edge_id}{dir_mark}] -> [{next_edge_id}{next_direction}] {adj_mark}")
-        print(f"  Segment {segment_count}: Inspect {next_edge_id} ({next_direction}), len={next_edge.len2d:.1f}px")
+        print(f"  Segment {segment_count}: Inspect {next_edge_id} ({next_direction}), len={_polyline_length(next_geo):.1f}px")
 
         current_edge_id = next_edge_id
         current_direction = next_direction

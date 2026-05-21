@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+INSPECTION_IMAGE_REL_DIR = Path("figures") / "inspection_images"
+
 
 
 def _segment_to_dict(seg: Any, index: int) -> Dict[str, Any]:
@@ -154,11 +156,35 @@ def _resolve_inspection_image_url(
     return None
 
 
+def _scan_inspection_image_catalog(root: Optional[Path]) -> List[Dict[str, str]]:
+    """扫描 figures/inspection_images 下可用图片，按文件名排序。"""
+    if root is None:
+        return []
+    img_dir = root / INSPECTION_IMAGE_REL_DIR
+    if not img_dir.exists() or not img_dir.is_dir():
+        return []
+
+    exts = {".jpg", ".jpeg", ".png"}
+    files = [p for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in exts]
+    files.sort(key=lambda p: p.stem.lower())
+
+    catalog: List[Dict[str, str]] = []
+    for p in files:
+        rel = p.relative_to(root).as_posix()
+        catalog.append({
+            "filename": p.name,
+            "image_path": rel,
+            "image_url": f"/api/inspection-image/{p.name}",
+        })
+    return catalog
+
+
 def enrich_inspection_points_for_dashboard(
     points: List[Dict[str, Any]],
     segments: List[Dict[str, Any]],
     *,
     root: Optional[Path] = None,
+    image_catalog: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     """扩展 Dashboard 巡检点字段（含 segment_id、priority、image_url 等）。"""
     edge_map = _edge_to_segment_map(segments)
@@ -167,15 +193,17 @@ def enrich_inspection_points_for_dashboard(
         "/static/inspection_placeholder_1.svg",
         "/static/inspection_placeholder_2.svg",
     ]
-    sample_urls = ["/api/inspection-sample/0", "/api/inspection-sample/1", "/api/inspection-sample/2"]
+    catalog = image_catalog or []
 
     enriched: List[Dict[str, Any]] = []
     for i, pt in enumerate(points):
         eid = pt.get("edge_id")
         sid = pt.get("segment_id") or (edge_map.get(eid) if eid else None)
         image_url = _resolve_inspection_image_url(pt, i, root)
-        if not image_url:
-            image_url = sample_urls[i % len(sample_urls)]
+        image_path = pt.get("image_path")
+        if not image_url and i < len(catalog):
+            image_url = catalog[i]["image_url"]
+            image_path = catalog[i]["image_path"]
 
         status = pt.get("status") or "pending"
         priority = pt.get("priority") or (
@@ -192,11 +220,13 @@ def enrich_inspection_points_for_dashboard(
             "edge_id": eid,
             "point_type": pt.get("point_type") or "sample",
             "priority": priority,
-            "image_path": pt.get("image_path"),
+            "image_path": image_path,
             "image_url": image_url,
+            "image_available": bool(image_url),
             "image_placeholder": placeholders[i % len(placeholders)],
             "description": description,
             "status": status,
+            "progress_index": i + 1,
             "metadata": {
                 k: v
                 for k, v in pt.items()
@@ -227,6 +257,7 @@ def _inspection_points_from_json(
     segments: Optional[List[Dict[str, Any]]] = None,
     *,
     root: Optional[Path] = None,
+    image_catalog: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     segments = segments or _segments_from_json(data)
     raw_points: List[Dict[str, Any]] = []
@@ -259,7 +290,9 @@ def _inspection_points_from_json(
             "visit_order": pt.get("visit_order"),
             "source_reason": pt.get("source_reason"),
         })
-    return enrich_inspection_points_for_dashboard(raw_points, segments, root=root)
+    return enrich_inspection_points_for_dashboard(
+        raw_points, segments, root=root, image_catalog=image_catalog
+    )
 
 
 def _statistics_from_json(data: Dict[str, Any], inspection_points: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -309,7 +342,13 @@ def build_dashboard_from_mission_json(
 ) -> Dict[str, Any]:
     """从已导出的 mission_output.json 构建 Dashboard 结构。"""
     segments = _segments_from_json(data)
-    inspection_points = _inspection_points_from_json(data, segments, root=root)
+    image_catalog = _scan_inspection_image_catalog(root) if pipeline == "image" else []
+    inspection_points = _inspection_points_from_json(
+        data,
+        segments,
+        root=root,
+        image_catalog=image_catalog,
+    )
     statistics = _statistics_from_json(data, inspection_points)
 
     visit = data.get("visit_order", {})

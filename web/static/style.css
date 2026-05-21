@@ -124,9 +124,9 @@ body {
 
 .map-inspect-row {
   display: grid;
-  grid-template-columns: 1fr 300px;
+  grid-template-columns: minmax(0, 1fr) clamp(300px, 30vw, 430px);
   gap: 0.75rem;
-  align-items: stretch;
+  align-items: center;
 }
 
 @media (max-width: 1100px) {
@@ -147,13 +147,20 @@ body {
 }
 
 .inspect-info-card {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.75rem 0.85rem;
+  background: linear-gradient(165deg, rgba(15, 23, 42, 0.95) 0%, rgba(30, 41, 59, 0.92) 100%);
+  border: 1px solid #334155;
+  border-radius: 12px;
+  padding: 0.8rem 0.9rem;
   min-width: 0;
   max-height: 620px;
   overflow-y: auto;
+  box-shadow: 0 12px 26px rgba(0, 0, 0, 0.38), inset 0 0 0 1px rgba(56, 189, 248, 0.07);
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.inspect-info-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.42), inset 0 0 0 1px rgba(56, 189, 248, 0.12);
 }
 
 .inspect-info-card.hidden {
@@ -165,6 +172,8 @@ body {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 0.65rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
 }
 
 .inspect-card-header h3 {
@@ -188,26 +197,31 @@ body {
 }
 
 .inspect-status.shooting {
-  background: rgba(59, 130, 246, 0.2);
-  color: #93c5fd;
+  background: rgba(34, 211, 238, 0.2);
+  color: #a5f3fc;
+  border: 1px solid rgba(34, 211, 238, 0.35);
   animation: pulse 1s ease infinite;
 }
 
 .inspect-status.done {
   background: rgba(34, 197, 94, 0.2);
   color: #86efac;
+  border: 1px solid rgba(34, 197, 94, 0.35);
 }
 
 @keyframes pulse {
-  50% { opacity: 0.65; }
+  50% {
+    opacity: 0.65;
+    transform: scale(1.03);
+  }
 }
 
 .inspect-meta {
   display: grid;
-  grid-template-columns: 4.5em 1fr;
-  gap: 0.25rem 0.5rem;
+  grid-template-columns: 5em 1fr;
+  gap: 0.28rem 0.55rem;
   font-size: 0.78rem;
-  margin-bottom: 0.65rem;
+  margin-bottom: 0;
 }
 
 .inspect-meta dt {
@@ -221,39 +235,104 @@ body {
 
 .inspect-img-wrap img {
   width: 100%;
-  border-radius: 6px;
-  border: 1px solid var(--border);
+  border-radius: 10px;
+  border: 1px solid #475569;
   background: #0f172a;
   aspect-ratio: 16/10;
   object-fit: cover;
+  min-height: 260px;
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(56, 189, 248, 0.18);
 }
 
 .inspect-img-hint {
   font-size: 0.7rem;
   color: var(--muted);
-  margin-top: 0.35rem;
-  text-align: center;
+  margin-top: 0.4rem;
+  text-align: left;
+}
+
+.inspect-content {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  align-items: start;
+}
+
+.inspect-float .inspect-content {
+  flex: 1;
+  gap: 0.7rem;
+}
+
+.inspect-float .inspect-meta {
+  grid-template-columns: 4.2em 1fr 4.2em 1fr;
+  gap: 0.26rem 0.52rem;
+  font-size: 0.8rem;
+}
+
+.inspect-float .inspect-card-header {
+  margin-bottom: 0.5rem;
+}
+
+.inspect-float .inspect-card-header h3 {
+  font-size: 0.88rem;
+}
+
+.inspect-float .inspect-img-hint {
+  font-size: 0.72rem;
+}
+
+@media (max-width: 1180px) {
+  .inspect-content {
+    gap: 0.65rem;
+  }
+}
+
+@media (max-width: 1400px) {
+  .modal-map-wrap {
+    grid-template-columns: minmax(0, 68%) minmax(0, 32%);
+  }
+  .inspect-float .inspect-img-wrap img {
+    min-height: clamp(340px, 44vh, 460px);
+  }
 }
 
 .modal-map-wrap {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 70%) minmax(0, 30%);
   flex: 1;
-  gap: 0.75rem;
+  gap: 0.55rem;
   min-height: 0;
   position: relative;
+  align-items: stretch;
 }
 
 .modal-panel .plot-area-fs {
   flex: 1;
-  height: auto;
+  height: 100%;
   min-height: 0;
 }
 
 .inspect-float {
-  width: 280px;
-  flex-shrink: 0;
-  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  max-height: none;
   z-index: 2;
+  display: flex;
+  flex-direction: column;
+  padding: 0.65rem 0.7rem;
+}
+
+.plot-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.plot-stage-fs {
+  flex: 1;
 }
 
 .panel-stats {
@@ -413,9 +492,24 @@ body {
 
 .plot-area {
   width: 100%;
+  max-width: 100%;
   height: 620px;
   border-radius: 6px;
   overflow: hidden;
+}
+
+.plot-stage-fs .plot-area-fs {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: 1px solid rgba(71, 85, 105, 0.55);
+  background: rgba(15, 23, 42, 0.36);
+}
+
+.inspect-float .inspect-img-wrap img {
+  min-height: clamp(380px, 48vh, 520px);
+  max-height: 60vh;
+  width: 100%;
 }
 
 .plot-area-fs {
@@ -446,16 +540,16 @@ body {
 .modal-panel {
   position: relative;
   z-index: 1;
-  width: 96vw;
-  height: 90vh;
+  width: 99vw;
+  height: 97vh;
   max-width: none;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 0.75rem 1rem 1rem;
+  border-radius: 12px;
+  padding: 0.28rem 0.38rem 0.36rem;
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
 }
 
@@ -562,6 +656,17 @@ body {
   margin-bottom: 0.5rem;
   font-size: 0.9rem;
   color: var(--muted);
+}
+
+body.fullscreen-active .modal-header {
+  margin-bottom: 0.2rem;
+  font-size: 0.78rem;
+  color: #a3b2c7;
+}
+
+body.fullscreen-active .modal-header span:first-child {
+  opacity: 0.86;
+  letter-spacing: 0.02em;
 }
 
 .plot-area.overlay-mode {
