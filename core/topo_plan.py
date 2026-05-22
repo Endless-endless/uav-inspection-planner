@@ -1432,6 +1432,7 @@ def get_edge_inspection_geometry_with_direction(
         return []
 
     projected: List[float] = []
+    target_debug: List[str] = []
     for p in points:
         pos = _point_xy_from_inspection_point(p)
         if pos is None:
@@ -1439,6 +1440,15 @@ def get_edge_inspection_geometry_with_direction(
         s = _project_point_to_polyline_distance(pos, polyline)
         if s is not None:
             projected.append(s)
+            if isinstance(p, dict):
+                pid = p.get("id") or p.get("point_id") or "unknown"
+                ptype = p.get("point_type", "unknown")
+            else:
+                pid = getattr(p, "id", None) or getattr(p, "point_id", None) or "unknown"
+                ptype = getattr(p, "point_type", "unknown")
+            target_debug.append(
+                f"id={pid}/type={ptype}/coord=({pos[0]:.1f},{pos[1]:.1f})/s={s:.2f}"
+            )
 
     if not projected:
         if debug:
@@ -1455,6 +1465,11 @@ def get_edge_inspection_geometry_with_direction(
         geom = list(reversed(geom))
 
     if debug:
+        if target_debug:
+            print(
+                f"[DEBUG] edge inspection targets edge={getattr(edge_task, 'edge_id', None)} "
+                + "; ".join(target_debug)
+            )
         print(
             f"[DEBUG] dead-end branch skipped/truncated edge={getattr(edge_task, 'edge_id', None)} "
             f"slice=({s_min:.2f},{s_max:.2f}) total={_polyline_length(polyline):.2f} "
@@ -1495,7 +1510,9 @@ def generate_connection_segment_along_topo(
     point_a: Tuple[float, float],
     point_b: Tuple[float, float],
     topo_graph: TopoGraph,
-    edge_task_map: dict
+    edge_task_map: dict,
+    from_edge_id: Optional[str] = None,
+    to_edge_id: Optional[str] = None,
 ) -> Tuple[List[Tuple[float, float]], float]:
     """
     沿拓扑图生成连接段（替代简单的直线连接）
@@ -1509,121 +1526,191 @@ def generate_connection_segment_along_topo(
     Returns:
         Tuple[List[Tuple[float, float]], float]: (几何路径, 长度)
     """
-    # 1. 找到最近的拓扑节点
+    def _append_polyline(dst: List[Tuple[float, float]], src: List[Tuple[float, float]]) -> None:
+        if not src:
+            return
+        src2 = [(float(p[0]), float(p[1])) for p in src]
+        if not dst:
+            dst.extend(src2)
+            return
+        if np.linalg.norm(np.array(dst[-1]) - np.array(src2[0])) <= 1e-6:
+            dst.extend(src2[1:])
+        else:
+            dst.extend(src2)
+
+    def _find_edge_between_nodes(u: str, v: str):
+        for e in topo_graph.edges.values():
+            if (e.u == u and e.v == v) or (e.u == v and e.v == u):
+                return e
+        return None
+
+    def _edge_polyline_aligned(edge_obj, u: str, v: str) -> List[Tuple[float, float]]:
+        poly = list(edge_obj.polyline or [])
+        if edge_obj.u == u and edge_obj.v == v:
+            return [(float(p[0]), float(p[1])) for p in poly]
+        return [(float(p[0]), float(p[1])) for p in reversed(poly)]
+
+    def _geom_length(geom: List[Tuple[float, float]]) -> float:
+        if len(geom) < 2:
+            return 0.0
+        return float(sum(np.linalg.norm(np.array(geom[i + 1]) - np.array(geom[i])) for i in range(len(geom) - 1)))
+
+    def _point_to_anchor(edge_task, point_xy: Tuple[float, float], anchor_node: str):
+        poly = list(getattr(edge_task, "polyline", None) or [])
+        if len(poly) < 2:
+            return None
+        s = _project_point_to_polyline_distance(point_xy, poly)
+        if s is None:
+            return None
+        total = _polyline_length(poly)
+        s = max(0.0, min(float(s), total))
+        if anchor_node == edge_task.u:
+            geom = _slice_polyline_by_distance(poly, 0.0, s)
+            return {"cost": s, "point_to_anchor": list(reversed(geom))}
+        if anchor_node == edge_task.v:
+            geom = _slice_polyline_by_distance(poly, s, total)
+            return {"cost": total - s, "point_to_anchor": geom}
+        return None
+
+    def _anchor_to_point(edge_task, point_xy: Tuple[float, float], anchor_node: str):
+        info = _point_to_anchor(edge_task, point_xy, anchor_node)
+        if not info:
+            return None
+        return list(reversed(info["point_to_anchor"]))
+
+    print("[DEBUG] generate_connection_segment_along_topo called:")
+    print(f"  point_a=({point_a[0]:.1f},{point_a[1]:.1f}) point_b=({point_b[0]:.1f},{point_b[1]:.1f})")
+    print(f"  from_edge={from_edge_id} to_edge={to_edge_id}")
+
+    from_edge = edge_task_map.get(from_edge_id) if from_edge_id else None
+    to_edge = edge_task_map.get(to_edge_id) if to_edge_id else None
+
+    # inspection-target-aware: 同边连接直接切片，避免 edge endpoint 往返
+    if from_edge is not None and to_edge is not None and from_edge.edge_id == to_edge.edge_id:
+        poly = list(from_edge.polyline or [])
+        if len(poly) >= 2:
+            sa = _project_point_to_polyline_distance(point_a, poly)
+            sb = _project_point_to_polyline_distance(point_b, poly)
+            if sa is not None and sb is not None:
+                sliced = _slice_polyline_by_distance(poly, sa, sb)
+                print(
+                    f"[DEBUG] trim edge polyline edge={from_edge.edge_id} "
+                    f"before={_polyline_length(poly):.2f} after={_polyline_length(sliced):.2f}"
+                )
+                print(
+                    f"[DEBUG] segment start/end/type/length start={sliced[0]} end={sliced[-1]} "
+                    f"type=connect length={_polyline_length(sliced):.2f}"
+                )
+                return sliced, _polyline_length(sliced)
+
+    # inspection-target-aware: 2x2 端点锚点组合，最小化 (point->anchor + topo_path + anchor->point)
+    if from_edge is not None and to_edge is not None:
+        best = None
+        for a_anchor in (from_edge.u, from_edge.v):
+            a_info = _point_to_anchor(from_edge, point_a, a_anchor)
+            if not a_info:
+                continue
+            for b_anchor in (to_edge.u, to_edge.v):
+                b_info = _point_to_anchor(to_edge, point_b, b_anchor)
+                if not b_info:
+                    continue
+                if a_anchor == b_anchor:
+                    node_path = [a_anchor]
+                else:
+                    node_path = get_shortest_path(topo_graph, a_anchor, b_anchor) or []
+                if not node_path:
+                    continue
+
+                middle_geo: List[Tuple[float, float]] = []
+                middle_cost = 0.0
+                for i in range(len(node_path) - 1):
+                    u = node_path[i]
+                    v = node_path[i + 1]
+                    e = _find_edge_between_nodes(u, v)
+                    if e is None:
+                        middle_geo = []
+                        middle_cost = float("inf")
+                        break
+                    middle_cost += float(getattr(e, "len2d", 0.0) or 0.0)
+                    _append_polyline(middle_geo, _edge_polyline_aligned(e, u, v))
+
+                total_cost = float(a_info["cost"]) + float(middle_cost) + float(b_info["cost"])
+                if best is None or total_cost < best["total_cost"]:
+                    best = {
+                        "total_cost": total_cost,
+                        "a_anchor": a_anchor,
+                        "b_anchor": b_anchor,
+                        "node_path": node_path,
+                        "a_geo": a_info["point_to_anchor"],
+                        "middle_geo": middle_geo,
+                        "b_geo": _anchor_to_point(to_edge, point_b, b_anchor) or [point_b],
+                    }
+
+        if best is not None:
+            geometry: List[Tuple[float, float]] = []
+            _append_polyline(geometry, best["a_geo"])
+            _append_polyline(geometry, best["middle_geo"])
+            _append_polyline(geometry, best["b_geo"])
+            if not geometry:
+                geometry = [point_a, point_b]
+            if np.linalg.norm(np.array(geometry[0]) - np.array(point_a)) > 1e-6:
+                geometry.insert(0, (float(point_a[0]), float(point_a[1])))
+            if np.linalg.norm(np.array(geometry[-1]) - np.array(point_b)) > 1e-6:
+                geometry.append((float(point_b[0]), float(point_b[1])))
+
+            length = _geom_length(geometry)
+            print(
+                f"[DEBUG] endpoint included reason=anchor_combo_optimal "
+                f"from_anchor={best['a_anchor']} to_anchor={best['b_anchor']} path={best['node_path']}"
+            )
+            print(
+                f"[DEBUG] segment start/end/type/length start={geometry[0]} end={geometry[-1]} "
+                f"type=connect length={length:.2f}"
+            )
+            return geometry, length
+
+    # fallback: 最近节点策略（兼容旧调用方）
     node_a = find_nearest_topo_node(point_a, topo_graph)
     node_b = find_nearest_topo_node(point_b, topo_graph)
-
     if node_a is None or node_b is None:
-        print(f"[WARNING] 无法找到最近的拓扑节点，退回到直线连接")
-        print(f"  point_a: {point_a}, point_b: {point_b}")
         geometry = [point_a, point_b]
-        length = np.linalg.norm(np.array(point_b) - np.array(point_a))
+        length = float(np.linalg.norm(np.array(point_b) - np.array(point_a)))
+        print("[DEBUG] endpoint included reason=fallback_direct_no_nearest_node")
         return geometry, length
 
-    # 2. 获取拓扑图最短路径（使用邻近性增强）
-    # 使用动态阈值：至少是两点间直线距离的1.2倍，确保能找到路径
     direct_distance = np.linalg.norm(np.array(point_b) - np.array(point_a))
     proximity_threshold = max(1500.0, direct_distance * 1.2)
-
-    node_path = get_shortest_path_with_proximity(topo_graph, node_a, node_b, proximity_threshold=proximity_threshold)
-
+    node_path = get_shortest_path_with_proximity(
+        topo_graph, node_a, node_b, proximity_threshold=proximity_threshold
+    )
     if not node_path:
-        print(f"[WARNING] 拓扑图中节点 {node_a} 和 {node_b} 不连通，退回到直线连接")
-        print(f"  point_a: {point_a}")
-        print(f"  point_b: {point_b}")
         geometry = [point_a, point_b]
-        length = np.linalg.norm(np.array(point_b) - np.array(point_a))
+        length = float(np.linalg.norm(np.array(point_b) - np.array(point_a)))
+        print("[DEBUG] endpoint included reason=fallback_direct_disconnected")
         return geometry, length
 
-    # 调试：显示路径信息
-    print(f"[DEBUG] generate_connection_segment_along_topo called:")
-    print(f"  point_a: ({point_a[0]:.1f}, {point_a[1]:.1f})")
-    print(f"  point_b: ({point_b[0]:.1f}, {point_b[1]:.1f})")
-    print(f"  node_a: {node_a}")
-    print(f"  node_b: {node_b}")
-    print(f"  node_path: {node_path} (length={len(node_path)})")
-
-    # 3. 将节点路径展开为 polyline geometry
-    geometry = []
-
-    # 添加起点
-    geometry.append(point_a)
-
-    # 如果起点不是最近的节点，添加连接段
+    geometry: List[Tuple[float, float]] = [(float(point_a[0]), float(point_a[1]))]
     node_a_obj = topo_graph.nodes[node_a]
     if np.linalg.norm(np.array(point_a) - np.array(node_a_obj.pos2d)) > 1.0:
-        geometry.append(node_a_obj.pos2d)
+        geometry.append((float(node_a_obj.pos2d[0]), float(node_a_obj.pos2d[1])))
 
-    # 遍历节点路径，展开每条边的 geometry
     for i in range(len(node_path) - 1):
         u = node_path[i]
         v = node_path[i + 1]
-
-        # 找到连接 u 和 v 的拓扑边
-        edge = None
-        for edge_id, e in topo_graph.edges.items():
-            if (e.u == u and e.v == v) or (e.u == v and e.v == u):
-                edge = e
-                break
-
+        edge = _find_edge_between_nodes(u, v)
         if edge and edge.polyline:
-            # 确定方向
-            if edge.u == u and edge.v == v:
-                # 正向
-                poly = edge.polyline
-            else:
-                # 反向
-                poly = list(reversed(edge.polyline))
-
-            # 添加边的 geometry（避免重复点）
-            if geometry:
-                last_point = geometry[-1]
-                if np.linalg.norm(np.array(poly[0]) - np.array(last_point)) > 0.1:
-                    geometry.extend(poly)
-                else:
-                    # 跳过重复点
-                    geometry.extend(poly[1:])
-            else:
-                geometry.extend(poly)
+            _append_polyline(geometry, _edge_polyline_aligned(edge, u, v))
         else:
-            # 没有找到边，使用节点位置
-            if i < len(node_path) - 1:
-                next_node = topo_graph.nodes[node_path[i + 1]]
-                geometry.append(next_node.pos2d)
+            next_node = topo_graph.nodes[v]
+            geometry.append((float(next_node.pos2d[0]), float(next_node.pos2d[1])))
 
-    # 如果终点不是最近的节点，添加连接段
     node_b_obj = topo_graph.nodes[node_b]
     if np.linalg.norm(np.array(point_b) - np.array(node_b_obj.pos2d)) > 1.0:
-        geometry.append(node_b_obj.pos2d)
+        geometry.append((float(node_b_obj.pos2d[0]), float(node_b_obj.pos2d[1])))
+    geometry.append((float(point_b[0]), float(point_b[1])))
 
-    # 添加终点
-    geometry.append(point_b)
-
-    # 4. 计算路径长度
-    length = 0.0
-    for i in range(len(geometry) - 1):
-        length += np.linalg.norm(np.array(geometry[i + 1]) - np.array(geometry[i]))
-
-    # 调试输出：显示长连接的详细信息
-    if length > 50:  # 降低阈值，看看更多细节
-        print(f"[DEBUG] Connection segment:")
-        print(f"  Start: ({point_a[0]:.1f}, {point_a[1]:.1f})")
-        print(f"  End: ({point_b[0]:.1f}, {point_b[1]:.1f})")
-        print(f"  Node path: {node_path} (length={len(node_path)})")
-        print(f"  Geometry points: {len(geometry)}")
-        print(f"  Length: {length:.1f}px")
-        if len(geometry) <= 3:
-            print(f"  WARNING: Geometry only has {len(geometry)} points!")
-        print()
-
-    # 5. 验证路径合理性
-    if len(geometry) < 2:
-        print(f"[ERROR] 生成的连接段几何点数少于2: {len(geometry)}")
-        print(f"  node_path: {node_path}")
-        print(f"  退回到直线连接")
-        geometry = [point_a, point_b]
-        length = np.linalg.norm(np.array(point_b) - np.array(point_a))
-
+    length = _geom_length(geometry)
+    print("[DEBUG] endpoint included reason=fallback_nearest_node")
     return geometry, length
 
 
@@ -1688,7 +1775,12 @@ def evaluate_transition_with_geometry(
 
         # 生成连接段（沿拓扑图）
         connect_geo, connect_len = generate_connection_segment_along_topo(
-            current_end_point, next_start_point, topo_graph, edge_task_map
+            current_end_point,
+            next_start_point,
+            topo_graph,
+            edge_task_map,
+            from_edge_id=current_edge_id,
+            to_edge_id=candidate_edge_id,
         )
 
         # 总增量代价 = 连接长度 + 下一条边长度
@@ -2495,7 +2587,9 @@ def build_grouped_continuous_mission(
                         edge_task_map[best_start_edge], best_start_dir
                     )[0],
                     topo_graph,
-                    edge_task_map
+                    edge_task_map,
+                    from_edge_id=last_edge_id,
+                    to_edge_id=best_start_edge,
                 )
 
                 # 对 connect geometry 进行插值，生成密集路径点
@@ -3476,9 +3570,13 @@ def build_grouped_continuous_mission_optimized(
         print(f"  方案: {best_candidate.summary()}")
 
         # 生成从当前末端到新 group entry 的 connect segment（沿拓扑图）
+        prev_inspects = [s for s in mission.segments if s.type == 'inspect']
+        prev_edge_id = prev_inspects[-1].edge_id if prev_inspects else None
         connect_geo, connect_len = generate_connection_segment_along_topo(
             current_end_point, best_candidate.entry_point,
-            topo_graph, edge_task_map
+            topo_graph, edge_task_map,
+            from_edge_id=prev_edge_id,
+            to_edge_id=best_candidate.start_edge_id,
         )
 
         # 对 connect geometry 进行插值，生成密集路径点

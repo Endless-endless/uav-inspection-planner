@@ -13,7 +13,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from core.topo import TopoGraph, TopoEdge
-from core.topo_plan import get_shortest_path, find_nearest_topo_node
+from core.topo_plan import (
+    get_shortest_path,
+    find_nearest_topo_node,
+    _polyline_length,
+    _project_point_to_polyline_distance,
+    _slice_polyline_by_distance,
+)
 
 
 def edge_cost(edge: TopoEdge, cost_config: Optional[Dict[str, Any]] = None) -> float:
@@ -277,13 +283,125 @@ def generate_connection_segment_with_planner(
     connect_planner: str = "bfs",
     cost_config: Optional[Dict[str, Any]] = None,
     use_proximity_bfs: bool = True,
+    from_edge_id: Optional[str] = None,
+    to_edge_id: Optional[str] = None,
 ) -> Tuple[List[Tuple[float, float]], float]:
     """
     沿拓扑图生成连接段；connect_planner: 'bfs' | 'dijkstra'。
 
     Dijkstra 失败时 fallback 到 BFS。
     """
-    _ = edge_task_map  # 与现有 API 兼容
+    def _append_polyline(dst: List[Tuple[float, float]], src: List[Tuple[float, float]]) -> None:
+        if not src:
+            return
+        src2 = [(float(p[0]), float(p[1])) for p in src]
+        if not dst:
+            dst.extend(src2)
+            return
+        if np.linalg.norm(np.array(dst[-1]) - np.array(src2[0])) <= 1e-6:
+            dst.extend(src2[1:])
+        else:
+            dst.extend(src2)
+
+    def _geom_length(geom: List[Tuple[float, float]]) -> float:
+        if len(geom) < 2:
+            return 0.0
+        return float(sum(np.linalg.norm(np.array(geom[i + 1]) - np.array(geom[i])) for i in range(len(geom) - 1)))
+
+    def _point_to_anchor(edge_task, point_xy: Tuple[float, float], anchor_node: str):
+        poly = list(getattr(edge_task, "polyline", None) or [])
+        if len(poly) < 2:
+            return None
+        s = _project_point_to_polyline_distance(point_xy, poly)
+        if s is None:
+            return None
+        total = _polyline_length(poly)
+        s = max(0.0, min(float(s), total))
+        if anchor_node == edge_task.u:
+            geom = _slice_polyline_by_distance(poly, 0.0, s)
+            return {"cost": s, "point_to_anchor": list(reversed(geom))}
+        if anchor_node == edge_task.v:
+            geom = _slice_polyline_by_distance(poly, s, total)
+            return {"cost": total - s, "point_to_anchor": geom}
+        return None
+
+    def _anchor_to_point(edge_task, point_xy: Tuple[float, float], anchor_node: str):
+        info = _point_to_anchor(edge_task, point_xy, anchor_node)
+        if not info:
+            return None
+        return list(reversed(info["point_to_anchor"]))
+
+    from_edge = edge_task_map.get(from_edge_id) if from_edge_id else None
+    to_edge = edge_task_map.get(to_edge_id) if to_edge_id else None
+
+    # 同边直接切片（target-aware）
+    if from_edge is not None and to_edge is not None and from_edge.edge_id == to_edge.edge_id:
+        poly = list(from_edge.polyline or [])
+        if len(poly) >= 2:
+            sa = _project_point_to_polyline_distance(point_a, poly)
+            sb = _project_point_to_polyline_distance(point_b, poly)
+            if sa is not None and sb is not None:
+                sliced = _slice_polyline_by_distance(poly, sa, sb)
+                return sliced, _polyline_length(sliced)
+
+    # 端点锚点组合（dijkstra/bfs 按 connect_planner 选）
+    if from_edge is not None and to_edge is not None:
+        best = None
+        for a_anchor in (from_edge.u, from_edge.v):
+            a_info = _point_to_anchor(from_edge, point_a, a_anchor)
+            if not a_info:
+                continue
+            for b_anchor in (to_edge.u, to_edge.v):
+                b_info = _point_to_anchor(to_edge, point_b, b_anchor)
+                if not b_info:
+                    continue
+
+                if a_anchor == b_anchor:
+                    node_path = [a_anchor]
+                    middle_cost = 0.0
+                elif connect_planner.lower() == "dijkstra":
+                    rs = dijkstra_shortest_path(topo_graph, a_anchor, b_anchor, cost_config=cost_config)
+                    node_path = (rs or {}).get("node_path") or []
+                    middle_cost = float((rs or {}).get("total_cost", float("inf")))
+                else:
+                    node_path = get_shortest_path(topo_graph, a_anchor, b_anchor) or []
+                    middle_cost = estimate_bfs_path_cost(topo_graph, node_path) if node_path else float("inf")
+
+                if not node_path:
+                    continue
+
+                middle_geo, _ = expand_node_path_to_geometry(
+                    topo_graph.get_node(node_path[0]).pos2d,
+                    topo_graph.get_node(node_path[-1]).pos2d,
+                    node_path,
+                    topo_graph,
+                )
+                if len(middle_geo) >= 2:
+                    middle_geo = middle_geo[1:-1]  # 去除首尾节点点位，避免重复
+                else:
+                    middle_geo = []
+
+                total_cost = float(a_info["cost"]) + float(middle_cost) + float(b_info["cost"])
+                if best is None or total_cost < best["total_cost"]:
+                    best = {
+                        "total_cost": total_cost,
+                        "a_geo": a_info["point_to_anchor"],
+                        "middle_geo": middle_geo,
+                        "b_geo": _anchor_to_point(to_edge, point_b, b_anchor) or [point_b],
+                    }
+
+        if best is not None:
+            geometry: List[Tuple[float, float]] = []
+            _append_polyline(geometry, best["a_geo"])
+            _append_polyline(geometry, best["middle_geo"])
+            _append_polyline(geometry, best["b_geo"])
+            if not geometry:
+                geometry = [point_a, point_b]
+            if np.linalg.norm(np.array(geometry[0]) - np.array(point_a)) > 1e-6:
+                geometry.insert(0, (float(point_a[0]), float(point_a[1])))
+            if np.linalg.norm(np.array(geometry[-1]) - np.array(point_b)) > 1e-6:
+                geometry.append((float(point_b[0]), float(point_b[1])))
+            return geometry, _geom_length(geometry)
 
     node_a = find_nearest_topo_node(point_a, topo_graph)
     node_b = find_nearest_topo_node(point_b, topo_graph)

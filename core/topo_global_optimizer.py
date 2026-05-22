@@ -639,10 +639,17 @@ def build_optimized_mission(
             connect_geo, connect_len = generate_connection_segment_with_planner(
                 current_end_point, geo[0], topo_graph, edge_task_map,
                 connect_planner="dijkstra",
+                from_edge_id=current_edge_id,
+                to_edge_id=edge_id,
             )
         else:
             connect_geo, connect_len = generate_connection_segment_along_topo(
-                current_end_point, geo[0], topo_graph, edge_task_map
+                current_end_point,
+                geo[0],
+                topo_graph,
+                edge_task_map,
+                from_edge_id=current_edge_id,
+                to_edge_id=edge_id,
             )
 
         # 插值密集路径点
