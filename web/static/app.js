@@ -630,28 +630,17 @@ function buildMissionTraces(result) {
 }
 
 function buildLegendLayout(fullscreen = false) {
-  if (fullscreen) {
-    return {
-      orientation: "h",
-      y: 0.01,
-      x: 0.5,
-      xanchor: "center",
-      yanchor: "bottom",
-      bgcolor: "rgba(15, 23, 42, 0.45)",
-      bordercolor: "rgba(148,163,184,0.2)",
-      borderwidth: 1,
-      font: { size: 10 },
-    };
-  }
+  // Legend inside the plot area at bottom-left — zero bottom margin waste
   return {
     orientation: "h",
-    y: -0.12,
-    x: 0.5,
-    xanchor: "center",
-    yanchor: "top",
-    bgcolor: "rgba(26, 35, 50, 0.75)",
-    bordercolor: "#2d3a4f",
-    font: { size: 10 },
+    x: 0.01,
+    y: 0.01,
+    xanchor: "left",
+    yanchor: "bottom",
+    bgcolor: "rgba(10, 16, 28, 0.72)",
+    bordercolor: "rgba(100,160,200,0.18)",
+    borderwidth: 1,
+    font: { size: fullscreen ? 11 : 10, color: "#94b8cc" },
   };
 }
 
@@ -662,15 +651,15 @@ function getFullscreenPlotSize() {
     const stage = plotEl.closest(".plot-stage-fs") || plotEl.parentElement;
     const pr = (stage || panel).getBoundingClientRect();
     const header = panel.querySelector(".modal-header");
-    const headerH = stage ? 0 : (header ? header.offsetHeight + 8 : 34);
+    const headerH = header ? header.offsetHeight + 4 : 36;
     return {
-      width: Math.max(380, Math.floor(pr.width - 4)),
-      height: Math.max(360, Math.floor(pr.height - headerH - 4)),
+      width: Math.max(380, Math.floor(pr.width - 2)),
+      height: Math.max(360, Math.floor((stage ? pr.height : panel.getBoundingClientRect().height - headerH) - 2)),
     };
   }
   return {
-    width: Math.floor(window.innerWidth * 0.99),
-    height: Math.floor(window.innerHeight * 0.97) - 32,
+    width: Math.floor(window.innerWidth * 0.74),
+    height: Math.floor(window.innerHeight) - 72,
   };
 }
 
@@ -708,8 +697,8 @@ function buildMissionLayout(result, options = {}) {
     plot_bgcolor: isImage ? "rgba(255,255,255,0.06)" : "#243044",
     font: { color: "#e6edf3", size: 11 },
     margin: fullscreen
-      ? { l: 16, r: 16, t: 8, b: 14 }
-      : { l: 48, r: 48, t: 34, b: 68 },
+      ? { l: 8, r: 8, t: 6, b: 8 }
+      : { l: 20, r: 10, t: 12, b: 16 },
     legend: buildLegendLayout(fullscreen),
     hovermode: "closest",
     images: buildBackgroundImages(result),
@@ -720,45 +709,49 @@ function buildMissionLayout(result, options = {}) {
   if (isImage) {
     const { width, height } = getImageSize(result);
     layout.xaxis = {
-      title: "X (px)",
+      title: "",
       range: [0, width],
-      domain: fullscreen ? [0.001, 0.999] : [0.01, 0.99],
+      domain: [0.0, 1.0],
       autorange: false,
       fixedrange: true,
       constrain: "domain",
       showgrid: true,
-      gridcolor: "rgba(255,255,255,0.12)",
+      gridcolor: "rgba(255,255,255,0.10)",
+      tickfont: { size: 9, color: "#5a7a94" },
       zeroline: false,
     };
     layout.yaxis = {
-      title: "Y (px)",
+      title: "",
       range: [height, 0],
-      domain: fullscreen ? [0.001, 0.999] : [0.01, 0.99],
+      domain: [0.0, 1.0],
       autorange: false,
       fixedrange: true,
       scaleanchor: "x",
       scaleratio: 1,
       showgrid: true,
-      gridcolor: "rgba(255,255,255,0.12)",
+      gridcolor: "rgba(255,255,255,0.10)",
+      tickfont: { size: 9, color: "#5a7a94" },
       zeroline: false,
     };
   } else {
     const b = result.bounds || { x_range: [0, 1000], y_range: [1000, 0] };
     layout.xaxis = {
-      title: "x (px)",
+      title: "",
       range: b.x_range,
-      domain: fullscreen ? [0.001, 0.999] : [0.01, 0.99],
+      domain: [0.0, 1.0],
       autorange: false,
       gridcolor: "#2d3a4f",
+      tickfont: { size: 9, color: "#5a7a94" },
       zeroline: false,
     };
     layout.yaxis = {
-      title: "y (px)",
+      title: "",
       range: b.y_range,
-      domain: fullscreen ? [0.001, 0.999] : [0.01, 0.99],
+      domain: [0.0, 1.0],
       scaleanchor: "x",
       scaleratio: 1,
       gridcolor: "#2d3a4f",
+      tickfont: { size: 9, color: "#5a7a94" },
       zeroline: false,
     };
   }
@@ -876,9 +869,10 @@ function openFullscreen() {
   document.body.classList.add("fullscreen-active");
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
-  requestAnimationFrame(() => {
+  // Double rAF: first lets CSS layout settle, second measures correct dimensions
+  requestAnimationFrame(() => requestAnimationFrame(() => {
     renderMission(state.lastResult, "mapPlotFs", { fullscreen: true });
-  });
+  }));
 }
 
 function closeFullscreen() {
@@ -892,6 +886,10 @@ function closeFullscreen() {
     Plotly.purge("mapPlotFs");
     state.plotReady.mapPlotFs = false;
   } catch (_) {}
+  // Restore main map to fill the now-wider space
+  requestAnimationFrame(() => {
+    try { Plotly.Plots.resize("mapPlot"); } catch (_) {}
+  });
 }
 
 async function runReplan() {
@@ -1096,6 +1094,20 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (state.lastResult) {
         renderMission(state.lastResult, "mapPlotFs", { fullscreen: true });
       }
+    } else {
+      try { Plotly.Plots.resize("mapPlot"); } catch (_) {}
     }
   });
+
+  // Resize main Plotly when the plot-stage changes width (e.g. inspection card shows/hides)
+  const plotStageEl = document.querySelector(".plot-stage");
+  if (plotStageEl && typeof ResizeObserver !== "undefined") {
+    let _resizeRaf = null;
+    new ResizeObserver(() => {
+      cancelAnimationFrame(_resizeRaf);
+      _resizeRaf = requestAnimationFrame(() => {
+        try { Plotly.Plots.resize("mapPlot"); } catch (_) {}
+      });
+    }).observe(plotStageEl);
+  }
 });

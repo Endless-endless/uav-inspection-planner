@@ -677,18 +677,31 @@ async def api_output(filename: str):
 
 
 def main():
+    import socket
     import uvicorn
+
+    def find_free_port(host: str = "127.0.0.1", start: int = 8001, max_tries: int = 50) -> int:
+        for port in range(start, start + max_tries):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                try:
+                    s.bind((host, port))
+                    return port
+                except OSError:
+                    continue
+        raise RuntimeError(f"No free port found in range {start}–{start + max_tries - 1}")
+
+    host = "127.0.0.1"
+    port = find_free_port(host)
 
     print("=" * 60)
     print("UAV Mission Planning Web Dashboard (dual pipeline)")
     print("=" * 60)
-    print("URL: http://127.0.0.1:8001")
-    print("  Image:   result/latest/mission_output.json + data/test.png")
-    print("  Unified: data/sample_*.json")
-    print("Image: auto-generates via demo_visualization_main if missing")
-    print("Legacy HTML: http://127.0.0.1:8001/legacy/html")
+    print(f"URL: http://{host}:{port}")
+    print(f"  Image:   result/latest/mission_output.json + data/test.png")
+    print(f"  Unified: data/sample_*.json")
+    print(f"Legacy HTML: http://{host}:{port}/legacy/html")
     print("=" * 60)
-    uvicorn.run(app, host="127.0.0.1", port=8001, log_level="info")
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":
