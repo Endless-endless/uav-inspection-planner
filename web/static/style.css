@@ -124,14 +124,14 @@ body {
 .panel-map {
   grid-column: 2;
   min-height: 420px;
-  padding: 0.55rem 0.6rem 0.6rem;
+  padding: 0.45rem 0.55rem 0.35rem;
 }
 
 .map-inspect-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 0.55rem;
-  align-items: start;
+  align-items: stretch;
 }
 
 /* When inspection card is visible, switch to 2-column: map ~68%, card ~32% */
@@ -271,6 +271,17 @@ body {
   font-weight: 600;
 }
 
+.telemetry-grid span i {
+  font-style: normal;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.inspect-img-wrap {
+  position: relative;
+  width: 100%;
+}
+
 .inspect-img-wrap img {
   width: 100%;
   border-radius: 10px;
@@ -280,6 +291,104 @@ body {
   object-fit: cover;
   min-height: 260px;
   box-shadow: 0 8px 18px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(56, 189, 248, 0.18);
+}
+
+.live-hud {
+  position: absolute;
+  left: 0.5rem;
+  right: 0.5rem;
+  top: 0.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.hud-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.24rem;
+  padding: 0.18rem 0.4rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(2, 6, 23, 0.62);
+  font-size: 0.62rem;
+  color: #cbd5e1;
+  letter-spacing: 0.02em;
+}
+
+.hud-pill b {
+  color: #f8fafc;
+  font-weight: 700;
+}
+
+.hud-pill.rec {
+  color: #fecaca;
+  border-color: rgba(248, 113, 113, 0.45);
+}
+
+.hud-pill.rec i {
+  width: 0.44rem;
+  height: 0.44rem;
+  border-radius: 999px;
+  background: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18);
+  animation: recPulse 1s ease infinite;
+}
+
+@keyframes recPulse {
+  50% {
+    opacity: 0.45;
+    transform: scale(0.86);
+  }
+}
+
+.event-timeline {
+  width: 100%;
+  border: 1px solid rgba(71, 85, 105, 0.55);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.5);
+  padding: 0.45rem 0.52rem;
+}
+
+.event-title {
+  font-size: 0.7rem;
+  color: #93c5fd;
+  margin-bottom: 0.35rem;
+}
+
+.event-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 100px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.24rem;
+}
+
+.event-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.45rem;
+  padding: 0.2rem 0.28rem;
+  border-radius: 6px;
+  background: rgba(2, 6, 23, 0.4);
+  border: 1px solid rgba(51, 65, 85, 0.45);
+  font-size: 0.68rem;
+}
+
+.event-list li span {
+  color: #93c5fd;
+  white-space: nowrap;
+}
+
+.event-list li b {
+  color: #e2e8f0;
+  font-weight: 500;
+  text-align: right;
 }
 
 .inspect-img-hint {
@@ -367,6 +476,7 @@ body {
   min-width: 0;
   min-height: 0;
   width: 100%;
+  height: 100%;
 }
 
 .plot-stage-fs {
@@ -531,7 +641,7 @@ body {
 .plot-area {
   width: 100%;
   max-width: 100%;
-  height: clamp(560px, calc(100vh - 260px), 800px);
+  height: clamp(600px, calc(100vh - 220px), 860px);
   border-radius: 6px;
   overflow: hidden;
 }
@@ -552,7 +662,7 @@ body {
 }
 
 .plot-area-fs {
-  height: calc(100vh - 72px);
+  height: calc(100vh - 62px);
   width: 100%;
   min-height: 400px;
 }

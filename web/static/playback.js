@@ -8,6 +8,31 @@
   const MOVE_FRAME_MS = 20;
   const POINT_TRIGGER_DIST = 8;
   const CONTINUITY_EPS = 5;
+  const STREAM_INTERVAL_MIN = 300;
+  const STREAM_INTERVAL_MAX = 1000;
+  const MAX_EVENT_ITEMS = 10;
+  const STATE_TEXT = {
+    IDLE: "待命",
+    TAKEOFF: "起飞中",
+    CRUISING: "巡航中",
+    LEAVING: "离开巡检点",
+    APPROACHING: "接近巡检点",
+    INSPECTING: "巡检中",
+    CAPTURING: "采集中",
+    COMPLETED: "任务完成",
+    PAUSED: "已暂停",
+  };
+  const STREAM_FALLBACKS = [
+    "/static/inspection_placeholder.svg",
+    "/static/inspection_placeholder_1.svg",
+    "/static/inspection_placeholder_2.svg",
+  ];
+  const CRUISE_STREAM_IMAGES = [...STREAM_FALLBACKS];
+  const APPROACH_STREAM_IMAGES = [
+    "/static/inspection_placeholder.svg",
+    "/static/inspection_placeholder_1.svg",
+    "/static/inspection_placeholder.svg",
+  ];
 
   const PLAYBACK = {
     status: "idle",
@@ -25,6 +50,23 @@
     usingPlaceholder: false,
     debug: null,
     imageCache: new Map(),
+    streamTimer: null,
+    streamImages: [],
+    streamIndex: 0,
+    streamCurrentUrl: STREAM_FALLBACKS[0],
+    streamFrozen: false,
+    missionState: "IDLE",
+    events: [],
+    startTimestamp: 0,
+    telemetry: {
+      fps: "--",
+      signal: "--",
+      battery: "--",
+      altitude: "--",
+      speed: "--",
+      mode: "待命",
+    },
+    phaseTimers: [],
   };
 
   function dist(a, b) {
@@ -349,7 +391,200 @@
     return PLAYBACK.speed;
   }
 
+  function setForBoth(id, value) {
+    ["", "Fs"].forEach((p) => {
+      const el = $(`${id}${p}`);
+      if (el) el.textContent = value;
+    });
+  }
+
+  function setMissionState(state) {
+    PLAYBACK.missionState = state;
+    const text = STATE_TEXT[state] || state;
+    setForBoth("inspectCardUavStatus", text);
+    setForBoth("inspectTelemMode", text);
+    ["", "Fs"].forEach((p) => {
+      const badge = $(`inspectCardStatus${p}`);
+      if (!badge) return;
+      if (state === "IDLE" || state === "PAUSED") badge.className = "inspect-status idle";
+      else if (state === "COMPLETED") badge.className = "inspect-status done";
+      else badge.className = "inspect-status shooting";
+      if (state === "PAUSED") badge.textContent = "已暂停";
+      else if (state === "COMPLETED") badge.textContent = "任务完成";
+      else if (state === "CAPTURING") badge.textContent = "正在拍摄";
+      else badge.textContent = text;
+    });
+  }
+
+  function elapsedTag() {
+    const ms = Math.max(0, Date.now() - (PLAYBACK.startTimestamp || Date.now()));
+    const sec = Math.floor(ms / 1000);
+    const mm = String(Math.floor(sec / 60)).padStart(2, "0");
+    const ss = String(sec % 60).padStart(2, "0");
+    return `T+${mm}:${ss}`;
+  }
+
+  function renderEventTimeline(prefix) {
+    const list = $(`inspectEventList${prefix || ""}`);
+    if (!list) return;
+    list.innerHTML = PLAYBACK.events
+      .map((item) => `<li><span>${item.ts}</span><b>${item.text}</b></li>`)
+      .join("");
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function pushEvent(text) {
+    PLAYBACK.events.push({ ts: elapsedTag(), text });
+    if (PLAYBACK.events.length > MAX_EVENT_ITEMS) {
+      PLAYBACK.events = PLAYBACK.events.slice(-MAX_EVENT_ITEMS);
+    }
+    renderEventTimeline("");
+    renderEventTimeline("Fs");
+  }
+
+  function updateProgressVisual() {
+    const total = Math.max(PLAYBACK.timeline.length, 1);
+    const pct = Math.round((Math.min(PLAYBACK.index, total) / total) * 100);
+    setForBoth("inspectCardProgressBarText", `${pct}%`);
+    ["", "Fs"].forEach((pfx) => {
+      const fill = document.querySelector(`#inspectInfoCard${pfx} .mission-progress i`);
+      if (fill) fill.style.width = `${pct}%`;
+    });
+  }
+
+  function renderTelemetry() {
+    setForBoth("inspectHudFps", PLAYBACK.telemetry.fps);
+    setForBoth("inspectHudSignal", PLAYBACK.telemetry.signal);
+    setForBoth("inspectHudBattery", PLAYBACK.telemetry.battery);
+    setForBoth("inspectHudAlt", PLAYBACK.telemetry.altitude);
+    setForBoth("inspectHudSpeed", PLAYBACK.telemetry.speed);
+
+    setForBoth("inspectTelemSignal", PLAYBACK.telemetry.signal);
+    setForBoth("inspectTelemBattery", PLAYBACK.telemetry.battery);
+    setForBoth("inspectTelemAlt", PLAYBACK.telemetry.altitude);
+    setForBoth("inspectTelemMode", STATE_TEXT[PLAYBACK.missionState] || "自动");
+  }
+
+  function updateTelemetryFromPlayback(stateHint) {
+    const total = Math.max(PLAYBACK.timeline.length, 1);
+    const progress = Math.min(1, PLAYBACK.index / total);
+    const speedFactor = getSpeed();
+    const fps = Math.round(24 + Math.random() * 8);
+    const signal = Math.max(66, Math.round(97 - progress * 18 - (Math.random() * 3)));
+    const battery = Math.max(18, Math.round(100 - progress * 78));
+    const altitude = Math.round(30 + Math.sin(PLAYBACK.index * 0.12) * 3 + (stateHint === "APPROACHING" ? -1 : 1));
+    const speedVal =
+      stateHint === "INSPECTING" || stateHint === "CAPTURING"
+        ? 0
+        : stateHint === "APPROACHING"
+          ? (5.5 * speedFactor)
+          : (10.8 * speedFactor);
+
+    PLAYBACK.telemetry = {
+      fps: `${fps}`,
+      signal: `${signal}%`,
+      battery: `${battery}%`,
+      altitude: `${altitude}m`,
+      speed: `${speedVal.toFixed(1)}m/s`,
+      mode: STATE_TEXT[PLAYBACK.missionState] || "自动",
+    };
+    renderTelemetry();
+    updateProgressVisual();
+  }
+
+  function setStreamImage(url, hintText) {
+    PLAYBACK.streamCurrentUrl = url || STREAM_FALLBACKS[0];
+    ["", "Fs"].forEach((p) => {
+      const img = $(`inspectCardImg${p}`);
+      if (!img) return;
+      img.onerror = () => {
+        img.src = STREAM_FALLBACKS[(PLAYBACK.streamIndex + 1) % STREAM_FALLBACKS.length];
+      };
+      img.src = PLAYBACK.streamCurrentUrl;
+      const hint = $(`inspectCardImgHint${p}`);
+      if (hint) hint.textContent = hintText || "实时图传 · 图像持续更新中";
+    });
+  }
+
+  function buildStreamPool(result) {
+    const set = new Set();
+    (result?.inspection_points || []).forEach((pt) => {
+      [pt.image_url, pt.image_path, pt.image_placeholder].forEach((v) => {
+        if (v && typeof v === "string") set.add(v);
+      });
+    });
+    for (let i = 1; i <= 36; i += 1) {
+      const name = `IP_${String(i).padStart(4, "0")}.jpg`;
+      set.add(`/api/inspection-image/${name}`);
+    }
+    STREAM_FALLBACKS.forEach((v) => set.add(v));
+    return [...set];
+  }
+
+  function stopStreamLoop() {
+    if (PLAYBACK.streamTimer != null) {
+      clearTimeout(PLAYBACK.streamTimer);
+      PLAYBACK.streamTimer = null;
+    }
+  }
+
+  function clearPhaseTimers() {
+    PLAYBACK.phaseTimers.forEach((t) => clearTimeout(t));
+    PLAYBACK.phaseTimers = [];
+  }
+
+  function streamDelayByState() {
+    if (PLAYBACK.missionState === "APPROACHING") {
+      return Math.round(700 + Math.random() * 250);
+    }
+    if (PLAYBACK.missionState === "TAKEOFF") {
+      return Math.round(460 + Math.random() * 260);
+    }
+    return Math.round(STREAM_INTERVAL_MIN + Math.random() * (STREAM_INTERVAL_MAX - STREAM_INTERVAL_MIN) * 0.6);
+  }
+
+  function scheduleStreamLoop() {
+    stopStreamLoop();
+    if (PLAYBACK.status !== "playing" || PLAYBACK.streamFrozen) return;
+    PLAYBACK.streamTimer = setTimeout(() => {
+      if (PLAYBACK.status !== "playing" || PLAYBACK.streamFrozen) return;
+      const state = PLAYBACK.missionState;
+      const streamPool =
+        state === "APPROACHING" ? APPROACH_STREAM_IMAGES : CRUISE_STREAM_IMAGES;
+      PLAYBACK.streamIndex = (PLAYBACK.streamIndex + 1) % streamPool.length;
+      const hintText =
+        state === "APPROACHING"
+          ? "接近巡检点 · 图传轻微闪烁"
+          : "实时图传 · 巡航占位画面";
+      setStreamImage(streamPool[PLAYBACK.streamIndex], hintText);
+      updateTelemetryFromPlayback(PLAYBACK.missionState);
+      scheduleStreamLoop();
+    }, streamDelayByState());
+  }
+
+  function ensureInspectCardVisible() {
+    ["", "Fs"].forEach((p) => {
+      const card = $(`inspectInfoCard${p}`);
+      if (card) card.classList.remove("hidden");
+    });
+  }
+
+  function freezeStreamAtPoint(point) {
+    PLAYBACK.streamFrozen = true;
+    stopStreamLoop();
+    const capture = point?.image_url || point?.image_path || PLAYBACK.streamCurrentUrl || STREAM_FALLBACKS[0];
+    setStreamImage(capture, "图像冻结 · 拍摄中");
+  }
+
+  function nextInspectOffset(fromIndex) {
+    for (let i = fromIndex; i < PLAYBACK.timeline.length; i += 1) {
+      if (PLAYBACK.timeline[i]?.type === "inspect") return i - fromIndex;
+    }
+    return -1;
+  }
+
   function clearInspectCard() {
+    clearPhaseTimers();
     ["", "Fs"].forEach((p) => {
       const card = $(`inspectInfoCard${p}`);
       if (!card) return;
@@ -367,7 +602,23 @@
         st.textContent = "待命";
         st.className = "inspect-status idle";
       }
+      const list = $(`inspectEventList${p}`);
+      if (list) list.innerHTML = "<li><span>T+00:00</span><b>系统待命</b></li>";
     });
+    PLAYBACK.events = [{ ts: "T+00:00", text: "系统待命" }];
+    PLAYBACK.streamCurrentUrl = STREAM_FALLBACKS[0];
+    PLAYBACK.streamFrozen = false;
+    PLAYBACK.telemetry = {
+      fps: "--",
+      signal: "--",
+      battery: "--",
+      altitude: "--",
+      speed: "--",
+      mode: "待命",
+    };
+    setMissionState("IDLE");
+    renderTelemetry();
+    updateProgressVisual();
   }
 
   function formatPointLabel(raw) {
@@ -412,23 +663,23 @@
     set("inspectCardType", formatPointType(point.point_type));
     set("inspectCardPriority", formatPriority(point.priority));
     set("inspectCardProgress", `${index} / ${Math.max(total, 1)}`);
-    set("inspectCardUavStatus", "正在巡检");
+    set("inspectCardUavStatus", STATE_TEXT[PLAYBACK.missionState] || "巡检中");
     set("inspectCardTime", new Date().toLocaleTimeString("zh-CN"));
     const img = $(`inspectCardImg${p}`);
     const imageUrl =
       point.image_url ||
       point.image_path ||
-      point.image_placeholder ||
-      "/static/inspection_placeholder.svg";
+      point.image_placeholder;
     const finalUrl = PLAYBACK.imageCache.get(imageUrl) || imageUrl;
-    if (img) {
+    if (img && finalUrl) {
       img.onerror = () => {
-        img.src = point.image_placeholder || "/static/inspection_placeholder.svg";
+        img.src = point.image_placeholder || PLAYBACK.streamCurrentUrl || STREAM_FALLBACKS[0];
         PLAYBACK.usingPlaceholder = true;
       };
       img.src = finalUrl;
+      PLAYBACK.streamCurrentUrl = finalUrl;
     }
-    if (!PLAYBACK.imageCache.has(imageUrl)) {
+    if (imageUrl && !PLAYBACK.imageCache.has(imageUrl)) {
       const preload = new Image();
       preload.onload = () => PLAYBACK.imageCache.set(imageUrl, imageUrl);
       preload.src = imageUrl;
@@ -437,8 +688,8 @@
     if (hint) {
       hint.textContent =
         point.image_available && point.image_url
-          ? "巡检图片已加载"
-          : "暂无巡检图片，显示占位图";
+          ? "巡检图像采集成功"
+          : "巡检图像已冻结，使用占位图";
     }
     const st = $(`inspectCardStatus${p}`);
     if (st) {
@@ -448,20 +699,63 @@
   }
 
   function showInspectCard(point, index, total) {
+    ensureInspectCardVisible();
     fillInspectCard("", point, index, total);
     fillInspectCard("Fs", point, index, total);
     const pid = point.id || point.point_id;
-    setTimeout(() => {
-      if (PLAYBACK.currentPointId === pid) {
-        ["", "Fs"].forEach((pfx) => {
-          const st = $(`inspectCardStatus${pfx}`);
-          if (st) {
-            st.textContent = "已完成 · 正常";
-            st.className = "inspect-status done";
-          }
-        });
-      }
-    }, Math.min(800, getDwellMs() * 0.5));
+    const dwell = Math.max(600, getDwellMs());
+    clearPhaseTimers();
+    setMissionState("APPROACHING");
+    updateTelemetryFromPlayback("APPROACHING");
+    ["", "Fs"].forEach((pfx) => {
+      const hint = $(`inspectCardImgHint${pfx}`);
+      if (hint) hint.textContent = "接近巡检点 · 正在稳定云台";
+    });
+    pushEvent(`到达巡检点 ${formatPointLabel(point.point_id || pid)}`);
+
+    const t1 = setTimeout(() => {
+      if (PLAYBACK.currentPointId !== pid) return;
+      setMissionState("CAPTURING");
+      updateTelemetryFromPlayback("CAPTURING");
+      ["", "Fs"].forEach((pfx) => {
+        const hint = $(`inspectCardImgHint${pfx}`);
+        if (hint) hint.textContent = "正在拍摄 · 图像冻结采集中";
+      });
+      pushEvent("正在拍摄");
+    }, Math.min(260, dwell * 0.2));
+    PLAYBACK.phaseTimers.push(t1);
+
+    const t2 = setTimeout(() => {
+      if (PLAYBACK.currentPointId !== pid) return;
+      ["", "Fs"].forEach((pfx) => {
+        const st = $(`inspectCardStatus${pfx}`);
+        if (st) {
+          st.textContent = "图像采集完成";
+          st.className = "inspect-status done";
+        }
+        const hint = $(`inspectCardImgHint${pfx}`);
+        if (hint) hint.textContent = "✓ 图像采集完成";
+      });
+      setForBoth("inspectCardUavStatus", "图像采集完成");
+      pushEvent("图像采集完成");
+    }, Math.min(720, dwell * 0.55));
+    PLAYBACK.phaseTimers.push(t2);
+
+    const t3 = setTimeout(() => {
+      if (PLAYBACK.currentPointId !== pid) return;
+      ["", "Fs"].forEach((pfx) => {
+        const st = $(`inspectCardStatus${pfx}`);
+        if (st) {
+          st.textContent = "AI 分析完成";
+          st.className = "inspect-status done";
+        }
+        const hint = $(`inspectCardImgHint${pfx}`);
+        if (hint) hint.textContent = "✓ 巡检完成 · ✓ 图像已采集 · ✓ AI 分析完成";
+      });
+      setForBoth("inspectCardUavStatus", "AI 分析完成");
+      pushEvent("AI 分析完成");
+    }, Math.min(1200, dwell * 0.82));
+    PLAYBACK.phaseTimers.push(t3);
   }
 
   function buildPlaybackTraces() {
@@ -651,7 +945,8 @@
       100,
       Math.round((PLAYBACK.index / PLAYBACK.timeline.length) * 100)
     );
-    prog.textContent = `${pct}% · ${PLAYBACK.index}/${PLAYBACK.timeline.length}`;
+    const stateText = STATE_TEXT[PLAYBACK.missionState] || "执行中";
+    prog.textContent = `${pct}% · ${PLAYBACK.index}/${PLAYBACK.timeline.length} · ${stateText}`;
   }
 
   function scheduleNext(delayMs) {
@@ -668,6 +963,18 @@
     PLAYBACK.visitedCoords.set(pid, { x: pt.x, y: pt.y });
     PLAYBACK.currentPoint = null;
     PLAYBACK.currentPointId = null;
+    clearPhaseTimers();
+    PLAYBACK.streamFrozen = false;
+    setMissionState("LEAVING");
+    updateTelemetryFromPlayback("LEAVING");
+    setStreamImage(CRUISE_STREAM_IMAGES[PLAYBACK.streamIndex % CRUISE_STREAM_IMAGES.length], "离开巡检点 · 恢复巡航图传");
+    const toCruise = setTimeout(() => {
+      if (PLAYBACK.status !== "playing") return;
+      setMissionState("CRUISING");
+      updateTelemetryFromPlayback("CRUISING");
+    }, 450);
+    PLAYBACK.phaseTimers.push(toCruise);
+    scheduleStreamLoop();
     updateAllPlotPlayback();
     if (PLAYBACK.status === "playing") tickPlayback();
   }
@@ -678,6 +985,11 @@
     if (PLAYBACK.index >= PLAYBACK.timeline.length) {
       PLAYBACK.status = "finished";
       stopTimer();
+      stopStreamLoop();
+      PLAYBACK.streamFrozen = true;
+      setMissionState("COMPLETED");
+      updateTelemetryFromPlayback("COMPLETED");
+      pushEvent("任务执行完成");
       setPlaybackUi();
       ["", "Fs"].forEach((p) => {
         const st = $(`inspectCardStatus${p}`);
@@ -696,6 +1008,7 @@
       PLAYBACK.uavPos = { x: ev.point.x, y: ev.point.y };
       PLAYBACK.currentPoint = { x: ev.point.x, y: ev.point.y };
       PLAYBACK.currentPointId = ev.point.id || ev.point.point_id;
+      freezeStreamAtPoint(ev.point);
       updateAllPlotPlayback();
       showInspectCard(ev.point, ev.inspect_index, PLAYBACK.totalInspectCount);
       stopTimer();
@@ -709,6 +1022,11 @@
       PLAYBACK.uavPos = { x: ev.x, y: ev.y };
       PLAYBACK.currentPoint = null;
       PLAYBACK.currentPointId = null;
+      const nearOffset = nextInspectOffset(PLAYBACK.index);
+      if (PLAYBACK.index < 8) setMissionState("TAKEOFF");
+      else if (nearOffset >= 0 && nearOffset < 18) setMissionState("APPROACHING");
+      else if (PLAYBACK.missionState !== "LEAVING") setMissionState("CRUISING");
+      updateTelemetryFromPlayback(PLAYBACK.missionState);
       updateAllPlotPlayback();
       setPlaybackUi();
       scheduleNext(MOVE_FRAME_MS / getSpeed());
@@ -737,6 +1055,8 @@
 
   window.resetPlayback = function (result) {
     stopTimer();
+    stopStreamLoop();
+    clearPhaseTimers();
     PLAYBACK.status = "idle";
     PLAYBACK.index = 0;
     PLAYBACK.currentPoint = null;
@@ -745,12 +1065,18 @@
     PLAYBACK.visitedCoords = new Map();
     PLAYBACK.timeline = [];
     PLAYBACK.totalInspectCount = 0;
+    PLAYBACK.startTimestamp = 0;
+    PLAYBACK.streamFrozen = false;
     clearInspectCard();
 
     if (result) {
       buildTimelineFromResult(result);
+      PLAYBACK.streamImages = buildStreamPool(result);
+      PLAYBACK.streamIndex = 0;
       PLAYBACK.uavPos = null;
     } else {
+      PLAYBACK.streamImages = [...STREAM_FALLBACKS];
+      PLAYBACK.streamIndex = 0;
       PLAYBACK.uavPos = null;
     }
 
@@ -770,6 +1096,7 @@
     }
 
     stopTimer();
+    stopStreamLoop();
     buildTimelineFromResult(result);
 
     if (!PLAYBACK.timeline.length) {
@@ -785,8 +1112,18 @@
     PLAYBACK.currentPointId = null;
     PLAYBACK.status = "playing";
     PLAYBACK.speed = getSpeed();
+    PLAYBACK.startTimestamp = Date.now();
+    PLAYBACK.streamFrozen = false;
+    PLAYBACK.streamImages = buildStreamPool(result);
+    PLAYBACK.streamIndex = 0;
 
     clearInspectCard();
+    ensureInspectCardVisible();
+    setMissionState("TAKEOFF");
+    pushEvent("任务开始执行");
+    setStreamImage(CRUISE_STREAM_IMAGES[0], "实时图传已启动");
+    updateTelemetryFromPlayback("TAKEOFF");
+    scheduleStreamLoop();
     setPlaybackUi();
     updateAllPlotPlayback();
 
@@ -798,7 +1135,12 @@
   window.pauseInspectionPlayback = function () {
     if (PLAYBACK.status !== "playing") return;
     stopTimer();
+    stopStreamLoop();
+    clearPhaseTimers();
     PLAYBACK.status = "paused";
+    setMissionState("PAUSED");
+    updateTelemetryFromPlayback("PAUSED");
+    pushEvent("任务已暂停");
     setPlaybackUi();
   };
 
@@ -806,6 +1148,10 @@
     if (PLAYBACK.status !== "paused") return;
     PLAYBACK.status = "playing";
     PLAYBACK.speed = getSpeed();
+    setMissionState("CRUISING");
+    updateTelemetryFromPlayback("CRUISING");
+    scheduleStreamLoop();
+    pushEvent("任务继续执行");
     setPlaybackUi();
     tickPlayback();
   };

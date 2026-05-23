@@ -647,7 +647,7 @@ function buildLegendLayout(fullscreen = false) {
   return {
     orientation: "h",
     x: 0.01,
-    y: 0.01,
+    y: 0.003,
     xanchor: "left",
     yanchor: "bottom",
     bgcolor: "rgba(10, 16, 28, 0.72)",
@@ -710,8 +710,8 @@ function buildMissionLayout(result, options = {}) {
     plot_bgcolor: isImage ? "rgba(255,255,255,0.06)" : "#243044",
     font: { color: "#e6edf3", size: 11 },
     margin: fullscreen
-      ? { l: 8, r: 8, t: 6, b: 8 }
-      : { l: 20, r: 10, t: 12, b: 16 },
+      ? { l: 6, r: 6, t: 2, b: 4 }
+      : { l: 14, r: 8, t: 4, b: 6 },
     legend: buildLegendLayout(fullscreen),
     hovermode: "closest",
     images: buildBackgroundImages(result),
