@@ -82,7 +82,7 @@ async function loadDatasets() {
 
 function applyPipelineUi() {
   const image = isImagePipeline();
-  $("pipelineBadge").textContent = image ? "Image PNG" : "Unified JSON";
+  $("pipelineBadge").textContent = image ? "图像 PNG" : "统一 JSON";
 
   const ds = $("datasetSelect");
   const pl = $("plannerSelect");
@@ -93,12 +93,12 @@ function applyPipelineUi() {
   if (image) {
     ds.innerHTML = '<option value="data/test.png">data/test.png</option>';
     ds.disabled = true;
-    pl.innerHTML = '<option value="legacy">Legacy Mission</option>';
+    pl.innerHTML = '<option value="legacy">传统任务模式</option>';
     pl.disabled = true;
     sp.disabled = true;
-    mm.innerHTML = '<option value="image_overlay" selected>Image Overlay</option>';
+    mm.innerHTML = '<option value="image_overlay" selected>图像叠加</option>';
     mm.disabled = true;
-    $("runBtn").textContent = "生成/加载图像主线 Mission";
+    $("runBtn").textContent = "生成/加载图像主线任务";
     forceBtn.classList.remove("hidden");
   } else {
     forceBtn.classList.add("hidden");
@@ -115,15 +115,15 @@ function applyPipelineUi() {
     if (topo) ds.value = topo.path;
     pl.disabled = false;
     pl.innerHTML = `
-      <option value="baseline">Baseline</option>
-      <option value="optimized">Optimized</option>
-      <option value="dijkstra">Dijkstra</option>`;
+      <option value="baseline">基线方案</option>
+      <option value="optimized">优化方案</option>
+      <option value="dijkstra">Dijkstra 最短路</option>`;
     sp.disabled = false;
     mm.disabled = false;
     mm.innerHTML = `
-      <option value="topology_only" selected>Topology Only</option>
-      <option value="image_overlay">Styled（无 test.png）</option>`;
-    $("runBtn").textContent = "运行 Unified 规划";
+      <option value="topology_only" selected>仅拓扑</option>
+      <option value="image_overlay">样式化（无 test.png）</option>`;
+    $("runBtn").textContent = "运行统一管线规划";
   }
   applyLayerDefaultsForPipeline();
   updateMapModeHint();
@@ -214,13 +214,13 @@ function validateReplanCoords() {
   const ex = parseFloat($("replanEndX").value);
   const ey = parseFloat($("replanEndY").value);
   if ([sx, sy, ex, ey].some((v) => Number.isNaN(v))) {
-    return { ok: false, message: "请填写完整的 Start/End 坐标" };
+    return { ok: false, message: "请填写完整的起点/终点坐标" };
   }
   const { width, height } = getImageSize(state.lastResult || { map_background: state.mapConfig });
   if (sx < 0 || sx > width || ex < 0 || ex > width || sy < 0 || sy > height || ey < 0 || ey > height) {
     return {
       ok: false,
-      message: `Start/End coordinate out of image bounds: x must be [0,${width}], y must be [0,${height}]`,
+      message: `起点/终点坐标超出图像范围：x 应在 [0,${width}]，y 应在 [0,${height}]`,
     };
   }
   return { ok: true, start: [sx, sy], end: [ex, ey] };
@@ -304,14 +304,14 @@ function updateMapModeHint() {
   const hint = $("mapModeHint");
   if (!hint) return;
   if (isImagePipeline()) {
-    const avail = state.imageMissionAvailable ? "mission 已就绪" : "将自动生成 mission";
+    const avail = state.imageMissionAvailable ? "任务已就绪" : "将自动生成任务";
     hint.textContent = `图像主线 · ${avail} · 默认无底图`;
     $("mapPlot")?.classList.add("overlay-mode");
   } else {
     hint.textContent =
       getMapMode() === "topology_only"
-        ? "Unified · 拓扑自适应"
-        : "Unified · 无底图";
+        ? "统一管线 · 拓扑自适应"
+        : "统一管线 · 无底图";
     $("mapPlot")?.classList.remove("overlay-mode");
   }
 }
@@ -349,17 +349,23 @@ function updateDownloadLinks(outputFiles, pipeline) {
 }
 
 function renderMeta(metadata) {
-  const gen = metadata.image_generation;
+  const pipelineMap = {
+    image: "图像主线",
+    unified: "统一管线",
+  };
+  const plannerMap = {
+    baseline: "基线规划",
+    optimized: "全局优化规划",
+    dijkstra: "全局优化规划",
+    legacy: "全局优化规划",
+    start_end_replan: "全局优化规划",
+  };
+  const pipelineText = pipelineMap[metadata.pipeline] || "—";
+  const plannerText = plannerMap[metadata.planner] || "全局优化规划";
   const lines = [
-    `pipeline: ${metadata.pipeline || "—"}`,
-    `source: ${metadata.source || "—"}`,
-    gen ? `generation: ${gen.generated ? "新生成" : "复用缓存"}` : null,
-    gen?.message ? `gen_msg: ${gen.message}` : null,
-    `planner: ${metadata.planner || "—"}`,
-    metadata.connect_planner ? `connect: ${metadata.connect_planner}` : null,
-    metadata.map_mode_note ? `map: ${metadata.map_mode_note}` : null,
-    metadata.end_connected != null ? `end_connected: ${metadata.end_connected}` : null,
-    metadata.planning_spacing != null ? `planning_spacing: ${metadata.planning_spacing}px` : null,
+    `管线: ${pipelineText}`,
+    `规划器: ${plannerText}`,
+    metadata.planning_spacing != null ? `巡检点间距: ${metadata.planning_spacing}px` : null,
   ].filter(Boolean);
   $("metaBox").innerHTML = lines.map((l) => `<div>${escapeHtml(l)}</div>`).join("");
 }
@@ -398,8 +404,8 @@ function renderVisitOrder(visitOrder) {
   }
   chips.innerHTML = visitOrder
     .map(
-      (eid, i) =>
-        `<span class="chip"><span class="idx">${i + 1}</span>${escapeHtml(eid)}</span>`
+      (_eid, i) =>
+        `<span class="chip"><span class="idx">${i + 1}</span>${escapeHtml(`巡检区段 ${i + 1}`)}</span>`
     )
     .join("");
 }
@@ -417,8 +423,11 @@ function buildMissionTraces(result) {
   segments.forEach((seg) => {
     const geom = seg.geometry_2d || [];
     if (geom.length < 2) return;
-    const edge = seg.edge_id || `${seg.from_edge_id || "?"}→${seg.to_edge_id || "?"}`;
-    const hoverLine = `${seg.segment_id}<br>${seg.type} · ${Math.round(seg.length)}px<br>${edge}`;
+    const segLabel = seg.segment_id
+      ? `巡检区段 ${String(seg.segment_id).replace(/^seg_/, "")}`
+      : "巡检区段";
+    const typeLabel = seg.type === "inspect" ? "巡检段" : "连接段";
+    const hoverLine = `${segLabel}<br>${typeLabel} · ${Math.round(seg.length)}px`;
 
     if (seg.type === "inspect") {
       inspectX.push(...geom.map((p) => p[0]), null);
@@ -442,7 +451,7 @@ function buildMissionTraces(result) {
       x: inspectX,
       y: inspectY,
       mode: "lines",
-      name: "Inspect",
+      name: "巡检路径",
       line: { color: MAP_STYLES.inspectColor, width: 4 },
       hoverinfo: "text",
       hovertext: inspectCustom,
@@ -456,7 +465,7 @@ function buildMissionTraces(result) {
       x: connectX,
       y: connectY,
       mode: "lines",
-      name: "Connect",
+      name: "连接路径",
       line: { color: MAP_STYLES.connectColor, width: 3, dash: "dash" },
       hoverinfo: "text",
       hovertext: connectCustom,
@@ -483,13 +492,17 @@ function buildMissionTraces(result) {
 
     visiblePts.forEach((p, idx) => {
       const pid = p.id || p.point_id || `point_${idx}`;
+      const pointLabel = `巡检点 ${String(p.point_id || p.id || idx + 1).replace(/^point_/, "")}`;
+      const segmentLabel = p.segment_id
+        ? `巡检区段 ${String(p.segment_id).replace(/^seg_/, "")}`
+        : "—";
       const isCurrent = currentId && pid === currentId;
       const isVisited = visited.has(pid);
       const cd = [
-        p.segment_id || p.edge_id || "—",
-        p.image_available ? "real image" : "placeholder",
+        segmentLabel,
+        p.image_available ? "真实图片" : "占位图",
         `${p.progress_index || idx + 1}/${totalPoints}`,
-        p.point_id || p.id || `point_${idx}`,
+        pointLabel,
       ];
       const item = { p, cd };
       if (isCurrent) currentPt = item;
@@ -502,7 +515,7 @@ function buildMissionTraces(result) {
         x: unvisited.map((v) => v.p.x),
         y: unvisited.map((v) => v.p.y),
         mode: "markers",
-        name: "Inspection Points",
+        name: "巡检点",
         marker: {
           size: isAll ? 5 : 6,
           color: "#38bdf8",
@@ -513,9 +526,9 @@ function buildMissionTraces(result) {
         customdata: unvisited.map((v) => v.cd),
         hovertemplate:
           "<b>%{text}</b><br>" +
-          "segment: %{customdata[0]}<br>" +
-          "image: %{customdata[1]}<br>" +
-          "progress: %{customdata[2]}<extra></extra>",
+          "区段: %{customdata[0]}<br>" +
+          "图片: %{customdata[1]}<br>" +
+          "进度: %{customdata[2]}<extra></extra>",
         showlegend: true,
         legendgroup: "points",
       });
@@ -526,7 +539,7 @@ function buildMissionTraces(result) {
         x: visitedPts.map((v) => v.p.x),
         y: visitedPts.map((v) => v.p.y),
         mode: "markers",
-        name: "Visited Points",
+        name: "已巡检点",
         marker: {
           size: isAll ? 5 : 7,
           color: "#22c55e",
@@ -537,9 +550,9 @@ function buildMissionTraces(result) {
         customdata: visitedPts.map((v) => v.cd),
         hovertemplate:
           "<b>%{text}</b><br>" +
-          "segment: %{customdata[0]}<br>" +
-          "image: %{customdata[1]}<br>" +
-          "progress: %{customdata[2]}<extra></extra>",
+          "区段: %{customdata[0]}<br>" +
+          "图片: %{customdata[1]}<br>" +
+          "进度: %{customdata[2]}<extra></extra>",
         showlegend: true,
         legendgroup: "points",
       });
@@ -550,7 +563,7 @@ function buildMissionTraces(result) {
         x: [currentPt.p.x],
         y: [currentPt.p.y],
         mode: "markers",
-        name: "Current Point",
+        name: "当前巡检点",
         marker: {
           size: 22,
           color: "rgba(250, 204, 21, 0.26)",
@@ -564,7 +577,7 @@ function buildMissionTraces(result) {
         x: [currentPt.p.x],
         y: [currentPt.p.y],
         mode: "markers",
-        name: "Current Point",
+        name: "当前巡检点",
         marker: {
           size: 12,
           color: "#facc15",
@@ -575,9 +588,9 @@ function buildMissionTraces(result) {
         customdata: [currentPt.cd],
         hovertemplate:
           "<b>%{text}</b><br>" +
-          "segment: %{customdata[0]}<br>" +
-          "image: %{customdata[1]}<br>" +
-          "progress: %{customdata[2]}<extra></extra>",
+          "区段: %{customdata[0]}<br>" +
+          "图片: %{customdata[1]}<br>" +
+          "进度: %{customdata[2]}<extra></extra>",
         showlegend: true,
         legendgroup: "points",
       });
@@ -590,17 +603,17 @@ function buildMissionTraces(result) {
       x: [markers.start.x],
       y: [markers.start.y],
       mode: "markers+text",
-      name: "Start",
+      name: "起点",
       marker: {
         size: 16,
         color: "#22c55e",
         symbol: "star",
         line: { width: 2, color: "#14532d" },
       },
-      text: ["START"],
+      text: ["起点"],
       textfont: { size: 10, color: "#bbf7d0" },
       textposition: "top center",
-      hovertemplate: "Start (%{x:.0f}, %{y:.0f})<extra></extra>",
+      hovertemplate: "起点 (%{x:.0f}, %{y:.0f})<extra></extra>",
       showlegend: true,
       legendgroup: "start",
     });
@@ -610,17 +623,17 @@ function buildMissionTraces(result) {
       x: [markers.end.x],
       y: [markers.end.y],
       mode: "markers+text",
-      name: "End",
+      name: "终点",
       marker: {
         size: 16,
         color: "#ef4444",
         symbol: "diamond",
         line: { width: 2, color: "#7f1d1d" },
       },
-      text: ["END"],
+      text: ["终点"],
       textfont: { size: 10, color: "#fecaca" },
       textposition: "bottom center",
-      hovertemplate: "End (%{x:.0f}, %{y:.0f})<extra></extra>",
+      hovertemplate: "终点 (%{x:.0f}, %{y:.0f})<extra></extra>",
       showlegend: true,
       legendgroup: "end",
     });
@@ -970,7 +983,7 @@ async function runPlanning() {
 
   $("runBtn").disabled = true;
   setStatus(
-    pipeline === "image" ? "正在生成/加载图像主线…" : "Unified 规划中…",
+    pipeline === "image" ? "正在生成/加载图像主线…" : "统一管线规划中…",
     "running"
   );
 
@@ -1007,7 +1020,7 @@ async function runPlanning() {
       ? "已自动生成并加载图像主线"
       : pipeline === "image"
         ? "已加载 result/latest/mission_output.json"
-        : `完成 · ${body.planner}`;
+        : `完成 · ${$("plannerSelect")?.selectedOptions?.[0]?.textContent || body.planner}`;
     setStatus(
       `${msg} · ${data.statistics?.num_segments ?? 0} 段`,
       "ok"

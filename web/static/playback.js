@@ -370,6 +370,33 @@
     });
   }
 
+  function formatPointLabel(raw) {
+    if (raw == null) return "—";
+    const core = String(raw).replace(/^point_?/i, "");
+    return `巡检点 ${core}`;
+  }
+
+  function formatSegmentLabel(raw) {
+    if (raw == null) return "—";
+    const core = String(raw).replace(/^seg_?/i, "");
+    return `巡检区段 ${core}`;
+  }
+
+  function formatPointType(raw) {
+    const t = String(raw || "").toLowerCase();
+    if (t === "endpoint") return "终端巡检点";
+    if (t === "turning") return "转角巡检点";
+    if (t === "sample") return "普通巡检点";
+    return raw || "普通巡检点";
+  }
+
+  function formatPriority(raw) {
+    const p = String(raw || "").toLowerCase();
+    if (p === "high") return "高";
+    if (p === "normal") return "普通";
+    return raw || "普通";
+  }
+
   function fillInspectCard(prefix, point, index, total) {
     const p = prefix || "";
     const card = $(`inspectInfoCard${p}`);
@@ -379,11 +406,11 @@
       const el = $(`${id}${p}`);
       if (el) el.textContent = val;
     };
-    set("inspectCardId", point.id || point.point_id || "—");
-    set("inspectCardSegment", point.segment_id || point.edge_id || "—");
+    set("inspectCardId", formatPointLabel(point.point_id || point.id));
+    set("inspectCardSegment", formatSegmentLabel(point.segment_id || point.edge_id));
     set("inspectCardCoord", `${Math.round(point.x)}, ${Math.round(point.y)}`);
-    set("inspectCardType", point.point_type || "sample");
-    set("inspectCardPriority", point.priority || "normal");
+    set("inspectCardType", formatPointType(point.point_type));
+    set("inspectCardPriority", formatPriority(point.priority));
     set("inspectCardProgress", `${index} / ${Math.max(total, 1)}`);
     set("inspectCardUavStatus", "正在巡检");
     set("inspectCardTime", new Date().toLocaleTimeString("zh-CN"));
@@ -440,7 +467,7 @@
   function buildPlaybackTraces() {
     return [
       {
-        name: "UAV Glow",
+        name: "无人机光晕",
         x: [],
         y: [],
         mode: "markers",
@@ -454,7 +481,7 @@
         hoverinfo: "skip",
       },
       {
-        name: "UAV",
+        name: "无人机",
         x: [],
         y: [],
         mode: "markers",
@@ -468,7 +495,7 @@
         hoverinfo: "skip",
       },
       {
-        name: "Current Inspect",
+        name: "当前巡检点",
         x: [],
         y: [],
         mode: "markers",
@@ -482,7 +509,7 @@
         hoverinfo: "skip",
       },
       {
-        name: "Visited",
+        name: "已巡检点",
         x: [],
         y: [],
         mode: "markers",
@@ -518,13 +545,13 @@
     const el = document.getElementById(plotId);
     if (!el?.data?.length) return null;
     const idx = (name) => el.data.findIndex((t) => t.name === name);
-    const uav = idx("UAV");
+    const uav = idx("无人机");
     if (uav < 0) return null;
     return {
-      glow: idx("UAV Glow"),
+      glow: idx("无人机光晕"),
       uav,
-      current: idx("Current Inspect"),
-      visited: idx("Visited"),
+      current: idx("当前巡检点"),
+      visited: idx("已巡检点"),
     };
   }
 
@@ -587,7 +614,7 @@
         Plotly.restyle(plotId, { x: [visX], y: [visY] }, [idx.visited]);
       }
     } catch (err) {
-      console.warn("playback restyle failed:", plotId, err);
+      console.warn("巡检播放重绘失败:", plotId, err);
     }
   }
 
@@ -738,7 +765,7 @@
   window.startInspectionPlayback = function () {
     const result = window.state?.lastResult;
     if (!result) {
-      alert("请先生成/加载 Mission");
+      alert("请先生成/加载任务");
       return;
     }
 
@@ -746,7 +773,7 @@
     buildTimelineFromResult(result);
 
     if (!PLAYBACK.timeline.length) {
-      alert("当前 Mission 无可播放轨迹");
+      alert("当前任务无可播放轨迹");
       return;
     }
 

@@ -244,6 +244,33 @@ body {
   word-break: break-all;
 }
 
+.telemetry-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.4rem;
+  width: 100%;
+  margin-top: 0.2rem;
+}
+
+.telemetry-grid span {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.42rem 0.5rem;
+  border-radius: 8px;
+  border: 1px solid rgba(56, 189, 248, 0.2);
+  background: rgba(15, 23, 42, 0.55);
+  color: var(--text);
+  font-size: 0.74rem;
+  line-height: 1.25;
+}
+
+.telemetry-grid span b {
+  color: #7dd3fc;
+  font-size: 0.66rem;
+  font-weight: 600;
+}
+
 .inspect-img-wrap img {
   width: 100%;
   border-radius: 10px;

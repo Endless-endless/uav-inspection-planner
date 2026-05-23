@@ -69,8 +69,8 @@ PlannerName = Literal["baseline", "optimized", "dijkstra", "legacy"]
 MapModeName = Literal["topology_only", "image_overlay"]
 
 app = FastAPI(
-    title="UAV Powerline Mission Dashboard",
-    description="Dual pipeline: Image (legacy PNG) + Unified JSON",
+    title="无人机电网巡检任务控制中心",
+    description="双管线：图像管线（传统 PNG）+ 统一 JSON 管线",
     version="1.1.0",
 )
 
@@ -111,12 +111,12 @@ def _resolve_input_path(input_file: str) -> Path:
         p = ROOT / p
     p = p.resolve()
     if not p.exists():
-        raise HTTPException(status_code=404, detail=f"Input file not found: {input_file}")
+        raise HTTPException(status_code=404, detail=f"未找到输入文件: {input_file}")
     data_root = DATA_DIR.resolve()
     try:
         p.relative_to(data_root)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Input must be under data/") from None
+        raise HTTPException(status_code=400, detail="输入文件必须位于 data/ 目录下") from None
     return p
 
 
@@ -130,7 +130,7 @@ def _run_image_demo_main() -> None:
     except Exception as import_err:
         if not DEMO_VISUALIZATION_SCRIPT.exists():
             raise RuntimeError(
-                f"demo script not found: {DEMO_VISUALIZATION_SCRIPT}"
+                f"未找到 demo 脚本: {DEMO_VISUALIZATION_SCRIPT}"
             ) from import_err
 
         proc = subprocess.run(
@@ -144,7 +144,7 @@ def _run_image_demo_main() -> None:
         if proc.returncode != 0:
             err_tail = (proc.stderr or proc.stdout or "")[-4000:]
             raise RuntimeError(
-                f"demo_visualization_main.py failed (code {proc.returncode}):\n{err_tail}"
+                f"demo_visualization_main.py 执行失败（返回码 {proc.returncode}）:\n{err_tail}"
             ) from import_err
 
 
@@ -359,7 +359,7 @@ async def _plan_image_pipeline() -> Dict[str, Any]:
 
 async def _plan_unified_pipeline(req: PlanRequest) -> Dict[str, Any]:
     if not req.input_file:
-        raise HTTPException(status_code=400, detail="Unified pipeline requires input_file")
+        raise HTTPException(status_code=400, detail="统一管线模式必须提供 input_file")
 
     input_path = _resolve_input_path(req.input_file)
     planner = req.planner.lower()
@@ -367,13 +367,13 @@ async def _plan_unified_pipeline(req: PlanRequest) -> Dict[str, Any]:
     if planner not in ("baseline", "optimized", "dijkstra"):
         raise HTTPException(
             status_code=400,
-            detail="Unified planner must be baseline | optimized | dijkstra",
+            detail="统一管线规划器必须是 baseline | optimized | dijkstra",
         )
 
     try:
         unified = load_unified_input_from_json(str(input_path))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to load input: {e}") from e
+        raise HTTPException(status_code=400, detail=f"输入文件加载失败: {e}") from e
 
     connect_planner = "bfs"
     connect_note: Optional[str] = None
@@ -688,18 +688,18 @@ def main():
                     return port
                 except OSError:
                     continue
-        raise RuntimeError(f"No free port found in range {start}–{start + max_tries - 1}")
+        raise RuntimeError(f"未找到可用端口，尝试范围: {start}–{start + max_tries - 1}")
 
     host = "127.0.0.1"
     port = find_free_port(host)
 
     print("=" * 60)
-    print("UAV Mission Planning Web Dashboard (dual pipeline)")
+    print("无人机巡检任务控制中心（双管线）")
     print("=" * 60)
     print(f"URL: http://{host}:{port}")
-    print(f"  Image:   result/latest/mission_output.json + data/test.png")
-    print(f"  Unified: data/sample_*.json")
-    print(f"Legacy HTML: http://{host}:{port}/legacy/html")
+    print(f"  图像管线: result/latest/mission_output.json + data/test.png")
+    print(f"  统一管线: data/sample_*.json")
+    print(f"传统页面: http://{host}:{port}/legacy/html")
     print("=" * 60)
     uvicorn.run(app, host=host, port=port, log_level="info")
 
