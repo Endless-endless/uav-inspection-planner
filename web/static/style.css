@@ -391,6 +391,20 @@ body {
   text-align: right;
 }
 
+.adaptive-status {
+  margin: 0.55rem 0 0.45rem;
+  padding: 0.42rem 0.5rem;
+  border: 1px solid rgba(56, 189, 248, 0.22);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.55);
+  color: #bae6fd;
+  font-size: 0.74rem;
+}
+
+.adaptive-events {
+  max-height: 120px;
+}
+
 .inspect-img-hint {
   font-size: 0.7rem;
   color: var(--muted);

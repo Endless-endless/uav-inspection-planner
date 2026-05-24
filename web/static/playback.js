@@ -832,6 +832,9 @@
       status: PLAYBACK.status,
       currentPointId: PLAYBACK.currentPointId,
       visitedIds: new Set(PLAYBACK.visitedIds),
+      uavPos: PLAYBACK.uavPos ? { ...PLAYBACK.uavPos } : null,
+      timelineIndex: PLAYBACK.index,
+      timelineLength: PLAYBACK.timeline.length,
     };
   };
 

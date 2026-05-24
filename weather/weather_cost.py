@@ -48,6 +48,11 @@ def load_weather_zones(weather_file: Optional[Path]) -> List[Dict[str, Any]]:
                 "wind_speed": z.get("wind_speed"),
                 "rain_level": z.get("rain_level"),
                 "visibility_level": z.get("visibility_level"),
+                "velocity": z.get("velocity") or [0.0, 0.0],
+                "expand_rate": float(z.get("expand_rate", 0.0) or 0.0),
+                "severity_rate": float(z.get("severity_rate", 0.0) or 0.0),
+                "lifetime": float(z.get("lifetime", 0.0) or 0.0),
+                "dynamic": bool(z.get("dynamic", False)),
             }
         )
     return out

@@ -1,31 +1,59 @@
 {
   "weather_zones": [
     {
-      "id": "zone_001",
+      "id": "wind_001",
       "type": "wind",
       "severity": 0.8,
       "center": [350, 450],
       "radius": 180,
+      "velocity": [2.0, -1.0],
+      "expand_rate": 0.3,
+      "severity_rate": 0.01,
+      "lifetime": 240,
+      "dynamic": true,
       "wind_speed": 8.5,
       "description": "强风区域"
     },
     {
-      "id": "zone_002",
+      "id": "rain_001",
       "type": "rain",
       "severity": 0.6,
       "center": [620, 300],
       "radius": 140,
+      "velocity": [-1.0, 0.6],
+      "expand_rate": 0.6,
+      "severity_rate": 0.015,
+      "lifetime": 260,
+      "dynamic": true,
       "rain_level": 0.7,
       "description": "降雨区域"
     },
     {
-      "id": "zone_003",
+      "id": "visibility_001",
       "type": "visibility",
       "severity": 0.55,
       "center": [500, 700],
       "radius": 120,
+      "velocity": [0.8, -1.4],
+      "expand_rate": 0.15,
+      "severity_rate": -0.004,
+      "lifetime": 220,
+      "dynamic": true,
       "visibility_level": 0.4,
       "description": "低能见度区域"
+    },
+    {
+      "id": "risk_001",
+      "type": "risk",
+      "severity": 0.72,
+      "center": [760, 560],
+      "radius": 95,
+      "velocity": [-1.6, -0.4],
+      "expand_rate": 0.25,
+      "severity_rate": 0.006,
+      "lifetime": 200,
+      "dynamic": true,
+      "description": "综合风险区域"
     }
   ]
 }
