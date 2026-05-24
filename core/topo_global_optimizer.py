@@ -561,6 +561,7 @@ def build_optimized_mission(
     groups: Dict[str, EdgeGroup],
     adjacency: dict,
     connect_planner: str = "bfs",
+    cost_config: Optional[Dict[str, Any]] = None,
 ) -> GroupedContinuousMission:
     """
     根据优化后的顺序构建任务
@@ -639,6 +640,7 @@ def build_optimized_mission(
             connect_geo, connect_len = generate_connection_segment_with_planner(
                 current_end_point, geo[0], topo_graph, edge_task_map,
                 connect_planner="dijkstra",
+                cost_config=cost_config,
                 from_edge_id=current_edge_id,
                 to_edge_id=edge_id,
             )

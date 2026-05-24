@@ -491,6 +491,10 @@ body {
   grid-column: 2;
 }
 
+.panel-experiment {
+  grid-column: 2;
+}
+
 .field {
   display: flex;
   flex-direction: column;

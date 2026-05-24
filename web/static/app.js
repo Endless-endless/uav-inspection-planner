@@ -33,7 +33,18 @@ const state = {
   showBackground: false,
   showInspect: true,
   showConnect: true,
+  showWeatherLayer: false,
   pointMode: "key",
+  weatherAware: false,
+  weatherWeight: 1.0,
+  experiment: {
+    active: false,
+    overlay: true,
+    runA: null,
+    runB: null,
+    metrics: null,
+    reasoning: "",
+  },
   pickPhase: null,
   plotReady: { mapPlot: false, mapPlotFs: false },
 };
@@ -162,14 +173,22 @@ function readUiToState() {
   state.showBackground = $("toggleBaseMap")?.checked !== false;
   state.showInspect = $("toggleInspect")?.checked !== false;
   state.showConnect = $("toggleConnect")?.checked !== false;
+  state.showWeatherLayer = $("toggleWeatherLayer")?.checked === true;
   state.pointMode = $("pointModeSelect")?.value || "key";
+  state.weatherAware = $("weatherAwareToggle")?.checked === true;
+  state.weatherWeight = Math.max(0, parseFloat($("weatherWeightInput")?.value || "1") || 1);
+  state.experiment.overlay = $("experimentOverlayToggle")?.checked !== false;
 }
 
 function syncStateToUi() {
   if ($("toggleBaseMap")) $("toggleBaseMap").checked = state.showBackground;
   if ($("toggleInspect")) $("toggleInspect").checked = state.showInspect;
   if ($("toggleConnect")) $("toggleConnect").checked = state.showConnect;
+  if ($("toggleWeatherLayer")) $("toggleWeatherLayer").checked = state.showWeatherLayer;
   if ($("pointModeSelect")) $("pointModeSelect").value = state.pointMode;
+  if ($("weatherAwareToggle")) $("weatherAwareToggle").checked = state.weatherAware;
+  if ($("weatherWeightInput")) $("weatherWeightInput").value = String(state.weatherWeight);
+  if ($("experimentOverlayToggle")) $("experimentOverlayToggle").checked = state.experiment.overlay;
 }
 
 function applyLayerDefaultsForPipeline() {
@@ -180,6 +199,7 @@ function applyLayerDefaultsForPipeline() {
     state.showBackground = false;
     state.pointMode = "all";
   }
+  if (state.showWeatherLayer == null) state.showWeatherLayer = false;
   syncStateToUi();
 }
 
@@ -230,6 +250,10 @@ function normalizeMissionResult(result) {
   const pipeline = result?.metadata?.pipeline || getPipeline();
   const out = { ...result };
   out.metadata = { ...(result.metadata || {}), pipeline };
+  out.statistics = { ...(result.statistics || {}) };
+  if (out.metadata.weather_mode != null) {
+    out.statistics.weather_mode = out.metadata.weather_mode;
+  }
 
   if (pipeline === "image") {
     const mapBg =
@@ -366,6 +390,8 @@ function renderMeta(metadata) {
     `管线: ${pipelineText}`,
     `规划器: ${plannerText}`,
     metadata.planning_spacing != null ? `巡检点间距: ${metadata.planning_spacing}px` : null,
+    `天气感知: ${metadata.weather_mode === "on" ? "开启" : "关闭"}`,
+    metadata.weather_mode === "on" ? `天气权重: ${metadata.weather_weight ?? 1.0}` : null,
   ].filter(Boolean);
   $("metaBox").innerHTML = lines.map((l) => `<div>${escapeHtml(l)}</div>`).join("");
 }
@@ -386,6 +412,11 @@ function renderStats(statistics) {
     ["connect_ratio", "连接占比", ((s.connect_ratio || 0) * 100).toFixed(1), "%"],
     ["num_segments", "区段数", s.num_segments, ""],
     ["num_inspection_points", "巡检点数", s.num_inspection_points, ""],
+    ["weather_penalty_total", "天气惩罚", s.weather_penalty_total ?? 0, ""],
+    ["total_cost", "实际总代价", s.total_cost ?? s.total_length ?? 0, ""],
+    ["weather_affected_edges", "受天气影响区段", s.weather_affected_edges ?? 0, ""],
+    ["risky_distance", "高风险穿越长度", s.risky_distance ?? 0, " px"],
+    ["weather_mode", "天气感知", s.weather_mode === "on" ? "开启" : "关闭", ""],
   ];
   $("statCards").innerHTML = items
     .map(
@@ -408,6 +439,239 @@ function renderVisitOrder(visitOrder) {
         `<span class="chip"><span class="idx">${i + 1}</span>${escapeHtml(`巡检区段 ${i + 1}`)}</span>`
     )
     .join("");
+}
+
+function getWeatherZones(result) {
+  const zones = result?.weather_zones || result?.metadata?.weather_zones || [];
+  return Array.isArray(zones) ? zones : [];
+}
+
+function flattenMissionPathPoints(result) {
+  const out = [];
+  const segs = result?.segments || [];
+  segs.forEach((s) => {
+    const geom = s.geometry_2d || [];
+    geom.forEach((p, idx) => {
+      if (!p || p.length < 2) return;
+      if (out.length && idx === 0) {
+        const last = out[out.length - 1];
+        if (Math.abs(last[0] - p[0]) < 1e-6 && Math.abs(last[1] - p[1]) < 1e-6) return;
+      }
+      out.push([Number(p[0]), Number(p[1])]);
+    });
+  });
+  return out;
+}
+
+function pathAsHashSet(points, stride = 3, grid = 10) {
+  const st = new Set();
+  for (let i = 0; i < points.length; i += stride) {
+    const x = Math.round(points[i][0] / grid);
+    const y = Math.round(points[i][1] / grid);
+    st.add(`${x},${y}`);
+  }
+  return st;
+}
+
+function computeRerouteRatio(resultA, resultB) {
+  const aPts = flattenMissionPathPoints(resultA);
+  const bPts = flattenMissionPathPoints(resultB);
+  if (!aPts.length || !bPts.length) return 0;
+  const setA = pathAsHashSet(aPts);
+  const setB = pathAsHashSet(bPts);
+  const union = new Set([...setA, ...setB]);
+  let inter = 0;
+  setA.forEach((v) => {
+    if (setB.has(v)) inter += 1;
+  });
+  const sim = union.size > 0 ? inter / union.size : 1;
+  return Math.max(0, Math.min(100, (1 - sim) * 100));
+}
+
+function calcRouteTraceArrays(result) {
+  const x = [];
+  const y = [];
+  (result?.segments || []).forEach((seg) => {
+    const geom = seg.geometry_2d || [];
+    if (geom.length < 2) return;
+    x.push(...geom.map((p) => p[0]), null);
+    y.push(...geom.map((p) => p[1]), null);
+  });
+  if (x.length && x[x.length - 1] === null) x.pop();
+  if (y.length && y[y.length - 1] === null) y.pop();
+  return { x, y };
+}
+
+function buildExperimentMetrics(resultA, resultB) {
+  const a = resultA?.statistics || {};
+  const b = resultB?.statistics || {};
+  const totalA = Number(a.total_length || 0);
+  const totalB = Number(b.total_length || 0);
+  const penaltyB = Number(b.weather_penalty_total || 0);
+  const costA = Number(a.total_cost != null ? a.total_cost : totalA);
+  const costB = Number(b.total_cost != null ? b.total_cost : totalB + penaltyB);
+  const riskyA = Number(a.risky_distance || 0);
+  const riskyB = Number(b.risky_distance || 0);
+  return {
+    total_distance_a: totalA,
+    total_distance_b: totalB,
+    weather_penalty_total: penaltyB,
+    total_cost_a: costA,
+    total_cost_b: costB,
+    weather_affected_edges_a: Number(a.weather_affected_edges || 0),
+    weather_affected_edges_b: Number(b.weather_affected_edges || 0),
+    risky_distance_a: riskyA,
+    risky_distance_b: riskyB,
+    reroute_ratio: computeRerouteRatio(resultA, resultB),
+    high_risk_bypass: riskyB + 1e-6 < riskyA,
+  };
+}
+
+function fmtNum(v, unit = "") {
+  const n = Number(v || 0);
+  return `${n.toFixed(2)}${unit}`;
+}
+
+function buildPlannerReasoning(resultA, resultB, metrics) {
+  const zones = resultB?.metadata?.weather_summary?.top_zones || [];
+  const segs = resultB?.metadata?.weather_summary?.top_segments || [];
+  if (!zones.length) {
+    return `系统未检测到显著天气惩罚，路径变化约 ${metrics.reroute_ratio.toFixed(1)}%。`;
+  }
+  const z = zones[0];
+  const labelMap = { wind: "强风区", rain: "降雨区", visibility: "低能见度", risk: "风险区域" };
+  const zLabel = labelMap[String(z.type || "").toLowerCase()] || "天气区域";
+  const segText = segs.length ? `优先规避区段：${segs.slice(0, 2).map((s) => s.segment_id).filter(Boolean).join("、") || "关键连接段"}` : "规避高风险连接段";
+  return [
+    `系统检测到主要影响区域：${zLabel}（强度 ${Number(z.severity || 0).toFixed(2)}）。`,
+    `该区域累计惩罚约 ${fmtNum(z.penalty)}，触发绕行策略。`,
+    `${segText}。`,
+    `对比结果：路径变化 ${metrics.reroute_ratio.toFixed(1)}%，总距离增量 ${fmtNum(metrics.total_distance_b - metrics.total_distance_a, " px")}。`,
+  ].join(" ");
+}
+
+function renderExperimentResult() {
+  const host = $("experimentCards");
+  const reason = $("plannerReasoningBox");
+  if (!host || !reason) return;
+  if (!state.experiment.active || !state.experiment.metrics) {
+    host.innerHTML = "";
+    reason.textContent = "尚未运行实验";
+    return;
+  }
+  const m = state.experiment.metrics;
+  host.innerHTML = [
+    `<div class="card"><div class="label">天气关闭总距离</div><div class="value">${fmtNum(m.total_distance_a, " px")}</div></div>`,
+    `<div class="card"><div class="label">天气开启总距离</div><div class="value">${fmtNum(m.total_distance_b, " px")}</div></div>`,
+    `<div class="card"><div class="label">天气惩罚</div><div class="value">${fmtNum(m.weather_penalty_total)}</div></div>`,
+    `<div class="card"><div class="label">天气关闭总代价</div><div class="value">${fmtNum(m.total_cost_a)}</div></div>`,
+    `<div class="card"><div class="label">天气开启总代价</div><div class="value">${fmtNum(m.total_cost_b)}</div></div>`,
+    `<div class="card"><div class="label">受天气影响区段</div><div class="value">${m.weather_affected_edges_b}</div></div>`,
+    `<div class="card"><div class="label">高风险穿越长度</div><div class="value">${fmtNum(m.risky_distance_b, " px")}</div></div>`,
+    `<div class="card"><div class="label">路径变化比例</div><div class="value">${m.reroute_ratio.toFixed(1)}%</div></div>`,
+  ].join("");
+  reason.textContent = state.experiment.reasoning || "实验已完成。";
+}
+
+function weatherColor(type, severity = 0.5) {
+  const t = String(type || "").toLowerCase();
+  const sev = Math.max(0, Math.min(1, Number(severity || 0)));
+  const alpha = (0.12 + sev * 0.30).toFixed(3);
+  const glowAlpha = (0.18 + sev * 0.55).toFixed(3);
+  if (t === "wind") return { fill: `rgba(34, 211, 238, ${alpha})`, line: `rgba(34, 211, 238, ${glowAlpha})`, label: "强风区" };
+  if (t === "rain") return { fill: `rgba(59, 130, 246, ${alpha})`, line: `rgba(59, 130, 246, ${glowAlpha})`, label: "降雨区" };
+  if (t === "visibility") return { fill: `rgba(168, 85, 247, ${alpha})`, line: `rgba(168, 85, 247, ${glowAlpha})`, label: "低能见度" };
+  return { fill: `rgba(239, 68, 68, ${alpha})`, line: `rgba(239, 68, 68, ${glowAlpha})`, label: "风险区域" };
+}
+
+function buildWeatherZoneTraces(result) {
+  if (!state.showWeatherLayer) return [];
+  const zones = getWeatherZones(result);
+  if (!zones.length) return [];
+  const traces = [];
+  const lx = [];
+  const ly = [];
+  const lt = [];
+  zones.forEach((z, idx) => {
+    const center = z.center || [];
+    const radius = Number(z.radius || 0);
+    if (center.length < 2 || !Number.isFinite(radius) || radius <= 0) return;
+    const cx = Number(center[0]);
+    const cy = Number(center[1]);
+    const sev = Number(z.severity || 0);
+    const c = weatherColor(z.type, sev);
+    const n = 56;
+    const xs = [];
+    const ys = [];
+    for (let i = 0; i <= n; i += 1) {
+      const a = (i / n) * Math.PI * 2;
+      xs.push(cx + radius * Math.cos(a));
+      ys.push(cy + radius * Math.sin(a));
+    }
+    const lineW = 1.2 + Math.max(0, Math.min(1, sev)) * 2.4;
+    traces.push({
+      x: xs,
+      y: ys,
+      mode: "lines",
+      fill: "toself",
+      fillcolor: c.fill,
+      line: { color: c.line, width: lineW },
+      name: `天气区 ${idx + 1}`,
+      hovertemplate: `${c.label}<br>强度: ${sev.toFixed(2)}<br>半径: ${radius.toFixed(0)}px<extra></extra>`,
+      showlegend: false,
+    });
+    lx.push(cx);
+    ly.push(cy);
+    lt.push(c.label);
+  });
+  if (lx.length) {
+    traces.push({
+      x: lx,
+      y: ly,
+      mode: "text",
+      text: lt,
+      textfont: { size: 10, color: "#e2e8f0" },
+      textposition: "middle center",
+      hoverinfo: "skip",
+      showlegend: false,
+    });
+  }
+  return traces;
+}
+
+function buildExperimentOverlayTraces() {
+  if (!state.experiment.active || !state.experiment.overlay) return [];
+  const runA = state.experiment.runA;
+  const runB = state.experiment.runB;
+  if (!runA || !runB) return [];
+  const a = calcRouteTraceArrays(runA);
+  const b = calcRouteTraceArrays(runB);
+  const traces = [];
+  if (a.x.length) {
+    traces.push({
+      x: a.x,
+      y: a.y,
+      mode: "lines",
+      name: "A 天气关闭",
+      line: { color: "rgba(148,163,184,0.88)", width: 2.4, dash: "dot" },
+      hoverinfo: "skip",
+      showlegend: true,
+      legendgroup: "expab",
+    });
+  }
+  if (b.x.length) {
+    traces.push({
+      x: b.x,
+      y: b.y,
+      mode: "lines",
+      name: "B 天气开启",
+      line: { color: "rgba(37,99,235,0.95)", width: 2.8 },
+      hoverinfo: "skip",
+      showlegend: true,
+      legendgroup: "expab",
+    });
+  }
+  return traces;
 }
 
 /** 统一 traces：原始 mission / Unified / Replan 共用 */
@@ -445,6 +709,8 @@ function buildMissionTraces(result) {
   });
 
   const traces = [];
+  traces.push(...buildWeatherZoneTraces(result));
+  traces.push(...buildExperimentOverlayTraces());
 
   if (state.showInspect && inspectX.length) {
     traces.push({
@@ -931,6 +1197,8 @@ async function runReplan() {
         start: check.start,
         end: check.end,
         planning_spacing: planningSpacing,
+        weather_aware: $("weatherAwareToggle")?.checked === true,
+        weather_weight: Math.max(0, parseFloat($("weatherWeightInput")?.value || "1") || 1),
       }),
     });
     const data = await res.json();
@@ -940,6 +1208,8 @@ async function runReplan() {
 
     const dashboard = normalizeMissionResult(data.dashboard || data);
     state.lastResult = dashboard;
+    state.experiment.active = false;
+    renderExperimentResult();
     renderStats(dashboard.statistics);
     renderVisitOrder(dashboard.visit_order);
     renderMission(dashboard);
@@ -961,7 +1231,7 @@ async function runReplan() {
   }
 }
 
-async function runPlanning() {
+function buildCurrentPlanRequest() {
   const pipeline = getPipeline();
   const body = {
     pipeline,
@@ -969,8 +1239,9 @@ async function runPlanning() {
     planner: "legacy",
     spacing: 50,
     map_mode: "image_overlay",
+    weather_aware: $("weatherAwareToggle")?.checked === true,
+    weather_weight: Math.max(0, parseFloat($("weatherWeightInput")?.value || "1") || 1),
   };
-
   if (pipeline === "image") {
     body.planner = "legacy";
     body.map_mode = "image_overlay";
@@ -980,6 +1251,87 @@ async function runPlanning() {
     body.spacing = parseFloat($("spacingInput").value) || 50;
     body.map_mode = getMapMode();
   }
+  return body;
+}
+
+async function executeExperimentRun(baseBody, weatherAware) {
+  const pipeline = baseBody.pipeline;
+  if (pipeline === "image") {
+    const check = validateReplanCoords();
+    if (check.ok) {
+      const planningSpacing = parseFloat($("planningSpacingInput")?.value) || 70;
+      const rr = await fetch("/api/replan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pipeline: "image",
+          start: check.start,
+          end: check.end,
+          planning_spacing: planningSpacing,
+          weather_aware: weatherAware,
+          weather_weight: baseBody.weather_weight,
+        }),
+      });
+      const rj = await rr.json();
+      if (!rr.ok || !rj.ok) throw new Error(rj.message || rj.detail || rr.statusText);
+      return normalizeMissionResult(rj.dashboard || rj);
+    }
+  }
+  const body = { ...baseBody, weather_aware: weatherAware };
+  const res = await fetch("/api/plan", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    const detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+    throw new Error(detail || res.statusText);
+  }
+  return normalizeMissionResult(data);
+}
+
+async function runWeatherExperiment() {
+  const btn = $("runWeatherExperimentBtn");
+  if (btn) btn.disabled = true;
+  setStatus("天气实验运行中：A(关闭) vs B(开启)…", "running");
+  try {
+    readUiToState();
+    const baseBody = buildCurrentPlanRequest();
+    const runA = await executeExperimentRun(baseBody, false);
+    const runB = await executeExperimentRun(baseBody, true);
+    const metrics = buildExperimentMetrics(runA, runB);
+    const reasoning = buildPlannerReasoning(runA, runB, metrics);
+
+    state.experiment.active = true;
+    state.experiment.runA = runA;
+    state.experiment.runB = runB;
+    state.experiment.metrics = metrics;
+    state.experiment.reasoning = reasoning;
+    state.experiment.overlay = $("experimentOverlayToggle")?.checked !== false;
+
+    state.lastResult = runB;
+    renderStats(runB.statistics);
+    renderVisitOrder(runB.visit_order);
+    renderMeta(runB.metadata || {});
+    renderExperimentResult();
+    refreshMapView();
+
+    const bypassText = metrics.high_risk_bypass ? "已触发高风险绕行" : "未触发明显高风险绕行";
+    setStatus(
+      `实验完成 · 路径变化 ${metrics.reroute_ratio.toFixed(1)}% · ${bypassText}`,
+      "ok"
+    );
+  } catch (err) {
+    setStatus(`天气实验失败: ${err.message}`, "err");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function runPlanning() {
+  const body = buildCurrentPlanRequest();
+  const pipeline = body.pipeline;
 
   $("runBtn").disabled = true;
   setStatus(
@@ -1001,6 +1353,8 @@ async function runPlanning() {
     }
 
     state.lastResult = normalizeMissionResult(data);
+    state.experiment.active = false;
+    renderExperimentResult();
     if (pipeline === "image") {
       state.imageMissionAvailable = true;
       const st = await checkImageMission();
@@ -1063,6 +1417,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     applyLayerDefaultsForPipeline();
     applyPipelineUi();
     updateReplanInputLimits();
+    renderExperimentResult();
     setStatus("就绪 · 运行 python app.py 后点击加载即可", "");
   } catch (e) {
     setStatus(`初始化失败: ${e.message}`, "err");
@@ -1071,22 +1426,41 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("pipelineSelect").addEventListener("change", () => {
     applyPipelineUi();
     state.lastResult = null;
+    state.experiment.active = false;
+    state.experiment.runA = null;
+    state.experiment.runB = null;
+    state.experiment.metrics = null;
+    state.experiment.reasoning = "";
+    renderExperimentResult();
     state.plotReady.mapPlot = false;
     if (typeof window.resetInspectionPlayback === "function") window.resetInspectionPlayback();
     setStatus("就绪", "");
   });
 
   $("runBtn").addEventListener("click", runPlanning);
+  $("runWeatherExperimentBtn")?.addEventListener("click", runWeatherExperiment);
   $("forceRegenBtn").addEventListener("click", forceRegenerateImage);
   $("fullscreenBtn").addEventListener("click", openFullscreen);
   $("closeFullscreenBtn").addEventListener("click", closeFullscreen);
   $("modalBackdrop")?.addEventListener("click", closeFullscreen);
   $("runReplanBtn")?.addEventListener("click", runReplan);
 
-  ["toggleBaseMap", "toggleInspect", "toggleConnect"].forEach((id) => {
+  ["toggleBaseMap", "toggleInspect", "toggleConnect", "toggleWeatherLayer"].forEach((id) => {
     $(id)?.addEventListener("change", () => refreshMapView());
   });
   $("pointModeSelect")?.addEventListener("change", () => refreshMapView());
+  $("weatherAwareToggle")?.addEventListener("change", () => {
+    readUiToState();
+    if (state.lastResult) renderMeta(state.lastResult.metadata || {});
+  });
+  $("weatherWeightInput")?.addEventListener("change", () => {
+    readUiToState();
+    if (state.lastResult) renderMeta(state.lastResult.metadata || {});
+  });
+  $("experimentOverlayToggle")?.addEventListener("change", () => {
+    state.experiment.overlay = $("experimentOverlayToggle")?.checked !== false;
+    refreshMapView();
+  });
 
   $("pickStartBtn")?.addEventListener("click", () => {
     state.pickPhase = "start";

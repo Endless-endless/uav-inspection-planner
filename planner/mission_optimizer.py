@@ -58,6 +58,7 @@ def optimize_edge_task_order(
     adjacency: Optional[dict] = None,
     start_edge_id: Optional[str] = None,
     connect_planner: str = "dijkstra",
+    cost_config: Optional[dict] = None,
 ) -> Tuple[List[str], Dict[str, str]]:
     """
     Topology-aware greedy：优先拓扑邻接边，connect 代价最短，巡检点更多者优先。
@@ -105,6 +106,7 @@ def optimize_edge_task_order(
                         topo_graph,
                         edge_task_map,
                         connect_planner=connect_planner,
+                        cost_config=cost_config,
                         from_edge_id=eid_i,
                         to_edge_id=eid_j,
                     )
@@ -301,6 +303,7 @@ def build_optimized_unified_mission(
     eps: float = 150.0,
     start_edge_id: Optional[str] = None,
     connect_planner: str = "bfs",
+    cost_config: Optional[dict] = None,
 ):
     """
     基于优化边序构建 GroupedContinuousMission。
@@ -336,6 +339,7 @@ def build_optimized_unified_mission(
         adjacency,
         start_edge_id=start_edge_id,
         connect_planner=connect_planner,
+        cost_config=cost_config,
     )
 
     mission = build_optimized_mission(
@@ -347,5 +351,6 @@ def build_optimized_unified_mission(
         groups,
         adjacency,
         connect_planner=connect_planner,
+        cost_config=cost_config,
     )
     return mission, edge_order, edge_directions

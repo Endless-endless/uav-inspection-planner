@@ -20,6 +20,7 @@ from core.topo_plan import (
     _project_point_to_polyline_distance,
     _slice_polyline_by_distance,
 )
+from weather.weather_cost import compute_edge_weather_penalty
 
 
 def edge_cost(edge: TopoEdge, cost_config: Optional[Dict[str, Any]] = None) -> float:
@@ -30,17 +31,37 @@ def edge_cost(edge: TopoEdge, cost_config: Optional[Dict[str, Any]] = None) -> f
     weight_key = cfg.get("length_field", "len2d")
 
     if weight_key == "len2d" and edge.len2d and edge.len2d > 0:
-        return float(edge.len2d)
+        base = float(edge.len2d)
+    else:
+        length_attr = getattr(edge, weight_key, None)
+        if isinstance(length_attr, (int, float)) and length_attr > 0:
+            base = float(length_attr)
+        elif edge.polyline and len(edge.polyline) >= 2:
+            pts = np.array(edge.polyline, dtype=np.float64)
+            base = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+        else:
+            base = 1.0
 
-    length_attr = getattr(edge, weight_key, None)
-    if isinstance(length_attr, (int, float)) and length_attr > 0:
-        return float(length_attr)
+    weather_cfg = cfg.get("weather") or {}
+    if not weather_cfg.get("enabled"):
+        return base
 
-    if edge.polyline and len(edge.polyline) >= 2:
-        pts = np.array(edge.polyline, dtype=np.float64)
-        return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
-
-    return 1.0
+    poly = list(edge.polyline or [])
+    if len(poly) < 2:
+        return base
+    cache = cfg.setdefault("_weather_edge_cache", {})
+    cache_key = edge.id
+    penalty = cache.get(cache_key)
+    if penalty is None:
+        penalty_info = compute_edge_weather_penalty(
+            poly,
+            weather_cfg.get("weather_zones") or [],
+            type_weights=weather_cfg.get("type_weights"),
+            weather_weight=float(weather_cfg.get("weather_weight", 1.0)),
+        )
+        penalty = float(penalty_info.get("total_penalty", 0.0))
+        cache[cache_key] = penalty
+    return base + penalty
 
 
 def _find_edge_between(topo_graph: TopoGraph, u: str, v: str) -> Optional[TopoEdge]:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import math
 from typing import Any, Dict, List, Optional, Tuple
+from weather.weather_cost import compute_edge_weather_penalty
 
 IMAGE_WIDTH = 916
 IMAGE_HEIGHT = 960
@@ -142,6 +143,25 @@ def _interpolate_line(p0: Point, p1: Point, step: float = 5.0) -> List[Point]:
     return out
 
 
+def _weather_penalty_for_line(
+    p0: Point,
+    p1: Point,
+    weather_context: Optional[Dict[str, Any]],
+) -> float:
+    if not weather_context or not weather_context.get("enabled"):
+        return 0.0
+    zones = weather_context.get("weather_zones") or []
+    if not zones:
+        return 0.0
+    info = compute_edge_weather_penalty(
+        [p0, p1],
+        zones,
+        type_weights=weather_context.get("type_weights"),
+        weather_weight=float(weather_context.get("weather_weight", 1.0)),
+    )
+    return float(info.get("total_penalty", 0.0))
+
+
 def _sample_polyline(
     polyline: List[Point],
     spacing: float,
@@ -258,6 +278,7 @@ def _rotate_order_nearest_start(
     ordered: List[str],
     tasks: Dict[str, Dict[str, Any]],
     start_xy: Point,
+    weather_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], bool, Point]:
     """Pick first edge + direction minimizing distance from start to entry."""
     best_edge: Optional[str] = None
@@ -269,7 +290,7 @@ def _rotate_order_nearest_start(
         poly = tasks[eid]["polyline"]
         for forward in (True, False):
             entry = poly[0] if forward else poly[-1]
-            d = _dist(start_xy, entry)
+            d = _dist(start_xy, entry) + _weather_penalty_for_line(start_xy, entry, weather_context)
             if d < best_dist:
                 best_dist = d
                 best_edge = eid
@@ -358,6 +379,7 @@ def build_start_end_replan_mission(
     start_xy: List[float],
     end_xy: List[float],
     planning_spacing: float = 70.0,
+    weather_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Build full mission JSON: start → inspect all edges (dense polylines) → end.
@@ -371,7 +393,7 @@ def build_start_end_replan_mission(
 
     visit_order = _edge_visit_order(base_mission, tasks)
     visit_order, first_forward, first_entry = _rotate_order_nearest_start(
-        visit_order, tasks, start
+        visit_order, tasks, start, weather_context=weather_context
     )
 
     segments_out: List[Dict[str, Any]] = []
@@ -399,8 +421,8 @@ def build_start_end_replan_mission(
         if i == 0:
             forward = first_forward
         else:
-            d_fwd = _dist(current, poly[0])
-            d_rev = _dist(current, poly[-1])
+            d_fwd = _dist(current, poly[0]) + _weather_penalty_for_line(current, poly[0], weather_context)
+            d_rev = _dist(current, poly[-1]) + _weather_penalty_for_line(current, poly[-1], weather_context)
             forward = d_fwd <= d_rev
         directions[eid] = forward
 
@@ -515,6 +537,8 @@ def build_start_end_replan_mission(
             "end_connected": True,
             "planning_spacing": spacing,
             "planning_point_count": len(planning_points),
+            "weather_aware": bool((weather_context or {}).get("enabled")),
+            "weather_weight": float((weather_context or {}).get("weather_weight", 1.0)),
         },
     }
     return mission

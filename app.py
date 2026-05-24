@@ -51,10 +51,16 @@ from planner.replan_start_end import (
     validate_image_coords,
 )
 from visualization.dashboard_map import get_background_map_config, resolve_map_path
+from weather.weather_cost import (
+    compute_mission_weather_stats,
+    load_weather_zones,
+    make_weather_context,
+)
 
 WEB_DIR = ROOT / "web"
 STATIC_DIR = WEB_DIR / "static"
 DATA_DIR = ROOT / "data"
+WEATHER_SAMPLE_PATH = DATA_DIR / "weather_sample.json"
 OUTPUT_DIR = ROOT / "result" / "web_app"
 LATEST_DIR = ROOT / "result" / "latest"
 LATEST_MISSION_PATH = LATEST_DIR / "mission_output.json"
@@ -92,6 +98,8 @@ class PlanRequest(BaseModel):
     planner: str = "baseline"
     spacing: float = Field(50.0, ge=5.0, le=500.0)
     map_mode: MapModeName = "topology_only"
+    weather_aware: bool = False
+    weather_weight: float = Field(1.0, ge=0.0, le=5.0)
 
 
 class ImageGenerateRequest(BaseModel):
@@ -103,6 +111,8 @@ class ReplanRequest(BaseModel):
     end: List[float] = Field(..., min_length=2, max_length=2)
     pipeline: PipelineName = "image"
     planning_spacing: float = Field(70.0, ge=20.0, le=300.0)
+    weather_aware: bool = False
+    weather_weight: float = Field(1.0, ge=0.0, le=5.0)
 
 
 def _resolve_input_path(input_file: str) -> Path:
@@ -118,6 +128,48 @@ def _resolve_input_path(input_file: str) -> Path:
     except ValueError:
         raise HTTPException(status_code=400, detail="输入文件必须位于 data/ 目录下") from None
     return p
+
+
+def _build_weather_context(enabled: bool, weather_weight: float) -> Dict[str, Any]:
+    zones = load_weather_zones(WEATHER_SAMPLE_PATH)
+    return make_weather_context(
+        enabled=enabled,
+        weather_weight=weather_weight,
+        weather_zones=zones,
+    )
+
+
+def _attach_weather_dashboard_fields(
+    dashboard: Dict[str, Any],
+    weather_ctx: Dict[str, Any],
+) -> None:
+    zones = weather_ctx.get("weather_zones") or []
+    stats = compute_mission_weather_stats(
+        dashboard.get("segments") or [],
+        zones,
+        type_weights=weather_ctx.get("type_weights"),
+        weather_weight=float(weather_ctx.get("weather_weight", 1.0)),
+    ) if weather_ctx.get("enabled") else {
+        "weather_penalty_total": 0.0,
+        "weather_affected_edges": 0,
+    }
+    dashboard.setdefault("statistics", {}).update(stats)
+    total_length = float(dashboard.get("statistics", {}).get("total_length", 0.0) or 0.0)
+    weather_penalty_total = float(dashboard.get("statistics", {}).get("weather_penalty_total", 0.0) or 0.0)
+    dashboard["statistics"]["total_cost"] = round(total_length + weather_penalty_total, 3)
+    dashboard["statistics"]["weather_mode"] = "on" if weather_ctx.get("enabled") else "off"
+    dashboard.setdefault("metadata", {}).update(
+        {
+            "weather_mode": "on" if weather_ctx.get("enabled") else "off",
+            "weather_aware": bool(weather_ctx.get("enabled")),
+            "weather_weight": float(weather_ctx.get("weather_weight", 1.0)),
+            "weather_summary": {
+                "top_zones": stats.get("top_weather_zones", []),
+                "top_segments": stats.get("top_weather_segments", []),
+            },
+        }
+    )
+    dashboard["weather_zones"] = zones
 
 
 def _run_image_demo_main() -> None:
@@ -215,6 +267,7 @@ async def _run_image_replan(
     start: List[float],
     end: List[float],
     planning_spacing: float = 70.0,
+    weather_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     图像主线起终点重规划：planner/replan_start_end.py。
@@ -241,6 +294,7 @@ async def _run_image_replan(
             start,
             end,
             planning_spacing=planning_spacing,
+            weather_context=weather_context,
         )
     except ReplanValidationError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -268,6 +322,8 @@ async def _run_image_replan(
             "planning_point_count": replan_meta.get("planning_point_count"),
             "replan": replan_meta,
             "image_generation": gen,
+            "weather_mode": "on" if (weather_context or {}).get("enabled") else "off",
+            "weather_weight": float((weather_context or {}).get("weather_weight", 1.0)),
         },
     )
     apply_custom_markers(
@@ -278,6 +334,7 @@ async def _run_image_replan(
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     save_json(OUTPUT_DIR / "latest_replan_mission.json", new_mission)
+    _attach_weather_dashboard_fields(dashboard, weather_context or make_weather_context())
     save_json(OUTPUT_DIR / "latest_replan_dashboard.json", dashboard)
     dashboard["output_files"] = {
         "mission_snapshot": "latest_replan_mission.json",
@@ -306,7 +363,12 @@ def _run_baseline(unified, spacing: float) -> Dict[str, Any]:
     )
 
 
-def _run_optimized(unified, spacing: float, connect_planner: str) -> Dict[str, Any]:
+def _run_optimized(
+    unified,
+    spacing: float,
+    connect_planner: str,
+    weather_cost_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     topo_graph, edge_tasks, line_pts = unified_input_to_edge_tasks(
         unified, spacing=spacing, merge_thresh=25.0
     )
@@ -315,6 +377,7 @@ def _run_optimized(unified, spacing: float, connect_planner: str) -> Dict[str, A
         edge_tasks,
         eps=150.0,
         connect_planner=connect_planner,
+        cost_config=weather_cost_config,
     )
     return {
         "topo_graph": topo_graph,
@@ -351,6 +414,10 @@ async def _plan_image_pipeline() -> Dict[str, Any]:
     if LATEST_HTML_PATH.exists():
         dashboard["output_files"]["legacy_html_path"] = "result/latest/main_view_interactive.html"
 
+    _attach_weather_dashboard_fields(
+        dashboard,
+        _build_weather_context(enabled=False, weather_weight=1.0),
+    )
     save_json(OUTPUT_DIR / "latest_dashboard.json", dashboard)
     dashboard["output_files"]["dashboard"] = "latest_dashboard.json"
 
@@ -377,23 +444,43 @@ async def _plan_unified_pipeline(req: PlanRequest) -> Dict[str, Any]:
 
     connect_planner = "bfs"
     connect_note: Optional[str] = None
+    weather_ctx = _build_weather_context(
+        enabled=bool(req.weather_aware),
+        weather_weight=float(req.weather_weight),
+    )
+    weather_cost_cfg = {"weather": weather_ctx}
 
     if planner == "baseline":
         mission_result = _run_baseline(unified, req.spacing)
         planner_label = "baseline"
         meta_planner_name = "baseline_global_topology"
     elif planner == "optimized":
-        mission_result = _run_optimized(unified, req.spacing, connect_planner="bfs")
+        optimized_connect = "dijkstra" if weather_ctx.get("enabled") else "bfs"
+        mission_result = _run_optimized(
+            unified,
+            req.spacing,
+            connect_planner=optimized_connect,
+            weather_cost_config=weather_cost_cfg,
+        )
         planner_label = "optimized"
-        connect_planner = "bfs"
+        connect_planner = optimized_connect
+        if weather_ctx.get("enabled"):
+            connect_note = "天气感知已开启：optimized 自动使用 Dijkstra 连接代价。"
         meta_planner_name = "topology_aware_optimized"
     else:
-        mission_result = _run_optimized(unified, req.spacing, connect_planner="dijkstra")
+        mission_result = _run_optimized(
+            unified,
+            req.spacing,
+            connect_planner="dijkstra",
+            weather_cost_config=weather_cost_cfg,
+        )
         planner_label = "dijkstra"
         connect_planner = "dijkstra"
         connect_note = (
             "请求 Dijkstra 连接规划；单段不可达时已 fallback 至 BFS（planner/topo_dijkstra）。"
         )
+        if weather_ctx.get("enabled"):
+            connect_note += " 已叠加天气惩罚代价。"
         meta_planner_name = "topology_aware_optimized+dijkstra_connect"
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -411,6 +498,8 @@ async def _plan_unified_pipeline(req: PlanRequest) -> Dict[str, Any]:
     exported.setdefault("metadata", {})["planner_name"] = meta_planner_name
     exported["metadata"]["dashboard_planner"] = planner_label
     exported["metadata"]["pipeline"] = "unified"
+    exported["metadata"]["weather_mode"] = "on" if weather_ctx.get("enabled") else "off"
+    exported["metadata"]["weather_weight"] = float(weather_ctx.get("weather_weight", 1.0))
     with mission_json_path.open("w", encoding="utf-8") as f:
         json.dump(exported, f, indent=2, ensure_ascii=False)
         f.write("\n")
@@ -423,6 +512,7 @@ async def _plan_unified_pipeline(req: PlanRequest) -> Dict[str, Any]:
             "planner": planner_label,
             "input_file": str(input_path.relative_to(ROOT)),
             "statistics": analysis_stats,
+            "weather_mode": "on" if weather_ctx.get("enabled") else "off",
         },
     )
 
@@ -462,7 +552,12 @@ async def _plan_unified_pipeline(req: PlanRequest) -> Dict[str, Any]:
         connect_planner=connect_planner,
         connect_planner_note=connect_note,
         output_files=output_files,
-        extra_metadata={"planner_name": meta_planner_name},
+        extra_metadata={
+            "planner_name": meta_planner_name,
+            "weather_mode": "on" if weather_ctx.get("enabled") else "off",
+            "weather_aware": bool(weather_ctx.get("enabled")),
+            "weather_weight": float(weather_ctx.get("weather_weight", 1.0)),
+        },
         map_mode=unified_map_mode,
         root=ROOT,
     )
@@ -471,6 +566,7 @@ async def _plan_unified_pipeline(req: PlanRequest) -> Dict[str, Any]:
         dashboard["metadata"]["map_mode_note"] = (
             "Unified 管线不使用 data/test.png；已自动切换为 topology 自适应视口。"
         )
+    _attach_weather_dashboard_fields(dashboard, weather_ctx)
 
     save_json(OUTPUT_DIR / "latest_dashboard.json", dashboard)
     output_files["dashboard"] = "latest_dashboard.json"
@@ -615,8 +711,15 @@ async def api_replan(req: ReplanRequest):
         )
 
     try:
+        weather_ctx = _build_weather_context(
+            enabled=bool(req.weather_aware),
+            weather_weight=float(req.weather_weight),
+        )
         dashboard = await _run_image_replan(
-            req.start, req.end, planning_spacing=req.planning_spacing
+            req.start,
+            req.end,
+            planning_spacing=req.planning_spacing,
+            weather_context=weather_ctx,
         )
     except HTTPException:
         raise

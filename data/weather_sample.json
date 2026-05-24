@@ -1,0 +1,31 @@
+{
+  "weather_zones": [
+    {
+      "id": "zone_001",
+      "type": "wind",
+      "severity": 0.8,
+      "center": [350, 450],
+      "radius": 180,
+      "wind_speed": 8.5,
+      "description": "强风区域"
+    },
+    {
+      "id": "zone_002",
+      "type": "rain",
+      "severity": 0.6,
+      "center": [620, 300],
+      "radius": 140,
+      "rain_level": 0.7,
+      "description": "降雨区域"
+    },
+    {
+      "id": "zone_003",
+      "type": "visibility",
+      "severity": 0.55,
+      "center": [500, 700],
+      "radius": 120,
+      "visibility_level": 0.4,
+      "description": "低能见度区域"
+    }
+  ]
+}
