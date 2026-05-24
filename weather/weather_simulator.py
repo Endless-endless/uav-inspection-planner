@@ -39,6 +39,28 @@ class DynamicWeatherSimulator:
         return copy.deepcopy(self.zones)
 
 
+def forecast_weather_zones(
+    weather_zones: Sequence[Dict[str, Any]],
+    horizon: float,
+    *,
+    elapsed: float = 0.0,
+    bounds: Optional[Dict[str, Sequence[float]]] = None,
+    steps: int = 4,
+) -> List[Dict[str, Any]]:
+    """Return zone states after `horizon` seconds without mutating the input."""
+    horizon = max(0.0, float(horizon))
+    if horizon <= 1e-6:
+        return [copy.deepcopy(z) for z in weather_zones]
+
+    zones = [copy.deepcopy(z) for z in weather_zones]
+    step_dt = horizon / max(1, int(steps))
+    cur_elapsed = float(elapsed)
+    for _ in range(max(1, int(steps))):
+        cur_elapsed += step_dt
+        zones = update_weather_zones(zones, step_dt, elapsed=cur_elapsed, bounds=bounds)
+    return zones
+
+
 def update_weather_zones(
     weather_zones: Sequence[Dict[str, Any]],
     dt: float,

@@ -53,6 +53,15 @@ const state = {
     timer: null,
     lastTick: 0,
     riskThreshold: 0.72,
+    predictionWindow: 10,
+    autoPredictiveReplan: true,
+    predictiveReplanCount: 0,
+    predictedRisk: 0,
+    predictedAffectedSegments: 0,
+    timeToRisk: null,
+    replanCooldownSec: 10,
+    lastReplanAt: 0,
+    lastWarningAt: 0,
     status: "正常巡航",
     events: [],
     replanTriggered: false,
@@ -197,6 +206,11 @@ function readUiToState() {
     0.1,
     parseFloat($("adaptiveRiskThresholdInput")?.value || "0.72") || 0.72
   );
+  state.dynamicWeather.predictionWindow = Math.max(
+    1,
+    parseInt($("predictionWindowSelect")?.value || "10", 10) || 10
+  );
+  state.dynamicWeather.autoPredictiveReplan = $("autoPredictiveReplanToggle")?.checked !== false;
 }
 
 function syncStateToUi() {
@@ -210,6 +224,8 @@ function syncStateToUi() {
   if ($("experimentOverlayToggle")) $("experimentOverlayToggle").checked = state.experiment.overlay;
   if ($("dynamicWeatherToggle")) $("dynamicWeatherToggle").checked = state.dynamicWeather.enabled;
   if ($("adaptiveRiskThresholdInput")) $("adaptiveRiskThresholdInput").value = String(state.dynamicWeather.riskThreshold);
+  if ($("predictionWindowSelect")) $("predictionWindowSelect").value = String(state.dynamicWeather.predictionWindow);
+  if ($("autoPredictiveReplanToggle")) $("autoPredictiveReplanToggle").checked = state.dynamicWeather.autoPredictiveReplan;
 }
 
 function applyLayerDefaultsForPipeline() {
@@ -438,6 +454,11 @@ function renderStats(statistics) {
     ["weather_affected_edges", "受天气影响区段", s.weather_affected_edges ?? 0, ""],
     ["risky_distance", "高风险穿越长度", s.risky_distance ?? 0, " px"],
     ["weather_mode", "天气感知", s.weather_mode === "on" ? "开启" : "关闭", ""],
+    ["predicted_risk", "预测风险", state.dynamicWeather.predictedRisk ?? 0, ""],
+    ["prediction_window", "预测窗口", `${state.dynamicWeather.predictionWindow ?? 10}s`, ""],
+    ["predicted_affected_segments", "预测影响采样点", state.dynamicWeather.predictedAffectedSegments ?? 0, ""],
+    ["time_to_risk", "预计进入风险", state.dynamicWeather.timeToRisk != null ? `${state.dynamicWeather.timeToRisk}s` : "—", ""],
+    ["predictive_replan_count", "预测式重规划", state.dynamicWeather.predictiveReplanCount ?? 0, ""],
   ];
   $("statCards").innerHTML = items
     .map(
@@ -730,6 +751,12 @@ function resetDynamicWeather(result) {
   state.dynamicWeather.replanTriggered = false;
   state.dynamicWeather.movementLogged = false;
   state.dynamicWeather.adaptivePath = null;
+  state.dynamicWeather.predictiveReplanCount = 0;
+  state.dynamicWeather.predictedRisk = 0;
+  state.dynamicWeather.predictedAffectedSegments = 0;
+  state.dynamicWeather.timeToRisk = null;
+  state.dynamicWeather.lastReplanAt = 0;
+  state.dynamicWeather.lastWarningAt = 0;
   state.dynamicWeather.events = [];
   setAdaptiveStatus("天气监测");
   pushAdaptiveEvent("动态天气监测初始化");
@@ -805,6 +832,162 @@ function nearestPathIndex(path, point) {
   return best;
 }
 
+function getPlaybackSpeed() {
+  const visual = typeof window.getPlaybackVisualState === "function"
+    ? window.getPlaybackVisualState()
+    : null;
+  if (visual?.playbackSpeed > 0) return Number(visual.playbackSpeed);
+  return Math.max(0.1, parseFloat($("playbackSpeedSelect")?.value || "1") || 1);
+}
+
+const PLAYBACK_BASE_PX_PER_SEC = 500;
+
+function buildPathFromUav(uav, path, startIdx) {
+  const sub = [[uav[0], uav[1]]];
+  for (let i = startIdx + 1; i < path.length; i += 1) {
+    sub.push([path[i][0], path[i][1]]);
+  }
+  return sub;
+}
+
+function pointAlongPolyline(polyline, distance) {
+  if (!polyline?.length) return null;
+  if (distance <= 0) return [polyline[0][0], polyline[0][1]];
+  let remain = distance;
+  for (let i = 1; i < polyline.length; i += 1) {
+    const ax = polyline[i - 1][0];
+    const ay = polyline[i - 1][1];
+    const bx = polyline[i][0];
+    const by = polyline[i][1];
+    const segLen = Math.hypot(bx - ax, by - ay);
+    if (segLen <= 1e-6) continue;
+    if (remain <= segLen) {
+      const t = remain / segLen;
+      return [ax + t * (bx - ax), ay + t * (by - ay)];
+    }
+    remain -= segLen;
+  }
+  const last = polyline[polyline.length - 1];
+  return [last[0], last[1]];
+}
+
+function forecastWeatherZones(zones, horizonSec, elapsed, bounds) {
+  const horizon = Math.max(0, Number(horizonSec) || 0);
+  if (horizon <= 1e-6) return cloneWeatherZones(zones);
+  const xr = bounds?.x_range || [0, 1000];
+  const yr = bounds?.y_range || [1000, 0];
+  const xmin = Math.min(xr[0], xr[1]);
+  const xmax = Math.max(xr[0], xr[1]);
+  const ymin = Math.min(yr[0], yr[1]);
+  const ymax = Math.max(yr[0], yr[1]);
+  const steps = Math.max(1, Math.ceil(horizon / 2));
+  const stepDt = horizon / steps;
+  let out = cloneWeatherZones(zones);
+  let curElapsed = Number(elapsed) || 0;
+  for (let i = 0; i < steps; i += 1) {
+    curElapsed += stepDt;
+    out = cloneWeatherZones(out).map((z) => {
+      if (!z.dynamic) return z;
+      const lifetime = Number(z.lifetime || 0);
+      if (lifetime > 0 && curElapsed > lifetime) {
+        const phase = (curElapsed - lifetime) / Math.max(lifetime, 1);
+        z.severity = Math.max(0, Math.min(1, Number(z.severity || 0) * Math.exp(-phase)));
+        if (z.severity <= 0.03) return null;
+      }
+      const vel = z.velocity || [0, 0];
+      z.center[0] += Number(vel[0] || 0) * stepDt;
+      z.center[1] += Number(vel[1] || 0) * stepDt;
+      z.radius = Math.max(10, Number(z.radius || 0) + Number(z.expand_rate || 0) * stepDt);
+      z.severity = Math.max(0, Math.min(1, Number(z.severity || 0) + Number(z.severity_rate || 0) * stepDt));
+      if (z.center[0] < xmin || z.center[0] > xmax) {
+        z.velocity[0] = -Number(z.velocity[0] || 0);
+        z.center[0] = Math.max(xmin, Math.min(xmax, z.center[0]));
+      }
+      if (z.center[1] < ymin || z.center[1] > ymax) {
+        z.velocity[1] = -Number(z.velocity[1] || 0);
+        z.center[1] = Math.max(ymin, Math.min(ymax, z.center[1]));
+      }
+      return z;
+    }).filter(Boolean);
+  }
+  return out;
+}
+
+function updatePredictiveMetrics(prediction) {
+  if (!prediction) {
+    state.dynamicWeather.predictedRisk = 0;
+    state.dynamicWeather.predictedAffectedSegments = 0;
+    state.dynamicWeather.timeToRisk = null;
+  } else {
+    state.dynamicWeather.predictedRisk = prediction.predicted_risk;
+    state.dynamicWeather.predictedAffectedSegments = prediction.predicted_affected_segments;
+    state.dynamicWeather.timeToRisk = prediction.time_to_risk;
+  }
+  if (state.lastResult?.statistics) {
+    renderStats(state.lastResult.statistics);
+  }
+}
+
+function predictFutureWeatherRisk() {
+  const uav = getPlaybackUavPoint();
+  const path = flattenMissionPathPoints(state.lastResult);
+  const windowSec = state.dynamicWeather.predictionWindow || 10;
+  const threshold = state.dynamicWeather.riskThreshold;
+  if (!uav || path.length < 2 || !state.dynamicWeather.zones.length) return null;
+
+  const start = nearestPathIndex(path, uav);
+  const futurePath = buildPathFromUav(uav, path, start);
+  const speed = getPlaybackSpeed();
+  const bounds = state.lastResult?.bounds || { x_range: [0, 1000], y_range: [1000, 0] };
+  const elapsed = state.dynamicWeather.elapsed || 0;
+  const sampleStep = 0.5;
+
+  let maxRisk = 0;
+  let timeToRisk = null;
+  let hitZone = null;
+  let hitPoint = null;
+  let affectedSamples = 0;
+
+  for (let t = 0; t <= windowSec + 1e-6; t += sampleStep) {
+    const dist = PLAYBACK_BASE_PX_PER_SEC * speed * t;
+    const pt = pointAlongPolyline(futurePath, dist);
+    if (!pt) break;
+    const forecastZones = forecastWeatherZones(state.dynamicWeather.zones, t, elapsed, bounds);
+    let stepRisk = 0;
+    let stepZone = null;
+    for (const z of forecastZones) {
+      const risk = pointZoneRisk(pt, z);
+      if (risk > stepRisk) {
+        stepRisk = risk;
+        stepZone = z;
+      }
+    }
+    if (stepRisk > maxRisk) {
+      maxRisk = stepRisk;
+      hitZone = stepZone;
+      hitPoint = pt;
+    }
+    if (stepRisk > threshold) {
+      affectedSamples += 1;
+      if (timeToRisk == null) timeToRisk = t;
+    }
+  }
+
+  return {
+    predicted_risk: maxRisk,
+    prediction_window: windowSec,
+    predicted_affected_segments: affectedSamples,
+    time_to_risk: timeToRisk,
+    hitZone,
+    hitPoint,
+    uav,
+    path,
+    startIndex: start,
+    zoneLabel: hitZone ? weatherColor(hitZone.type, hitZone.severity).label : "天气区",
+    isPredictive: timeToRisk != null && timeToRisk > 0.25,
+  };
+}
+
 function analyzeFutureWeatherRisk() {
   const uav = getPlaybackUavPoint();
   const path = flattenMissionPathPoints(state.lastResult);
@@ -873,27 +1056,79 @@ function renderAdaptiveEvents() {
     .join("");
 }
 
+function canTriggerAdaptiveReplan() {
+  const cooldownMs = (state.dynamicWeather.replanCooldownSec || 10) * 1000;
+  return (performance.now() - (state.dynamicWeather.lastReplanAt || 0)) >= cooldownMs;
+}
+
+function triggerAdaptiveReplan(riskInfo, { predictive = false } = {}) {
+  const zone = riskInfo.hitZone;
+  const uav = riskInfo.uav;
+  const hitPoint = riskInfo.hitPoint;
+  if (!zone || !uav || !hitPoint) return false;
+
+  const label = riskInfo.zoneLabel || weatherColor(zone.type, zone.severity).label;
+  if (predictive) {
+    setAdaptiveStatus("预测风险预警");
+    pushAdaptiveEvent("提前触发自适应重规划");
+    state.dynamicWeather.predictiveReplanCount += 1;
+  } else {
+    pushAdaptiveEvent(`检测到${label}进入前方航迹`);
+    pushAdaptiveEvent(`风险 ${(riskInfo.maxRisk ?? riskInfo.predicted_risk ?? 0).toFixed(2)} 超过阈值`);
+    pushAdaptiveEvent("触发自动重规划");
+  }
+
+  setAdaptiveStatus("自动重规划");
+  state.dynamicWeather.adaptivePath = buildAdaptivePathAroundZone(uav, hitPoint, zone);
+  state.dynamicWeather.replanTriggered = true;
+  state.dynamicWeather.lastReplanAt = performance.now();
+  pushAdaptiveEvent("新路径已生成");
+  setAdaptiveStatus("路径更新完成");
+  updateAdaptivePlotTraces();
+  return true;
+}
+
 function maybeTriggerAdaptiveReplan() {
   const visual = typeof window.getPlaybackVisualState === "function" ? window.getPlaybackVisualState() : null;
   if (!visual || visual.status !== "playing") return;
+
+  const threshold = state.dynamicWeather.riskThreshold;
+  const prediction = predictFutureWeatherRisk();
+  updatePredictiveMetrics(prediction);
+
+  if (prediction?.predicted_risk > threshold) {
+    setAdaptiveStatus("预测风险分析");
+    const now = performance.now();
+    const warnCooldownMs = 5000;
+    if ((now - (state.dynamicWeather.lastWarningAt || 0)) >= warnCooldownMs) {
+      const label = prediction.zoneLabel || "天气区";
+      pushAdaptiveEvent(`预测到前方${label}覆盖航迹`);
+      const eta = Math.max(1, Math.round(prediction.time_to_risk ?? prediction.prediction_window ?? 10));
+      pushAdaptiveEvent(`预计 ${eta}s 后进入风险区`);
+      state.dynamicWeather.lastWarningAt = now;
+    }
+
+    if (
+      prediction.isPredictive
+      && state.dynamicWeather.autoPredictiveReplan
+      && canTriggerAdaptiveReplan()
+    ) {
+      triggerAdaptiveReplan(prediction, { predictive: true });
+      return;
+    }
+    setAdaptiveStatus("预测风险预警");
+    return;
+  }
+
   setAdaptiveStatus("风险分析");
   const risk = analyzeFutureWeatherRisk();
   if (!risk?.hitZone) {
     setAdaptiveStatus("正常巡航");
     return;
   }
-  if (risk.maxRisk > state.dynamicWeather.riskThreshold) {
-    if (!state.dynamicWeather.replanTriggered) {
-      const label = weatherColor(risk.hitZone.type, risk.hitZone.severity).label;
-      pushAdaptiveEvent(`检测到${label}进入前方航迹`);
-      pushAdaptiveEvent(`风险 ${risk.maxRisk.toFixed(2)} 超过阈值`);
-      setAdaptiveStatus("自动重规划");
-      state.dynamicWeather.adaptivePath = buildAdaptivePathAroundZone(risk.uav, risk.hitPoint, risk.hitZone);
-      state.dynamicWeather.replanTriggered = true;
-      pushAdaptiveEvent("触发自动重规划");
-      pushAdaptiveEvent("新路径生成完成");
-      setAdaptiveStatus("路径更新完成");
-      updateAdaptivePlotTraces();
+  if (risk.maxRisk > threshold) {
+    if (canTriggerAdaptiveReplan()) {
+      triggerAdaptiveReplan(risk, { predictive: false });
     }
   } else {
     setAdaptiveStatus("天气监测");
@@ -1747,6 +1982,17 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("adaptiveRiskThresholdInput")?.addEventListener("change", () => {
     readUiToState();
     pushAdaptiveEvent(`风险阈值更新为 ${state.dynamicWeather.riskThreshold.toFixed(2)}`);
+  });
+  $("predictionWindowSelect")?.addEventListener("change", () => {
+    readUiToState();
+    pushAdaptiveEvent(`预测窗口更新为 ${state.dynamicWeather.predictionWindow}s`);
+    updatePredictiveMetrics(predictFutureWeatherRisk());
+  });
+  $("autoPredictiveReplanToggle")?.addEventListener("change", () => {
+    readUiToState();
+    pushAdaptiveEvent(
+      state.dynamicWeather.autoPredictiveReplan ? "预测式自动重规划已开启" : "预测式自动重规划已关闭"
+    );
   });
 
   $("pickStartBtn")?.addEventListener("click", () => {

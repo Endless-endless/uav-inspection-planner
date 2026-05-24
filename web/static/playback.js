@@ -835,6 +835,7 @@
       uavPos: PLAYBACK.uavPos ? { ...PLAYBACK.uavPos } : null,
       timelineIndex: PLAYBACK.index,
       timelineLength: PLAYBACK.timeline.length,
+      playbackSpeed: PLAYBACK.speed || 1,
     };
   };
 
