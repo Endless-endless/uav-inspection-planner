@@ -70,9 +70,13 @@
   };
 
   function getMissionForPlayback(fallback) {
+    if (window.MissionStore?.getCurrentMission) {
+      return MissionStore.getCurrentMission() || fallback || null;
+    }
     if (window.MissionStore?.getMission) {
       return MissionStore.getMission() || fallback || null;
     }
+    // deprecated alias
     return window.state?.lastResult || fallback || null;
   }
 

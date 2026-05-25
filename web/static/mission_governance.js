@@ -126,6 +126,28 @@
       return MissionStore.current?.source || "spacing";
     },
 
+    /** @deprecated 使用 getSource() */
+    getMissionSource() {
+      return MissionStore.getSource();
+    },
+
+    /** 与 metadata.inspection_point_source 一致，仅 spacing | image */
+    getInspectionPointSource() {
+      return MissionStore.getSource();
+    },
+
+    getCurrentMission() {
+      return MissionStore.getMission();
+    },
+
+    getCurrentSegments() {
+      return MissionStore.getSegments();
+    },
+
+    getCurrentInspectionPoints() {
+      return MissionStore.getInspectionPoints();
+    },
+
     getSegments() {
       return MissionStore.current?.segments || [];
     },

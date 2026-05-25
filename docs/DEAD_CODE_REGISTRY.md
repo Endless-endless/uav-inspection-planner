@@ -9,7 +9,7 @@
 
 | 符号 | 位置 | 说明 |
 |------|------|------|
-| `buildImageInspectionOverlayTraces()` | `web/static/app.js` | 恒返回 `[]`，占位 stub |
+| ~~`buildImageInspectionOverlayTraces()`~~ | — | **已删除**（2026-05-25 清理阶段） |
 | `#togglePoints` | `web/index.html` | HTML 存在，`app.js` 未绑定 |
 
 ---
@@ -21,11 +21,11 @@
 | `archive/**` | 已隔离旧 replan / core / demo |
 | `demo/generate_interactive_main_view.py` | Legacy Plotly HTML（仅 `/legacy/html`） |
 | `core/visualization_enhanced.py` | 旧 3D/动画，Dashboard 未用 |
-| `visualization/plotly_viewer.py` | 无 app 引用 |
-| `visualization/matplotlib_plots.py` | 无 app 引用 |
-| `visualization/map_3d_overlay.py` | 无 app 引用 |
-| `planner/powerline_inspector.py` | 零外部 import |
-| `utils/csv_logger.py` | 仅 utils 包导出 |
+| `visualization/plotly_viewer.py` | 无 app 引用 → **已移至** `archive/deprecated_cleanup/visualization/` |
+| `visualization/matplotlib_plots.py` | 无 app 引用 → **已归档** |
+| `visualization/map_3d_overlay.py` | 无 app 引用 → **已归档** |
+| `planner/powerline_inspector.py` | 零外部 import → **已归档** |
+| `utils/csv_logger.py` | 无 app 引用 → **已归档** |
 
 ---
 
@@ -47,7 +47,7 @@
 | Server replan | `planner/replan_start_end.py` | `archive/.../replan_*.py` |
 | Dashboard JSON | `planner/mission_result_builder.py` | `generate_interactive_main_view.py` 内联 |
 | 地图底图 | `visualization/dashboard_map.py` | `visualization/map_overlay.py`（demo PNG） |
-| Client adaptive | `web/static/app.js` + `MissionStore.applyAdaptiveConnectReroute` | 旧 `state.lastResult.segments` 直改 |
+| Client adaptive | `web/static/weather_ui.js` + `MissionStore.applyAdaptiveConnectReroute` | 旧 `state.lastResult.segments` 直改 |
 
 ---
 
