@@ -134,6 +134,12 @@ class PowerlinePlannerV3:
         self.independent_lines = []  # List[IndependentLine]
         self.line_inspection_points = []  # List[LineInspectionPoint]
         self.line_inspection_points_by_line = {}  # Dict[line_id, List[LineInspectionPoint]]
+        self.inspection_point_source = "spacing"  # spacing | image
+        self.image_inspection_detections = []
+        self.image_inspection_overlay = []
+        self.clean_map_path = None
+        self.image_detection_stats = {}
+        self.inspection_detector_config = None
         self.primary_line_id = None  # 主线路ID（最长线路）
 
         # =====================================================
@@ -2378,6 +2384,99 @@ class PowerlinePlannerV3:
 
         return self.line_inspection_points
 
+    def step5_detect_image_inspection_points(self, detector_config=None):
+        """Detect hollow black-ring inspection points from the input image."""
+        print("[STEP 5] 检测图像巡检点...")
+        from core.inspection_point_detector import (
+            DEFAULT_DETECTOR_CONFIG,
+            detect_black_inspection_points_with_stats,
+            generate_clean_map,
+        )
+
+        cfg = detector_config or DEFAULT_DETECTOR_CONFIG
+        self.inspection_detector_config = cfg
+        self.image_inspection_detections, self.image_detection_stats = (
+            detect_black_inspection_points_with_stats(self.image_path, config=cfg)
+        )
+        print("[巡检点检测] 统计:")
+        print(f"  - raw contour candidates: {self.image_detection_stats.get('contour_candidates', 0)}")
+        print(f"  - hough candidates: {self.image_detection_stats.get('hough_candidates', 0)}")
+        print(f"  - merged inspection points: {self.image_detection_stats.get('merged_points', 0)}")
+        try:
+            self.clean_map_path = generate_clean_map(
+                self.image_path,
+                detections=self.image_inspection_detections,
+                config=cfg,
+            )
+            print(f"[图像底图] 已生成无黑圈底图: {self.clean_map_path}")
+        except Exception as exc:
+            self.clean_map_path = None
+            print(f"[WARN] clean map 生成失败: {exc}")
+        self.inspection_point_source = "image"
+        self.line_inspection_points = []
+        self.line_inspection_points_by_line = {}
+        print(f"[图像巡检点] 检测到 {len(self.image_inspection_detections)} 个黑色空心圆")
+        return self.image_inspection_detections
+
+    def step5_finalize_image_inspection_points(self, max_snap_distance: float = None):
+        """Snap detected image points onto topo edges and build mission points."""
+        if not self.image_inspection_detections:
+            print("[WARN] 尚未检测图像巡检点")
+            return [], {}
+
+        if self.topo_graph is None:
+            print("[WARN] 尚未构建拓扑图，无法吸附图像巡检点")
+            return [], {}
+
+        from core.inspection_point_generator import (
+            build_image_detected_inspection_points,
+            save_inspection_points_visualization,
+        )
+        from core.inspection_point_detector import DEFAULT_DETECTOR_CONFIG
+
+        cfg = self.inspection_detector_config or DEFAULT_DETECTOR_CONFIG
+        snap_threshold = float(max_snap_distance if max_snap_distance is not None else cfg.snap_threshold)
+        terrain = self.height_map_smooth if hasattr(self, "height_map_smooth") else None
+        (
+            self.line_inspection_points,
+            self.line_inspection_points_by_line,
+            self.image_inspection_overlay,
+        ) = build_image_detected_inspection_points(
+            self.image_inspection_detections,
+            self.topo_graph,
+            terrain=terrain,
+            flight_height=self.flight_height,
+            max_snap_distance=snap_threshold,
+        )
+        if isinstance(self.image_detection_stats, dict):
+            self.image_detection_stats["valid_snapped_points"] = len(self.line_inspection_points)
+            self.image_detection_stats["invalid_points"] = sum(
+                1 for item in self.image_inspection_overlay if not item.get("valid")
+            )
+            print("[巡检点检测] 统计:")
+            print(f"  - valid snapped points: {self.image_detection_stats.get('valid_snapped_points', 0)}")
+            print(f"  - invalid points: {self.image_detection_stats.get('invalid_points', 0)}")
+
+        save_inspection_points_visualization(
+            self.independent_lines,
+            self.line_inspection_points_by_line,
+            self.image_path,
+            "result/step5_line_inspection_points.png",
+        )
+        return self.line_inspection_points
+
+    def _map_existing_points_to_3d(self):
+        from core.inspection_point_generator import _map_to_3d
+
+        terrain = self.height_map_smooth if hasattr(self, "height_map_smooth") else None
+        all_points = []
+        for line_id, points in self.line_inspection_points_by_line.items():
+            for point in points:
+                point.position_3d = _map_to_3d(point.pixel_position, terrain, self.flight_height)
+                all_points.append(point)
+        self.line_inspection_points = all_points
+        return self.line_inspection_points_by_line
+
     def step6_map_line_points_to_3d(
         self,
         terrain_raw,
@@ -2407,6 +2506,14 @@ class PowerlinePlannerV3:
 
         # 复用现有地形平滑逻辑
         self.step6_smooth_terrain(terrain_raw, gaussian_sigma, enhance_resolution)
+
+        if getattr(self, "inspection_point_source", "spacing") == "image":
+            if self.line_inspection_points_by_line:
+                self._map_existing_points_to_3d()
+                print(f"[3D映射] 完成，{len(self.line_inspection_points)} 个图像巡检点已映射到3D")
+            else:
+                print("[3D映射] 图像巡检点将在拓扑吸附后映射")
+            return self.line_inspection_points_by_line
 
         # 更新巡检点的3D坐标
         from core.inspection_point_generator import generate_all_inspection_points

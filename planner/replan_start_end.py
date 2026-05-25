@@ -12,6 +12,8 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 from weather.weather_cost import compute_edge_weather_penalty
 
+from planner.mission_result_builder import is_image_inspection_point, is_image_inspection_source
+
 IMAGE_WIDTH = 916
 IMAGE_HEIGHT = 960
 
@@ -305,6 +307,157 @@ def _rotate_order_nearest_start(
     return rotated, best_forward, best_entry
 
 
+def _collect_baseline_inspection_points(
+    base_mission: Dict[str, Any],
+    visit_order: List[str],
+) -> List[Dict[str, Any]]:
+    """Reuse image-defined inspection points during replan."""
+    points: List[Dict[str, Any]] = []
+    edge_rank = {eid: idx for idx, eid in enumerate(visit_order)}
+    for pt in base_mission.get("inspection_points", []) or []:
+        pos = pt.get("pixel_position") or [pt.get("x"), pt.get("y")]
+        if not pos or len(pos) < 2:
+            continue
+        copied = copy.deepcopy(pt)
+        copied["x"] = float(pos[0])
+        copied["y"] = float(pos[1])
+        copied["pixel_position"] = [float(pos[0]), float(pos[1])]
+        points.append(copied)
+    points.sort(
+        key=lambda p: (
+            edge_rank.get(str(p.get("edge_id")), 10**6),
+            float(p.get("visit_order") or 0),
+        )
+    )
+    return points
+
+
+def _filter_image_inspection_points(points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [pt for pt in points or [] if is_image_inspection_point(pt)]
+
+
+def _points_from_overlay(
+    overlay: List[Dict[str, Any]],
+    *,
+    visit_order: List[str],
+) -> List[Dict[str, Any]]:
+    edge_rank = {eid: idx for idx, eid in enumerate(visit_order)}
+    points: List[Dict[str, Any]] = []
+    for item in overlay or []:
+        if not item.get("valid"):
+            continue
+        snapped = item.get("snapped_coord")
+        if not snapped or len(snapped) < 2:
+            continue
+        point_id = str(item.get("id") or f"IP_{len(points) + 1:04d}")
+        points.append(
+            {
+                "point_id": point_id,
+                "id": point_id,
+                "edge_id": item.get("edge_id"),
+                "x": float(snapped[0]),
+                "y": float(snapped[1]),
+                "pixel_position": [float(snapped[0]), float(snapped[1])],
+                "point_type": "image_detected",
+                "source_reason": "image_black_dot",
+                "detection_result": {
+                    "raw_coord": item.get("raw_coord"),
+                    "snapped_coord": snapped,
+                    "snap_distance": item.get("snap_distance"),
+                    "confidence": item.get("confidence"),
+                    "source": item.get("source"),
+                },
+            }
+        )
+    points.sort(
+        key=lambda p: (
+            edge_rank.get(str(p.get("edge_id")), 10**6),
+            float((p.get("detection_result") or {}).get("distance_along_edge") or 0.0),
+        )
+    )
+    return points
+
+
+def _normalize_cached_inspection_points(
+    points: List[Dict[str, Any]],
+    *,
+    visit_order: List[str],
+) -> List[Dict[str, Any]]:
+    edge_rank = {eid: idx for idx, eid in enumerate(visit_order)}
+    normalized: List[Dict[str, Any]] = []
+    for pt in points or []:
+        pos = pt.get("pixel_position") or pt.get("snapped_coord")
+        if (not pos or len(pos) < 2) and pt.get("x") is not None and pt.get("y") is not None:
+            pos = [pt["x"], pt["y"]]
+        if not pos or len(pos) < 2:
+            continue
+        copied = copy.deepcopy(pt)
+        copied["x"] = float(pos[0])
+        copied["y"] = float(pos[1])
+        copied["pixel_position"] = [float(pos[0]), float(pos[1])]
+        if not copied.get("point_id"):
+            copied["point_id"] = copied.get("id") or f"IP_{len(normalized) + 1:04d}"
+        normalized.append(copied)
+    normalized.sort(
+        key=lambda p: (
+            edge_rank.get(str(p.get("edge_id")), 10**6),
+            float(p.get("visit_order") or 0),
+        )
+    )
+    return normalized
+
+
+def _resolve_replan_inspection_points(
+    base_mission: Dict[str, Any],
+    *,
+    visit_order: List[str],
+    tasks: Dict[str, Dict[str, Any]],
+    directions: Dict[str, bool],
+    spacing: float,
+    mission_context: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Dict[str, Any]], str]:
+    ctx = mission_context or {}
+    source = str(
+        ctx.get("inspection_point_source")
+        or (base_mission.get("metadata") or {}).get("inspection_point_source")
+        or "spacing"
+    )
+
+    if not is_image_inspection_source(source):
+        return _build_planning_inspection_points(tasks, visit_order, directions, spacing), "spacing"
+
+    cached = _normalize_cached_inspection_points(
+        ctx.get("inspection_points") or [],
+        visit_order=visit_order,
+    )
+    if cached:
+        print(f"[Replan] reuse cached dashboard inspection points: {len(cached)}")
+        return cached, "image"
+
+    baseline_points = _filter_image_inspection_points(
+        _collect_baseline_inspection_points(base_mission, visit_order)
+    )
+    if baseline_points:
+        print(f"[Replan] reuse baseline image inspection points: {len(baseline_points)}")
+        return baseline_points, "image"
+
+    overlay = (
+        ctx.get("image_inspection_overlay")
+        or base_mission.get("image_inspection_overlay")
+        or (base_mission.get("metadata") or {}).get("image_inspection_overlay")
+        or []
+    )
+    overlay_points = _points_from_overlay(overlay, visit_order=visit_order)
+    if overlay_points:
+        print(f"[Replan] rebuild image inspection points from overlay: {len(overlay_points)}")
+        return overlay_points, "image"
+
+    raise ReplanValidationError(
+        "Image inspection replan requires existing image-detected points, "
+        "but none were found in baseline mission or request context."
+    )
+
+
 def _build_planning_inspection_points(
     tasks: Dict[str, Dict[str, Any]],
     visit_order: List[str],
@@ -380,6 +533,7 @@ def build_start_end_replan_mission(
     end_xy: List[float],
     planning_spacing: float = 70.0,
     weather_context: Optional[Dict[str, Any]] = None,
+    mission_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Build full mission JSON: start → inspect all edges (dense polylines) → end.
@@ -484,11 +638,31 @@ def build_start_end_replan_mission(
     )
     total_len = inspect_len + connect_len
 
-    planning_points = _build_planning_inspection_points(
-        tasks, visit_order, directions, spacing
-    )
-
     base_meta = copy.deepcopy(base_mission.get("metadata") or {})
+    ctx = mission_context or {}
+    planning_points, resolved_source = _resolve_replan_inspection_points(
+        base_mission,
+        visit_order=visit_order,
+        tasks=tasks,
+        directions=directions,
+        spacing=spacing,
+        mission_context=ctx,
+    )
+    if is_image_inspection_source(resolved_source):
+        resolved_source = "image"
+        if ctx.get("image_path"):
+            base_meta["map_image"] = ctx.get("image_path")
+        if ctx.get("clean_map_image"):
+            base_meta["clean_map_image"] = ctx.get("clean_map_image")
+        if ctx.get("image_detection_stats"):
+            base_meta["image_detection_stats"] = copy.deepcopy(ctx.get("image_detection_stats"))
+        overlay = ctx.get("image_inspection_overlay")
+        if overlay:
+            base_meta["image_inspection_overlay"] = copy.deepcopy(overlay)
+    else:
+        resolved_source = "spacing"
+    base_meta["inspection_point_source"] = resolved_source
+
     base_stats = copy.deepcopy(base_mission.get("statistics") or {})
 
     statistics = {
@@ -537,8 +711,16 @@ def build_start_end_replan_mission(
             "end_connected": True,
             "planning_spacing": spacing,
             "planning_point_count": len(planning_points),
+            "inspection_point_source": resolved_source,
             "weather_aware": bool((weather_context or {}).get("enabled")),
             "weather_weight": float((weather_context or {}).get("weather_weight", 1.0)),
         },
     }
+    if is_image_inspection_source(resolved_source):
+        mission["image_inspection_overlay"] = copy.deepcopy(
+            ctx.get("image_inspection_overlay")
+            or base_meta.get("image_inspection_overlay")
+            or base_mission.get("image_inspection_overlay")
+            or []
+        )
     return mission

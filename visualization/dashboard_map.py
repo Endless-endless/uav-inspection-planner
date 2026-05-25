@@ -29,7 +29,7 @@ def resolve_map_path(root: Path, map_rel: str = DEFAULT_MAP_REL) -> Path:
 def get_background_map_config(
     root: Path,
     map_rel: str = DEFAULT_MAP_REL,
-    image_url: str = "/api/map/background",
+    image_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     返回 Dashboard 可用的底图元数据（不含 base64，由前端通过 URL 加载）。
@@ -37,6 +37,8 @@ def get_background_map_config(
     layout.images 参数与 generate_interactive_main_view 对齐。
     """
     map_path = resolve_map_path(root, map_rel)
+    if image_url is None:
+        image_url = f"/api/map/background?path={map_rel}"
     if not map_path.exists():
         return {
             "available": False,

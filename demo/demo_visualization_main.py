@@ -39,7 +39,11 @@ from planner.powerline_planner_v3_final import PowerlinePlannerV3
 from core.topo_plan import export_grouped_mission_to_json
 
 
-def main():
+def main(
+    image_path: str = "data/test.png",
+    inspection_point_source: str = "spacing",
+    inspection_spacing: float = 100.0,
+):
     """
     主函数：生成主展示页
     """
@@ -94,10 +98,11 @@ def main():
     weather_scene = "calm"  # 默认：微风
 
     planner = PowerlinePlannerV3(
-        image_path='data/test.png',
+        image_path=image_path,
         flight_height=30,
         weather_scene=weather_scene
     )
+    planner.inspection_point_source = inspection_point_source
 
     # 获取并显示天气信息
     weather_info = planner.get_weather_info()
@@ -120,15 +125,24 @@ def main():
     planner.step2_fix_breaks()
     planner.step3_skeletonize()
     planner.step4_extract_independent_lines()
-    planner.step5_generate_line_inspection_points()
+    if inspection_point_source == "image":
+        planner.step5_detect_image_inspection_points()
+    else:
+        planner.step5_generate_line_inspection_points(spacing=inspection_spacing)
 
     # 设置地形
     terrain = np.zeros((planner.height, planner.width), dtype=np.float32)
-    planner.step6_map_line_points_to_3d(terrain)
-    planner.step6_smooth_terrain(terrain)
+    if inspection_point_source == "image":
+        planner.step6_smooth_terrain(terrain)
+    else:
+        planner.step6_map_line_points_to_3d(terrain)
 
     # 拓扑建模
     topo_graph = planner.step7_5_build_topo()
+
+    if inspection_point_source == "image":
+        planner.step5_finalize_image_inspection_points()
+        planner._map_existing_points_to_3d()
 
     # EdgeTask 建模
     edge_tasks = planner.step8_5_build_edge_tasks()
@@ -191,7 +205,14 @@ def main():
         line_inspection_points_by_line=planner.line_inspection_points_by_line,
         output_path="result/latest/mission_output.json",
         terrain_3d=planner.terrain_3d,
-        weather_info=weather_info_for_export  # 传入天气信息（包含统计）
+        weather_info=weather_info_for_export,
+        extra_metadata={
+            "inspection_point_source": planner.inspection_point_source,
+            "map_image": image_path,
+            "clean_map_image": getattr(planner, "clean_map_path", None),
+            "image_inspection_overlay": planner.image_inspection_overlay,
+            "image_detection_stats": getattr(planner, "image_detection_stats", {}),
+        },
     )
 
     print(f"[完成] JSON 已导出: {json_path}")
@@ -231,7 +252,7 @@ def main():
 
         # 生成交互式主展示页，传递当前天气信息
         html_path = create_interactive_main_view(
-            map_image_path='data/test.png',
+            map_image_path=image_path,
             mission_json_path=json_path,
             output_html_path='result/latest/main_view_interactive.html',
             weather=weather_info  # 直接使用当前 weather_scene 对应的天气字典
@@ -257,7 +278,7 @@ def main():
         from visualization.map_overlay import plot_path_on_real_map, plot_path_on_real_map_with_coords
 
         # 使用 data/test.png 作为底图
-        map_image_path = 'data/test.png'
+        map_image_path = image_path
         if os.path.exists(map_image_path):
             # 标准版（基于 data/test.png）
             plot_path_on_real_map(
@@ -334,4 +355,11 @@ def main():
 
 
 if __name__ == "__main__":
-    planner = main()
+    image_path = os.environ.get("UAV_IMAGE_PATH", "data/test.png")
+    inspection_point_source = os.environ.get("UAV_INSPECTION_SOURCE", "spacing")
+    inspection_spacing = float(os.environ.get("UAV_INSPECTION_SPACING", "100"))
+    planner = main(
+        image_path=image_path,
+        inspection_point_source=inspection_point_source,
+        inspection_spacing=inspection_spacing,
+    )

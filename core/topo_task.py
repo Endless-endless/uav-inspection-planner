@@ -20,7 +20,7 @@ EdgeTask：
 """
 
 from dataclasses import dataclass, field
-from typing import Any, List, Tuple, Dict, Optional
+from typing import Any, List, Tuple, Dict, Optional, Sequence
 import numpy as np
 
 
@@ -65,32 +65,102 @@ class EdgeTask:
 # 点到边的映射
 # =====================================================
 
+def point_to_line_segment_distance(point, line_start, line_end):
+    """
+    计算点到线段的垂直距离
+    """
+    point = np.array(point)
+    start = np.array(line_start)
+    end = np.array(line_end)
+
+    line_vec = end - start
+    point_vec = point - start
+    line_len = np.linalg.norm(line_vec)
+
+    if line_len < 1e-6:
+        return np.linalg.norm(point_vec)
+
+    t = np.dot(point_vec, line_vec) / (line_len ** 2)
+    t = np.clip(t, 0, 1)
+    closest = start + t * line_vec
+    return np.linalg.norm(point - closest)
+
+
+def project_point_to_polyline(
+    point: Sequence[float],
+    polyline: Sequence[Sequence[float]],
+) -> Optional[Dict[str, Any]]:
+    """Project a point onto a polyline and return snap metadata."""
+    if len(polyline) < 2:
+        return None
+
+    best: Optional[Dict[str, Any]] = None
+    arc = 0.0
+    for i in range(len(polyline) - 1):
+        p1 = np.array(polyline[i], dtype=float)
+        p2 = np.array(polyline[i + 1], dtype=float)
+        seg_vec = p2 - p1
+        seg_len = float(np.linalg.norm(seg_vec))
+        if seg_len < 1e-6:
+            continue
+
+        pt = np.array(point, dtype=float)
+        t = float(np.dot(pt - p1, seg_vec) / (seg_len ** 2))
+        t = max(0.0, min(1.0, t))
+        closest = p1 + t * seg_vec
+        dist = float(np.linalg.norm(pt - closest))
+        along = arc + t * seg_len
+
+        if best is None or dist < float(best["distance"]):
+            best = {
+                "snapped_coord": (float(closest[0]), float(closest[1])),
+                "distance": dist,
+                "distance_along_edge": float(along),
+                "segment_index": int(i),
+            }
+        arc += seg_len
+
+    return best
+
+
+def snap_point_to_topo_graph(
+    point: Sequence[float],
+    topo_graph,
+    *,
+    max_distance: float = 80.0,
+) -> Optional[Dict[str, Any]]:
+    """Snap a point to the nearest topo edge polyline."""
+    best: Optional[Dict[str, Any]] = None
+    for edge_id, edge in topo_graph.edges.items():
+        proj = project_point_to_polyline(point, edge.polyline)
+        if proj is None:
+            continue
+        if best is None or float(proj["distance"]) < float(best["distance"]):
+            best = {
+                **proj,
+                "edge_id": edge_id,
+                "line_id": edge.line_id,
+            }
+
+    if best is None:
+        return None
+    if float(best["distance"]) > float(max_distance):
+        return None
+    return best
+
+
 def map_points_to_edges(topo_graph, line_inspection_points_by_line: Dict[str, List]) -> Dict[str, List[Dict]]:
     """
     将巡检点映射到对应的拓扑边
-
-    原理：
-    - 每个巡检点属于某条线路
-    - 每条线路被切分为多条拓扑边
-    - 根据点的位置，将其分配到对应的边上
-
-    Args:
-        topo_graph: 拓扑图
-        line_inspection_points_by_line: {line_id: [巡检点列表]}
-
-    Returns:
-        Dict[str, List[Dict]]: {edge_id: [该边上的巡检点列表]}
     """
     print("[点边映射] 开始将巡检点映射到拓扑边...")
 
-    edge_points = {edge_id: [] for edge_id in topo_graph.edges}  # {edge_id: [points]}
+    edge_points = {edge_id: [] for edge_id in topo_graph.edges}
 
-    # 按线路组织边，确保巡检点只在同线路候选边内匹配
     line_to_edges: Dict[str, List[Tuple[str, Any]]] = {}
     for edge_id, edge in topo_graph.edges.items():
         line_to_edges.setdefault(edge.line_id, []).append((edge_id, edge))
 
-    # 每个点仅分配给“最近的一条边”，避免端点/连接点被多条边重复收录
     for line_id, points in line_inspection_points_by_line.items():
         candidates = line_to_edges.get(line_id, [])
         if not candidates or not points:
@@ -113,6 +183,7 @@ def map_points_to_edges(topo_graph, line_inspection_points_by_line: Dict[str, Li
             if pt_pos is None:
                 continue
 
+            snap_threshold = 80.0 if point_type == "image_detected" else 10.0
             best_edge_id = None
             best_dist = float("inf")
 
@@ -128,56 +199,17 @@ def map_points_to_edges(topo_graph, line_inspection_points_by_line: Dict[str, Li
                         best_dist = dist
                         best_edge_id = edge_id
 
-            if best_edge_id is not None and best_dist < 10.0:
+            if best_edge_id is not None and best_dist < snap_threshold:
                 edge_points[best_edge_id].append(point)
                 print(
                     f"[DEBUG] visit target point_type={point_type} mapped_edge={best_edge_id} "
                     f"coord=({pt_pos[0]:.2f},{pt_pos[1]:.2f}) reason={source_reason or 'nearest_edge'}"
                 )
-                if point_type in ("endpoint", "start", "end"):
-                    print(
-                        f"[DEBUG] endpoint added reason edge={best_edge_id} "
-                        f"point_type={point_type} source={source_reason or 'n/a'}"
-                    )
 
-    # 统计
     total_mapped = sum(len(pts) for pts in edge_points.values())
     print(f"  [点边映射] 完成: {len(edge_points)} 条边, {total_mapped} 个巡检点")
 
     return edge_points
-
-
-def point_to_line_segment_distance(point, line_start, line_end):
-    """
-    计算点到线段的垂直距离
-
-    Args:
-        point: 点 (x, y)
-        line_start: 线段起点 (x, y)
-        line_end: 线段终点 (x, y)
-
-    Returns:
-        float: 距离
-    """
-    point = np.array(point)
-    start = np.array(line_start)
-    end = np.array(line_end)
-
-    line_vec = end - start
-    point_vec = point - start
-    line_len = np.linalg.norm(line_vec)
-
-    if line_len < 1e-6:
-        return np.linalg.norm(point_vec)
-
-    # 投影
-    t = np.dot(point_vec, line_vec) / (line_len ** 2)
-    t = np.clip(t, 0, 1)
-
-    # 最近点
-    closest = start + t * line_vec
-
-    return np.linalg.norm(point - closest)
 
 
 # =====================================================

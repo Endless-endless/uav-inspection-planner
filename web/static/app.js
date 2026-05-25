@@ -22,6 +22,7 @@ const KEY_POINT_TYPES = new Set([
   "tower",
   "pole",
   "terminal",
+  "image_detected",
 ]);
 const KEY_POINT_MAX = 30;
 
@@ -67,11 +68,48 @@ const state = {
     replanTriggered: false,
     movementLogged: false,
     adaptivePath: null,
+    adaptiveFlash: null,
+    adaptiveFlashTimer: null,
+    predictiveHud: null,
   },
   pickPhase: null,
   plotReady: { mapPlot: false, mapPlotFs: false },
 };
 window.state = state;
+
+if (window.MissionStore) {
+  Object.defineProperty(state, "lastResult", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      return MissionStore.getMission();
+    },
+    set(value) {
+      if (value == null) {
+        MissionStore.clear();
+      } else {
+        MissionStore.loadFromDashboard(value, { kind: "legacy_set" });
+      }
+    },
+  });
+}
+
+function getCurrentMission() {
+  return window.MissionStore ? MissionStore.getMission() : state.lastResult;
+}
+
+function syncPlaybackAfterMissionChange(options = {}) {
+  const mission = getCurrentMission();
+  if (!mission) return;
+  if (typeof window.reloadPlaybackTimeline === "function") {
+    window.reloadPlaybackTimeline(mission, options);
+  } else if (typeof window.resetPlayback === "function") {
+    window.resetPlayback(mission);
+  }
+  if (options.restart && typeof window.startInspectionPlayback === "function") {
+    window.startInspectionPlayback({ preservePhase: true });
+  }
+}
 
 function getPipeline() {
   return $("pipelineSelect")?.value || "image";
@@ -89,9 +127,10 @@ function getMapMode() {
   return sel.value;
 }
 
-async function loadMapConfig() {
+async function loadMapConfig(imagePath) {
   try {
-    const res = await fetch("/api/map/config");
+    const path = imagePath || "data/test.png";
+    const res = await fetch(`/api/map/config?path=${encodeURIComponent(path)}`);
     if (!res.ok) throw new Error(res.statusText);
     state.mapConfig = await res.json();
   } catch (e) {
@@ -114,8 +153,38 @@ async function loadDatasets() {
   state.datasets = data.datasets || [];
 }
 
+function getImagePathForSource(source) {
+  return source === "image" ? "data/test_point.png" : "data/test.png";
+}
+
+function getInspectionPointSource() {
+  const ui = $("inspectionPointSourceSelect")?.value || "spacing";
+  return window.normalizeInspectionPointSource
+    ? normalizeInspectionPointSource(ui)
+    : ui;
+}
+
+function updateSpacingControlsVisibility() {
+  const imageMode = isImagePipeline() && getInspectionPointSource() === "image";
+  const storeImage = window.MissionStore?.isImageSource?.() === true;
+  const hideSpacing = imageMode || storeImage;
+
+  const spacingField = $("spacingInput")?.closest(".field");
+  const planningField = $("planningSpacingInput")?.closest(".field");
+  if (spacingField) spacingField.classList.toggle("hidden", hideSpacing);
+  if (planningField) planningField.classList.toggle("hidden", hideSpacing);
+
+  const replanHint = document.querySelector("#replanPanel .subpanel-hint");
+  if (replanHint && hideSpacing) {
+    replanHint.textContent = "图像管线 · 保留图像巡检点 · 仅重排路径";
+  } else if (replanHint) {
+    replanHint.textContent = "图像管线 · 全局重排序 · 端点冗余规避";
+  }
+}
+
 function applyPipelineUi() {
   const image = isImagePipeline();
+  const pointSource = getInspectionPointSource();
   $("pipelineBadge").textContent = image ? "图像 PNG" : "统一 JSON";
 
   const ds = $("datasetSelect");
@@ -123,18 +192,22 @@ function applyPipelineUi() {
   const sp = $("spacingInput");
   const mm = $("mapModeSelect");
   const forceBtn = $("forceRegenBtn");
+  const pointSourceSel = $("inspectionPointSourceSelect");
 
   if (image) {
-    ds.innerHTML = '<option value="data/test.png">data/test.png</option>';
+    const imagePath = getImagePathForSource(pointSource);
+    ds.innerHTML = `<option value="${imagePath}">${imagePath}</option>`;
     ds.disabled = true;
+    if (pointSourceSel) pointSourceSel.disabled = false;
     pl.innerHTML = '<option value="legacy">传统任务模式</option>';
     pl.disabled = true;
     sp.disabled = true;
-    mm.innerHTML = '<option value="image_overlay" selected>图像叠加</option>';
+    mm.innerHTML = `<option value="image_overlay" selected>图像叠加（${imagePath}）</option>`;
     mm.disabled = true;
-    $("runBtn").textContent = "生成/加载图像主线任务";
+    $("runBtn").textContent = pointSource === "image" ? "生成/加载图像巡检点任务" : "生成/加载图像主线任务";
     forceBtn.classList.remove("hidden");
   } else {
+    if (pointSourceSel) pointSourceSel.disabled = true;
     forceBtn.classList.add("hidden");
     $("dlLegacyHtml").classList.add("hidden");
     ds.disabled = false;
@@ -163,6 +236,7 @@ function applyPipelineUi() {
   updateMapModeHint();
   updateReplanPanel();
   updateReplanInputLimits();
+  updateSpacingControlsVisibility();
 }
 
 function updateReplanPanel() {
@@ -287,6 +361,11 @@ function normalizeMissionResult(result) {
   const pipeline = result?.metadata?.pipeline || getPipeline();
   const out = { ...result };
   out.metadata = { ...(result.metadata || {}), pipeline };
+  if (window.normalizeInspectionPointSource) {
+    out.metadata.inspection_point_source = normalizeInspectionPointSource(
+      out.metadata.inspection_point_source
+    );
+  }
   out.statistics = { ...(result.statistics || {}) };
   if (out.metadata.weather_mode != null) {
     out.statistics.weather_mode = out.metadata.weather_mode;
@@ -298,6 +377,19 @@ function normalizeMissionResult(result) {
         ? result.map_background || state.mapConfig
         : state.mapConfig;
     out.map_background = mapBg;
+    if (out.metadata?.clean_map_image && mapBg?.path !== out.metadata.clean_map_image) {
+      out.map_background = {
+        ...mapBg,
+        path: out.metadata.clean_map_image,
+        url: `/api/map/background?path=${encodeURIComponent(out.metadata.clean_map_image)}`,
+        layout_image: mapBg.layout_image
+          ? {
+              ...mapBg.layout_image,
+              source: `/api/map/background?path=${encodeURIComponent(out.metadata.clean_map_image)}`,
+            }
+          : null,
+      };
+    }
     const { width, height } = getImageSize(out);
     out.bounds = {
       x_range: [0, width],
@@ -426,6 +518,15 @@ function renderMeta(metadata) {
   const lines = [
     `管线: ${pipelineText}`,
     `规划器: ${plannerText}`,
+    (metadata.inspection_point_source === "image")
+      ? "巡检点来源: 图像巡检点"
+      : metadata.inspection_point_source === "spacing"
+        ? "巡检点来源: 自动采样"
+        : null,
+    metadata.image_detection_stats?.merged_points != null
+      ? `图像检测: ${metadata.image_detection_stats.merged_points} 个 / 有效吸附 ${metadata.image_detection_stats.valid_snapped_points ?? "—"} 个`
+      : null,
+    metadata.map_image ? `输入图像: ${metadata.map_image}` : null,
     metadata.planning_spacing != null ? `巡检点间距: ${metadata.planning_spacing}px` : null,
     `天气感知: ${metadata.weather_mode === "on" ? "开启" : "关闭"}`,
     metadata.weather_mode === "on" ? `天气权重: ${metadata.weather_weight ?? 1.0}` : null,
@@ -720,18 +821,158 @@ function buildExperimentOverlayTraces() {
 }
 
 function buildAdaptiveReplanTraces() {
-  const path = state.dynamicWeather.adaptivePath;
-  if (!path || path.length < 2) return [];
+  const flash = state.dynamicWeather.adaptiveFlash;
+  if (!flash?.path || flash.path.length < 2) return [];
+  const elapsed = Math.max(0, performance.now() - flash.startedAt);
+  const phase = Math.min(1, elapsed / flash.durationMs);
+  const opacity = phase < 0.65 ? 0.95 : Math.max(0, 0.95 * (1 - (phase - 0.65) / 0.35));
   return [{
-    x: path.map((p) => p[0]),
-    y: path.map((p) => p[1]),
+    x: flash.path.map((p) => p[0]),
+    y: flash.path.map((p) => p[1]),
     mode: "lines",
     name: "自适应重规划路径",
-    line: { color: "rgba(34, 197, 94, 0.95)", width: 4, dash: "dashdot" },
-    hovertemplate: "动态天气触发的新连接路径<extra></extra>",
-    showlegend: true,
+    line: {
+      color: `rgba(74, 222, 128, ${opacity.toFixed(3)})`,
+      width: 5 + (1 - phase) * 2,
+      dash: "solid",
+    },
+    hovertemplate: "临时绕行路径<extra></extra>",
+    showlegend: false,
     legendgroup: "adaptive",
   }];
+}
+
+function polylineLength(points) {
+  if (!points || points.length < 2) return 0;
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    total += Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]);
+  }
+  return total;
+}
+
+function applyAdaptivePathToMission(adaptivePath) {
+  const uav = getPlaybackUavPoint();
+  if (window.MissionStore) {
+    return MissionStore.applyAdaptiveConnectReroute(adaptivePath, { uav });
+  }
+  const mission = getCurrentMission();
+  if (!mission?.segments?.length || !adaptivePath?.length) return false;
+  const segments = mission.segments.map((seg) => ({ ...seg, geometry_2d: [...(seg.geometry_2d || [])] }));
+  let targetIdx = -1;
+  let bestDist = Infinity;
+  segments.forEach((seg, idx) => {
+    if (seg.type !== "connect") return;
+    const geom = seg.geometry_2d || [];
+    if (geom.length < 2) return;
+    const anchor = uav || geom[0];
+    const d = Math.hypot(geom[0][0] - anchor[0], geom[0][1] - anchor[1]);
+    if (d < bestDist) {
+      bestDist = d;
+      targetIdx = idx;
+    }
+  });
+  if (targetIdx < 0) return false;
+  const newGeom = adaptivePath.map((p) => [Number(p[0]), Number(p[1])]);
+  segments[targetIdx] = {
+    ...segments[targetIdx],
+    geometry_2d: newGeom,
+    length: Math.round(polylineLength(newGeom)),
+    role: "adaptive_reroute",
+  };
+  state.lastResult = { ...mission, segments };
+  return true;
+}
+
+function clearAdaptiveFlashTimer() {
+  if (state.dynamicWeather.adaptiveFlashTimer) {
+    clearInterval(state.dynamicWeather.adaptiveFlashTimer);
+    state.dynamicWeather.adaptiveFlashTimer = null;
+  }
+}
+
+function finishAdaptiveFlash() {
+  const flash = state.dynamicWeather.adaptiveFlash;
+  clearAdaptiveFlashTimer();
+  state.dynamicWeather.adaptiveFlash = null;
+  state.dynamicWeather.adaptivePath = null;
+  if (window.LayerManager) {
+    LayerManager.clearLayer(window.LayerIds?.T1_ADAPTIVE_FLASH);
+  }
+  if (flash?.path?.length) {
+    applyAdaptivePathToMission(flash.path);
+    syncPlaybackAfterMissionChange({ restart: AppPhaseManager?.getPhase?.() === AppPhase?.PLAYING });
+  }
+  if (AppPhaseManager) AppPhaseManager.endAdaptiveWarning();
+  updateAdaptivePlotTraces();
+  refreshMapView();
+}
+
+function startAdaptiveFlash(path) {
+  if (!path || path.length < 2) return;
+  clearAdaptiveFlashTimer();
+  state.dynamicWeather.adaptivePath = null;
+  state.dynamicWeather.adaptiveFlash = {
+    path,
+    startedAt: performance.now(),
+    durationMs: 1800,
+  };
+  setAdaptiveStatus("路径更新完成", "reroute");
+  const traces = buildAdaptiveReplanTraces();
+  if (window.LayerManager && window.LayerIds) {
+    LayerManager.setLayer(LayerIds.T1_ADAPTIVE_FLASH, traces, {
+      durationMs: state.dynamicWeather.adaptiveFlash.durationMs,
+      onExpire: () => finishAdaptiveFlash(),
+    });
+  }
+  updateAdaptivePlotTraces();
+  state.dynamicWeather.adaptiveFlashTimer = window.setInterval(() => {
+    const flash = state.dynamicWeather.adaptiveFlash;
+    if (!flash) {
+      clearAdaptiveFlashTimer();
+      return;
+    }
+    if (performance.now() - flash.startedAt >= flash.durationMs) {
+      finishAdaptiveFlash();
+      return;
+    }
+    if (window.LayerManager && window.LayerIds) {
+      LayerManager.setLayer(LayerIds.T1_ADAPTIVE_FLASH, buildAdaptiveReplanTraces());
+    }
+    updateAdaptivePlotTraces();
+  }, 60);
+}
+
+function setPredictiveWarningHud(text, durationMs = 6000) {
+  const ids = ["predictiveWarningHud", "predictiveWarningHudFs"];
+  if (!text) {
+    ids.forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      el.textContent = "";
+      el.classList.add("hidden");
+    });
+    state.dynamicWeather.predictiveHud = null;
+    return;
+  }
+  ids.forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = text;
+    el.classList.remove("hidden");
+  });
+  state.dynamicWeather.predictiveHud = {
+    text,
+    activeUntil: performance.now() + durationMs,
+  };
+}
+
+function tickPredictiveWarningHud() {
+  const hud = state.dynamicWeather.predictiveHud;
+  if (!hud) return;
+  if (performance.now() >= hud.activeUntil) {
+    setPredictiveWarningHud(null);
+  }
 }
 
 function cloneWeatherZones(zones) {
@@ -751,6 +992,10 @@ function resetDynamicWeather(result) {
   state.dynamicWeather.replanTriggered = false;
   state.dynamicWeather.movementLogged = false;
   state.dynamicWeather.adaptivePath = null;
+  state.dynamicWeather.adaptiveFlash = null;
+  clearAdaptiveFlashTimer();
+  state.dynamicWeather.predictiveHud = null;
+  setPredictiveWarningHud(null);
   state.dynamicWeather.predictiveReplanCount = 0;
   state.dynamicWeather.predictedRisk = 0;
   state.dynamicWeather.predictedAffectedSegments = 0;
@@ -1030,10 +1275,14 @@ function adaptiveStatusText(status) {
   return status || "正常巡航";
 }
 
-function setAdaptiveStatus(status) {
+function setAdaptiveStatus(status, tone = "normal") {
   state.dynamicWeather.status = adaptiveStatusText(status);
   const el = $("adaptiveStatus");
-  if (el) el.textContent = state.dynamicWeather.status;
+  if (!el) return;
+  el.textContent = state.dynamicWeather.status;
+  el.classList.remove("is-warning", "is-reroute");
+  if (tone === "warning") el.classList.add("is-warning");
+  if (tone === "reroute") el.classList.add("is-reroute");
 }
 
 function pushAdaptiveEvent(text) {
@@ -1062,14 +1311,17 @@ function canTriggerAdaptiveReplan() {
 }
 
 function triggerAdaptiveReplan(riskInfo, { predictive = false } = {}) {
+  if (AppPhaseManager && !AppPhaseManager.canRunAdaptive()) return false;
   const zone = riskInfo.hitZone;
   const uav = riskInfo.uav;
   const hitPoint = riskInfo.hitPoint;
   if (!zone || !uav || !hitPoint) return false;
 
+  if (AppPhaseManager) AppPhaseManager.beginAdaptiveWarning();
+
   const label = riskInfo.zoneLabel || weatherColor(zone.type, zone.severity).label;
   if (predictive) {
-    setAdaptiveStatus("预测风险预警");
+    setAdaptiveStatus("预测风险预警", "warning");
     pushAdaptiveEvent("提前触发自适应重规划");
     state.dynamicWeather.predictiveReplanCount += 1;
   } else {
@@ -1078,17 +1330,18 @@ function triggerAdaptiveReplan(riskInfo, { predictive = false } = {}) {
     pushAdaptiveEvent("触发自动重规划");
   }
 
-  setAdaptiveStatus("自动重规划");
-  state.dynamicWeather.adaptivePath = buildAdaptivePathAroundZone(uav, hitPoint, zone);
+  setAdaptiveStatus("自动重规划", "reroute");
+  const path = buildAdaptivePathAroundZone(uav, hitPoint, zone);
   state.dynamicWeather.replanTriggered = true;
   state.dynamicWeather.lastReplanAt = performance.now();
+  setPredictiveWarningHud(null);
   pushAdaptiveEvent("新路径已生成");
-  setAdaptiveStatus("路径更新完成");
-  updateAdaptivePlotTraces();
+  startAdaptiveFlash(path);
   return true;
 }
 
 function maybeTriggerAdaptiveReplan() {
+  if (AppPhaseManager && !AppPhaseManager.canRunAdaptive()) return;
   const visual = typeof window.getPlaybackVisualState === "function" ? window.getPlaybackVisualState() : null;
   if (!visual || visual.status !== "playing") return;
 
@@ -1097,13 +1350,14 @@ function maybeTriggerAdaptiveReplan() {
   updatePredictiveMetrics(prediction);
 
   if (prediction?.predicted_risk > threshold) {
-    setAdaptiveStatus("预测风险分析");
+    const label = prediction.zoneLabel || "风险区";
+    const eta = Math.max(1, Math.round(prediction.time_to_risk ?? prediction.prediction_window ?? 10));
+    setPredictiveWarningHud(`⚠ 预计 ${eta}s 后进入${label}`);
+    setAdaptiveStatus("预测风险分析", "warning");
     const now = performance.now();
     const warnCooldownMs = 5000;
     if ((now - (state.dynamicWeather.lastWarningAt || 0)) >= warnCooldownMs) {
-      const label = prediction.zoneLabel || "天气区";
       pushAdaptiveEvent(`预测到前方${label}覆盖航迹`);
-      const eta = Math.max(1, Math.round(prediction.time_to_risk ?? prediction.prediction_window ?? 10));
       pushAdaptiveEvent(`预计 ${eta}s 后进入风险区`);
       state.dynamicWeather.lastWarningAt = now;
     }
@@ -1116,10 +1370,10 @@ function maybeTriggerAdaptiveReplan() {
       triggerAdaptiveReplan(prediction, { predictive: true });
       return;
     }
-    setAdaptiveStatus("预测风险预警");
     return;
   }
 
+  setPredictiveWarningHud(null);
   setAdaptiveStatus("风险分析");
   const risk = analyzeFutureWeatherRisk();
   if (!risk?.hitZone) {
@@ -1138,12 +1392,16 @@ function maybeTriggerAdaptiveReplan() {
 function startDynamicWeatherLoop() {
   stopDynamicWeatherLoop();
   state.dynamicWeather.timer = window.setInterval(() => {
-    if (!state.lastResult || !state.dynamicWeather.enabled) return;
+    if (!getCurrentMission() || !state.dynamicWeather.enabled) return;
+    if (AppPhaseManager && ![AppPhase.PLAYING, AppPhase.ADAPTIVE_WARNING, AppPhase.MISSION_READY].includes(AppPhaseManager.getPhase())) {
+      return;
+    }
     const now = performance.now();
     const dt = Math.min(2.0, Math.max(0.2, (now - state.dynamicWeather.lastTick) / 1000));
     state.dynamicWeather.lastTick = now;
     updateDynamicWeatherZones(dt);
     maybeTriggerAdaptiveReplan();
+    tickPredictiveWarningHud();
     updateWeatherPlotTraces();
   }, 900);
 }
@@ -1153,6 +1411,7 @@ function stopDynamicWeatherLoop() {
     clearInterval(state.dynamicWeather.timer);
     state.dynamicWeather.timer = null;
   }
+  clearAdaptiveFlashTimer();
 }
 
 function replaceTraceSet(plotId, predicate, traces) {
@@ -1163,22 +1422,55 @@ function replaceTraceSet(plotId, predicate, traces) {
 }
 
 function updateWeatherPlotTraces() {
-  const traces = buildWeatherZoneTraces(state.lastResult);
+  const traces = buildWeatherZoneTraces(getCurrentMission());
+  if (window.LayerManager && window.LayerIds) {
+    LayerManager.setLayer(LayerIds.L3_WEATHER, traces);
+  }
   ["mapPlot", "mapPlotFs"].forEach((plotId) => {
-    replaceTraceSet(plotId, (t) => String(t.name || "").startsWith("天气区 ") || t.name === "天气标签", traces);
+    if (window.LayerManager && window.LayerIds) {
+      LayerManager.replaceLayerTraces(plotId, LayerIds.L3_WEATHER, traces, state);
+    } else {
+      replaceTraceSet(plotId, (t) => String(t.name || "").startsWith("天气区 ") || t.name === "天气标签", traces);
+    }
   });
 }
 
 function updateAdaptivePlotTraces() {
   const traces = buildAdaptiveReplanTraces();
+  if (window.LayerManager && window.LayerIds) {
+    LayerManager.setLayer(LayerIds.T1_ADAPTIVE_FLASH, traces, {
+      durationMs: state.dynamicWeather.adaptiveFlash?.durationMs || 1800,
+    });
+  }
   ["mapPlot", "mapPlotFs"].forEach((plotId) => {
-    replaceTraceSet(plotId, (t) => t.name === "自适应重规划路径", traces);
+    if (window.LayerManager && window.LayerIds) {
+      LayerManager.replaceLayerTraces(plotId, LayerIds.T1_ADAPTIVE_FLASH, traces, state);
+    } else {
+      replaceTraceSet(plotId, (t) => t.name === "自适应重规划路径", traces);
+    }
   });
 }
 
-/** 统一 traces：原始 mission / Unified / Replan 共用 */
+function updateExperimentPlotTraces() {
+  const traces = buildExperimentOverlayTraces();
+  if (window.LayerManager && window.LayerIds) {
+    LayerManager.setLayer(LayerIds.T3_AB_EXPERIMENT, traces);
+  }
+  ["mapPlot", "mapPlotFs"].forEach((plotId) => {
+    if (window.LayerManager && window.LayerIds) {
+      LayerManager.replaceLayerTraces(plotId, LayerIds.T3_AB_EXPERIMENT, traces, state);
+    }
+  });
+}
+
+/** @deprecated dead stub — see docs/DEAD_CODE_REGISTRY.md */
+function buildImageInspectionOverlayTraces(_result) {
+  return [];
+}
+
 function buildMissionTraces(result) {
-  const segments = result.segments || [];
+  const mission = getCurrentMission() || result;
+  const segments = mission?.segments || [];
   const inspectX = [],
     inspectY = [],
     inspectCustom = [];
@@ -1211,9 +1503,15 @@ function buildMissionTraces(result) {
   });
 
   const traces = [];
-  traces.push(...buildWeatherZoneTraces(result));
-  traces.push(...buildExperimentOverlayTraces());
-  traces.push(...buildAdaptiveReplanTraces());
+  if (state.showWeatherLayer) {
+    traces.push(...(window.LayerManager?.getLayer(window.LayerIds?.L3_WEATHER) || buildWeatherZoneTraces(mission)));
+  }
+  if (state.experiment.active && state.experiment.overlay) {
+    traces.push(...(window.LayerManager?.getLayer(window.LayerIds?.T3_AB_EXPERIMENT) || buildExperimentOverlayTraces()));
+  }
+  if (state.dynamicWeather.adaptiveFlash) {
+    traces.push(...(window.LayerManager?.getLayer(window.LayerIds?.T1_ADAPTIVE_FLASH) || buildAdaptiveReplanTraces()));
+  }
 
   if (state.showInspect && inspectX.length) {
     traces.push({
@@ -1244,7 +1542,7 @@ function buildMissionTraces(result) {
   }
 
   const visiblePts = selectInspectionPoints(
-    result.inspection_points || [],
+    mission.inspection_points || [],
     state.pointMode
   );
   if (visiblePts.length) {
@@ -1254,7 +1552,7 @@ function buildMissionTraces(result) {
       : null;
     const visited = playbackVisual?.visitedIds || new Set();
     const currentId = playbackVisual?.currentPointId || null;
-    const totalPoints = (result.inspection_points || []).length || visiblePts.length;
+    const totalPoints = (mission.inspection_points || []).length || visiblePts.length;
     const unvisited = [];
     const visitedPts = [];
     let currentPt = null;
@@ -1284,12 +1582,26 @@ function buildMissionTraces(result) {
         x: unvisited.map((v) => v.p.x),
         y: unvisited.map((v) => v.p.y),
         mode: "markers",
+        name: "巡检点光晕",
+        marker: {
+          size: isAll ? 12 : 16,
+          color: "rgba(34, 211, 238, 0.18)",
+          line: { width: 0, color: "rgba(0,0,0,0)" },
+        },
+        hoverinfo: "skip",
+        showlegend: false,
+        legendgroup: "points",
+      });
+      traces.push({
+        x: unvisited.map((v) => v.p.x),
+        y: unvisited.map((v) => v.p.y),
+        mode: "markers",
         name: "巡检点",
         marker: {
-          size: isAll ? 5 : 6,
-          color: "#38bdf8",
-          opacity: isAll ? 0.5 : 0.82,
-          line: { width: isAll ? 0.8 : 1.2, color: "#dbeafe" },
+          size: isAll ? 6 : 8,
+          color: "#22d3ee",
+          opacity: isAll ? 0.72 : 0.95,
+          line: { width: isAll ? 1.4 : 2, color: "#ffffff" },
         },
         text: unvisited.map((v) => v.cd[3]),
         customdata: unvisited.map((v) => v.cd),
@@ -1310,10 +1622,10 @@ function buildMissionTraces(result) {
         mode: "markers",
         name: "已巡检点",
         marker: {
-          size: isAll ? 5 : 7,
+          size: isAll ? 6 : 8,
           color: "#22c55e",
-          opacity: 0.62,
-          line: { width: 1, color: "#14532d" },
+          opacity: 0.88,
+          line: { width: 2, color: "#ffffff" },
         },
         text: visitedPts.map((v) => v.cd[3]),
         customdata: visitedPts.map((v) => v.cd),
@@ -1332,10 +1644,10 @@ function buildMissionTraces(result) {
         x: [currentPt.p.x],
         y: [currentPt.p.y],
         mode: "markers",
-        name: "当前巡检点",
+        name: "当前巡检点光晕",
         marker: {
-          size: 22,
-          color: "rgba(250, 204, 21, 0.26)",
+          size: 28,
+          color: "rgba(250, 204, 21, 0.24)",
           line: { width: 0, color: "rgba(0,0,0,0)" },
         },
         hoverinfo: "skip",
@@ -1348,10 +1660,10 @@ function buildMissionTraces(result) {
         mode: "markers",
         name: "当前巡检点",
         marker: {
-          size: 12,
+          size: 13,
           color: "#facc15",
           opacity: 1,
-          line: { width: 2.2, color: "#ffffff" },
+          line: { width: 2.4, color: "#ffffff" },
         },
         text: [currentPt.cd[3]],
         customdata: [currentPt.cd],
@@ -1565,10 +1877,19 @@ function buildPlotFromMission(result, options = {}) {
   };
 }
 
-function onMissionLoaded(result) {
-  resetDynamicWeather(result);
+function onMissionLoaded(result, options = {}) {
+  const normalized = normalizeMissionResult(result);
+  if (window.MissionStore) {
+    if (!options.skipStoreLoad) {
+      MissionStore.loadFromDashboard(normalized, { kind: options.kind || "initial" });
+    }
+  } else {
+    state.lastResult = normalized;
+  }
+  resetDynamicWeather(getCurrentMission() || normalized);
+  updateSpacingControlsVisibility();
   if (typeof window.onMissionLoadedForPlayback === "function") {
-    window.onMissionLoadedForPlayback(result);
+    window.onMissionLoadedForPlayback(getCurrentMission() || normalized);
   }
 }
 
@@ -1594,8 +1915,8 @@ function bindMapClick(plotId) {
       state.pickPhase = null;
     }
     updatePickHint();
-    if (state.lastResult) {
-      const markers = { ...(state.lastResult.markers || {}) };
+    if (getCurrentMission()) {
+      const markers = { ...(getCurrentMission().markers || {}) };
       if ($("replanStartX").value !== "" && $("replanStartY").value !== "") {
         markers.start = {
           x: parseFloat($("replanStartX").value),
@@ -1608,7 +1929,11 @@ function bindMapClick(plotId) {
           y: parseFloat($("replanEndY").value),
         };
       }
-      state.lastResult = { ...state.lastResult, markers };
+      if (window.MissionStore) {
+        MissionStore.updateMarkers(markers);
+      } else {
+        state.lastResult = { ...getCurrentMission(), markers };
+      }
       refreshMapView();
     }
   });
@@ -1675,6 +2000,29 @@ function closeFullscreen() {
   });
 }
 
+function buildReplanPayload(check) {
+  const base = {
+    pipeline: "image",
+    start: check.start,
+    end: check.end,
+    planning_spacing: parseFloat($("planningSpacingInput")?.value) || 70,
+    weather_aware: $("weatherAwareToggle")?.checked === true,
+    weather_weight: Math.max(0, parseFloat($("weatherWeightInput")?.value || "1") || 1),
+    dataset: $("datasetSelect")?.value,
+    spacing: parseFloat($("spacingInput")?.value) || 50,
+  };
+  if (window.MissionStore) {
+    return MissionStore.buildReplanPayload(base);
+  }
+  const meta = getCurrentMission()?.metadata || {};
+  return {
+    ...base,
+    inspection_point_source: normalizeInspectionPointSource?.(getInspectionPointSource()) || getInspectionPointSource(),
+    image_path: meta.map_image || getImagePathForSource(getInspectionPointSource()),
+    inspection_points: getCurrentMission()?.inspection_points || [],
+  };
+}
+
 async function runReplan() {
   if (!isImagePipeline()) {
     setStatus("重规划仅支持 Image Pipeline", "err");
@@ -1687,23 +2035,18 @@ async function runReplan() {
     return;
   }
 
-  const planningSpacing = parseFloat($("planningSpacingInput")?.value) || 70;
+  const wasPlaying = typeof window.getPlaybackVisualState === "function"
+    && window.getPlaybackVisualState()?.status === "playing";
 
   $("runReplanBtn").disabled = true;
   setStatus("起终点重规划中…", "running");
+  if (AppPhaseManager) AppPhaseManager.beginReplanning();
 
   try {
     const res = await fetch("/api/replan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        pipeline: "image",
-        start: check.start,
-        end: check.end,
-        planning_spacing: planningSpacing,
-        weather_aware: $("weatherAwareToggle")?.checked === true,
-        weather_weight: Math.max(0, parseFloat($("weatherWeightInput")?.value || "1") || 1),
-      }),
+      body: JSON.stringify(buildReplanPayload(check)),
     });
     const data = await res.json();
     if (!res.ok || !data.ok) {
@@ -1711,25 +2054,37 @@ async function runReplan() {
     }
 
     const dashboard = normalizeMissionResult(data.dashboard || data);
-    state.lastResult = dashboard;
+    if (window.MissionStore) {
+      MissionStore.applyServerReplan(dashboard, {
+        mission_json_path: dashboard.output_files?.mission_snapshot || "latest_replan_mission.json",
+      });
+    } else {
+      state.lastResult = dashboard;
+    }
     state.experiment.active = false;
+    if (window.LayerManager) LayerManager.clearLayer(window.LayerIds?.T3_AB_EXPERIMENT);
     renderExperimentResult();
-    renderStats(dashboard.statistics);
-    renderVisitOrder(dashboard.visit_order);
-    renderMission(dashboard);
-    onMissionLoaded(dashboard);
-    renderMeta(dashboard.metadata || {});
+    const mission = getCurrentMission();
+    renderStats(mission?.statistics);
+    renderVisitOrder(mission?.visit_order);
+    renderMission(mission);
+    renderMeta(mission?.metadata || {});
     updateDownloadLinks(dashboard.output_files || {}, "image");
+    updateSpacingControlsVisibility();
+    syncPlaybackAfterMissionChange({ restart: wasPlaying });
 
-    const connected = dashboard.metadata?.end_connected;
+    const connected = mission?.metadata?.end_connected ?? dashboard.metadata?.end_connected;
     setStatus(
-      `重规划完成 · ${dashboard.statistics?.num_segments ?? 0} 段` +
+      `重规划完成 · ${mission?.statistics?.num_segments ?? 0} 段` +
         (connected ? " · 已连接终点" : " · 终点未连接"),
       connected ? "ok" : "err"
     );
   } catch (err) {
     setStatus(`重规划失败: ${err.message}`, "err");
     console.error(err);
+    if (AppPhaseManager && MissionStore.getMission()) {
+      AppPhaseManager.setPhase(AppPhase.MISSION_READY, { reason: "replan_failed" });
+    }
   } finally {
     $("runReplanBtn").disabled = false;
   }
@@ -1749,6 +2104,8 @@ function buildCurrentPlanRequest() {
   if (pipeline === "image") {
     body.planner = "legacy";
     body.map_mode = "image_overlay";
+    body.inspection_point_source = getInspectionPointSource();
+    body.image_path = getImagePathForSource(body.inspection_point_source);
   } else {
     body.input_file = $("datasetSelect").value;
     body.planner = $("plannerSelect").value;
@@ -1768,10 +2125,7 @@ async function executeExperimentRun(baseBody, weatherAware) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          pipeline: "image",
-          start: check.start,
-          end: check.end,
-          planning_spacing: planningSpacing,
+          ...buildReplanPayload(check),
           weather_aware: weatherAware,
           weather_weight: baseBody.weather_weight,
         }),
@@ -1814,10 +2168,16 @@ async function runWeatherExperiment() {
     state.experiment.reasoning = reasoning;
     state.experiment.overlay = $("experimentOverlayToggle")?.checked !== false;
 
-    state.lastResult = runB;
-    renderStats(runB.statistics);
-    renderVisitOrder(runB.visit_order);
-    renderMeta(runB.metadata || {});
+    if (window.MissionStore) {
+      MissionStore.loadFromDashboard(runB, { kind: "experiment" });
+    } else {
+      state.lastResult = runB;
+    }
+    updateExperimentPlotTraces();
+    const mission = getCurrentMission();
+    renderStats(mission?.statistics);
+    renderVisitOrder(mission?.visit_order);
+    renderMeta(mission?.metadata || {});
     renderExperimentResult();
     refreshMapView();
 
@@ -1842,6 +2202,7 @@ async function runPlanning() {
     pipeline === "image" ? "正在生成/加载图像主线…" : "统一管线规划中…",
     "running"
   );
+  if (AppPhaseManager) AppPhaseManager.beginPlanning();
 
   try {
     const res = await fetch("/api/plan", {
@@ -1856,8 +2217,10 @@ async function runPlanning() {
       throw new Error(detail || res.statusText);
     }
 
-    state.lastResult = normalizeMissionResult(data);
+    const normalized = normalizeMissionResult(data);
+    onMissionLoaded(normalized, { kind: "plan" });
     state.experiment.active = false;
+    if (window.LayerManager) LayerManager.clearAllTransient();
     renderExperimentResult();
     if (pipeline === "image") {
       state.imageMissionAvailable = true;
@@ -1866,11 +2229,11 @@ async function runPlanning() {
       updateReplanInputLimits();
     }
 
-    renderStats(state.lastResult.statistics);
-    renderVisitOrder(state.lastResult.visit_order);
-    renderMission(state.lastResult);
-    onMissionLoaded(state.lastResult);
-    renderMeta(data.metadata || {});
+    const mission = getCurrentMission();
+    renderStats(mission?.statistics);
+    renderVisitOrder(mission?.visit_order);
+    renderMission(mission);
+    renderMeta(mission?.metadata || data.metadata || {});
     updateDownloadLinks(data.output_files || {}, pipeline);
 
     const gen = data.metadata?.image_generation;
@@ -1898,7 +2261,11 @@ async function forceRegenerateImage() {
     const res = await fetch("/api/image-mission/generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ force: true }),
+      body: JSON.stringify({
+        force: true,
+        inspection_point_source: getInspectionPointSource(),
+        image_path: getImagePathForSource(getInspectionPointSource()),
+      }),
     });
     const data = await res.json();
     if (!res.ok || !data.ok) {
@@ -1931,7 +2298,11 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   $("pipelineSelect").addEventListener("change", () => {
     applyPipelineUi();
-    state.lastResult = null;
+    if (window.MissionStore) {
+      MissionStore.clear();
+    } else {
+      state.lastResult = null;
+    }
     state.experiment.active = false;
     state.experiment.runA = null;
     state.experiment.runB = null;
@@ -1941,6 +2312,14 @@ document.addEventListener("DOMContentLoaded", async () => {
     state.plotReady.mapPlot = false;
     if (typeof window.resetInspectionPlayback === "function") window.resetInspectionPlayback();
     setStatus("就绪", "");
+  });
+
+  $("inspectionPointSourceSelect")?.addEventListener("change", async () => {
+    applyPipelineUi();
+    updateSpacingControlsVisibility();
+    const imagePath = getImagePathForSource(getInspectionPointSource());
+    await loadMapConfig(imagePath);
+    if (getCurrentMission()) refreshMapView();
   });
 
   $("runBtn").addEventListener("click", runPlanning);

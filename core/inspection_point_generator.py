@@ -16,7 +16,7 @@
 import numpy as np
 from PIL import Image, ImageDraw
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Any
 import os
 
 
@@ -525,6 +525,89 @@ def convert_line_points_to_legacy_format(
     all_legacy.sort(key=lambda d: d['index'])
 
     return all_legacy
+
+
+def build_image_detected_inspection_points(
+    detections: List[Dict[str, Any]],
+    topo_graph,
+    *,
+    terrain: Optional[np.ndarray] = None,
+    flight_height: float = 25.0,
+    max_snap_distance: float = 30.0,
+) -> Tuple[List[LineInspectionPoint], Dict[str, List[LineInspectionPoint]], List[Dict[str, Any]]]:
+    """Convert detected image points into snapped LineInspectionPoint objects."""
+    from core.topo_task import snap_point_to_topo_graph
+
+    points_by_line: Dict[str, List[LineInspectionPoint]] = {}
+    overlay: List[Dict[str, Any]] = []
+    all_points: List[LineInspectionPoint] = []
+    invalid_count = 0
+
+    for det in detections or []:
+        raw = det.get("coord") or det.get("pixel_position")
+        if not raw or len(raw) < 2:
+            continue
+        raw_xy = (float(raw[0]), float(raw[1]))
+        snap = snap_point_to_topo_graph(raw_xy, topo_graph, max_distance=max_snap_distance)
+        entry = {
+            "id": det.get("id"),
+            "raw_coord": [round(raw_xy[0], 2), round(raw_xy[1], 2)],
+            "valid": snap is not None,
+            "confidence": det.get("confidence"),
+            "source": det.get("source"),
+        }
+        if snap:
+            snapped = snap["snapped_coord"]
+            pos_3d = _map_to_3d(snapped, terrain, flight_height)
+            point = LineInspectionPoint(
+                id=str(det.get("id") or f"IP_{len(all_points) + 1:04d}"),
+                line_id=str(snap["line_id"]),
+                point_type="image_detected",
+                pixel_position=(float(snapped[0]), float(snapped[1])),
+                position_3d=pos_3d,
+                line_index=int(snap.get("segment_index", 0)),
+                priority="high",
+                status="uninspected",
+                source_reason="image_black_dot",
+                detection_result={
+                    "raw_coord": [round(raw_xy[0], 2), round(raw_xy[1], 2)],
+                    "edge_id": snap["edge_id"],
+                    "distance_along_edge": round(float(snap["distance_along_edge"]), 2),
+                    "snap_distance": round(float(snap["distance"]), 2),
+                    "snapped_coord": [round(float(snapped[0]), 2), round(float(snapped[1]), 2)],
+                    "confidence": det.get("confidence"),
+                    "source": det.get("source"),
+                },
+            )
+            points_by_line.setdefault(point.line_id, []).append(point)
+            all_points.append(point)
+            entry.update(
+                {
+                    "edge_id": snap["edge_id"],
+                    "snapped_coord": [round(float(snapped[0]), 2), round(float(snapped[1]), 2)],
+                    "distance_along_edge": round(float(snap["distance_along_edge"]), 2),
+                    "snap_distance": round(float(snap["distance"]), 2),
+                }
+            )
+        else:
+            invalid_count += 1
+            entry["snap_distance"] = None
+        overlay.append(entry)
+
+    for line_id in points_by_line:
+        points_by_line[line_id].sort(
+            key=lambda p: float((p.detection_result or {}).get("distance_along_edge", p.line_index))
+        )
+
+    print("[巡检点检测] 统计:")
+    print(f"  - merged inspection points: {len(detections)}")
+    print(f"  - valid snapped points: {len(all_points)}")
+    print(f"  - invalid points: {invalid_count}")
+    print(
+        f"[图像巡检点] 检测 {len(detections)} 个，有效吸附 {len(all_points)} 个，"
+        f"无效 {invalid_count} 个 (snap<={max_snap_distance}px)"
+    )
+    return all_points, points_by_line, overlay
 
 
 def merge_line_points_to_single_path(

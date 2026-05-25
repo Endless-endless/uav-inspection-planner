@@ -69,6 +69,19 @@
     phaseTimers: [],
   };
 
+  function getMissionForPlayback(fallback) {
+    if (window.MissionStore?.getMission) {
+      return MissionStore.getMission() || fallback || null;
+    }
+    return window.state?.lastResult || fallback || null;
+  }
+
+  function notifyPlaybackPhase(status) {
+    if (window.AppPhaseManager?.setPlaybackStatus) {
+      AppPhaseManager.setPlaybackStatus(status);
+    }
+  }
+
   function dist(a, b) {
     return Math.hypot(a.x - b.x, a.y - b.y);
   }
@@ -988,6 +1001,7 @@
 
     if (PLAYBACK.index >= PLAYBACK.timeline.length) {
       PLAYBACK.status = "finished";
+      notifyPlaybackPhase("finished");
       stopTimer();
       stopStreamLoop();
       PLAYBACK.streamFrozen = true;
@@ -1086,14 +1100,24 @@
 
     setPlaybackUi();
     updateAllPlotPlayback();
+    notifyPlaybackPhase("idle");
   };
 
   window.onMissionLoadedForPlayback = function (result) {
-    window.resetPlayback(result);
+    window.resetPlayback(result || getMissionForPlayback());
   };
 
-  window.startInspectionPlayback = function () {
-    const result = window.state?.lastResult;
+  window.reloadPlaybackTimeline = function (result, options = {}) {
+    const mission = result || getMissionForPlayback();
+    const wasPlaying = PLAYBACK.status === "playing";
+    window.resetPlayback(mission);
+    if (options.restart && wasPlaying) {
+      window.startInspectionPlayback({ autoStart: true });
+    }
+  };
+
+  window.startInspectionPlayback = function (options = {}) {
+    const result = getMissionForPlayback();
     if (!result) {
       alert("请先生成/加载任务");
       return;
@@ -1115,6 +1139,7 @@
     PLAYBACK.currentPoint = null;
     PLAYBACK.currentPointId = null;
     PLAYBACK.status = "playing";
+    notifyPlaybackPhase("playing");
     PLAYBACK.speed = getSpeed();
     PLAYBACK.startTimestamp = Date.now();
     PLAYBACK.streamFrozen = false;
@@ -1142,6 +1167,7 @@
     stopStreamLoop();
     clearPhaseTimers();
     PLAYBACK.status = "paused";
+    notifyPlaybackPhase("paused");
     setMissionState("PAUSED");
     updateTelemetryFromPlayback("PAUSED");
     pushEvent("任务已暂停");
@@ -1151,6 +1177,7 @@
   window.resumeInspectionPlayback = function () {
     if (PLAYBACK.status !== "paused") return;
     PLAYBACK.status = "playing";
+    notifyPlaybackPhase("playing");
     PLAYBACK.speed = getSpeed();
     setMissionState("CRUISING");
     updateTelemetryFromPlayback("CRUISING");
@@ -1161,7 +1188,7 @@
   };
 
   window.resetInspectionPlayback = function () {
-    window.resetPlayback(window.state?.lastResult || null);
+    window.resetPlayback(getMissionForPlayback());
   };
 
   document.addEventListener("DOMContentLoaded", () => {

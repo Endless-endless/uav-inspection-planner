@@ -41,6 +41,9 @@ from planner.mission_result_builder import (
     build_dashboard_from_mission_json,
     build_dashboard_payload,
     build_image_pipeline_dashboard,
+    build_mission_context,
+    is_image_inspection_source,
+    normalize_inspection_point_source,
     save_json,
 )
 from planner.replan_start_end import (
@@ -66,9 +69,12 @@ LATEST_DIR = ROOT / "result" / "latest"
 LATEST_MISSION_PATH = LATEST_DIR / "mission_output.json"
 LATEST_HTML_PATH = LATEST_DIR / "main_view_interactive.html"
 DEFAULT_MAP_PATH = "data/test.png"
+DEFAULT_POINT_MAP_PATH = "data/test_point.png"
+InspectionPointSource = Literal["spacing", "image"]
 DEMO_VISUALIZATION_SCRIPT = ROOT / "demo" / "demo_visualization_main.py"
 _image_gen_lock = threading.Lock()
 _image_generating = False
+_current_mission_context: Dict[str, Any] = {}
 
 PipelineName = Literal["image", "unified"]
 PlannerName = Literal["baseline", "optimized", "dijkstra", "legacy"]
@@ -100,10 +106,14 @@ class PlanRequest(BaseModel):
     map_mode: MapModeName = "topology_only"
     weather_aware: bool = False
     weather_weight: float = Field(1.0, ge=0.0, le=5.0)
+    inspection_point_source: InspectionPointSource = "spacing"
+    image_path: str = DEFAULT_MAP_PATH
 
 
 class ImageGenerateRequest(BaseModel):
     force: bool = False
+    inspection_point_source: InspectionPointSource = "spacing"
+    image_path: str = DEFAULT_MAP_PATH
 
 
 class ReplanRequest(BaseModel):
@@ -113,6 +123,12 @@ class ReplanRequest(BaseModel):
     planning_spacing: float = Field(70.0, ge=20.0, le=300.0)
     weather_aware: bool = False
     weather_weight: float = Field(1.0, ge=0.0, le=5.0)
+    inspection_point_source: Optional[str] = None
+    image_path: Optional[str] = None
+    dataset: Optional[str] = None
+    spacing: Optional[float] = None
+    snap_threshold: Optional[float] = None
+    inspection_points: Optional[List[Dict[str, Any]]] = None
 
 
 def _resolve_input_path(input_file: str) -> Path:
@@ -172,12 +188,94 @@ def _attach_weather_dashboard_fields(
     dashboard["weather_zones"] = zones
 
 
-def _run_image_demo_main() -> None:
+def _resolve_image_path(image_path: str) -> str:
+    rel = str(image_path or DEFAULT_MAP_PATH).replace("\\", "/")
+    path = resolve_map_path(ROOT, rel)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Map image not found: {rel}")
+    try:
+        path.relative_to(DATA_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="图像文件必须位于 data/ 目录下") from None
+    return rel
+
+
+def _mission_generation_config(mission_data: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    meta = (mission_data or {}).get("metadata") or {}
+    source = normalize_inspection_point_source(meta.get("inspection_point_source"))
+    image_path = str(meta.get("map_image") or DEFAULT_MAP_PATH)
+    return {
+        "inspection_point_source": source,
+        "image_path": image_path,
+    }
+
+
+def _update_current_mission_context(context: Dict[str, Any]) -> None:
+    global _current_mission_context
+    _current_mission_context = dict(context or {})
+
+
+def _build_replan_mission_context(
+    baseline: Dict[str, Any],
+    req: ReplanRequest,
+    *,
+    dashboard: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    request_payload = req.model_dump(exclude_none=True)
+    cached_dashboard = dashboard or {}
+    if not cached_dashboard and _current_mission_context:
+        cached_dashboard = {
+            "metadata": {
+                k: _current_mission_context.get(k)
+                for k in (
+                    "inspection_point_source",
+                    "map_image",
+                    "clean_map_image",
+                    "image_detection_stats",
+                    "image_inspection_overlay",
+                    "input_file",
+                    "pipeline",
+                    "planner",
+                    "spacing",
+                )
+            },
+            "inspection_points": _current_mission_context.get("inspection_points") or [],
+        }
+    context = build_mission_context(
+        baseline,
+        request=request_payload,
+        dashboard=cached_dashboard,
+    )
+    if is_image_inspection_source(context.get("inspection_point_source")):
+        if not context.get("inspection_points"):
+            context["inspection_points"] = cached_dashboard.get("inspection_points") or []
+        if not context.get("image_inspection_overlay"):
+            context["image_inspection_overlay"] = (
+                baseline.get("image_inspection_overlay")
+                or (baseline.get("metadata") or {}).get("image_inspection_overlay")
+                or []
+            )
+    _update_current_mission_context(context)
+    return context
+
+
+def _run_image_demo_main(
+    *,
+    inspection_point_source: str = "spacing",
+    image_path: str = DEFAULT_MAP_PATH,
+) -> None:
     """调用图像主线 demo（优先 import main，失败则 subprocess）。"""
+    import os
+
+    os.environ["UAV_INSPECTION_SOURCE"] = inspection_point_source
+    os.environ["UAV_IMAGE_PATH"] = image_path
     try:
         from demo.demo_visualization_main import main as demo_main
 
-        demo_main()
+        demo_main(
+            image_path=image_path,
+            inspection_point_source=inspection_point_source,
+        )
         return
     except Exception as import_err:
         if not DEMO_VISUALIZATION_SCRIPT.exists():
@@ -185,6 +283,9 @@ def _run_image_demo_main() -> None:
                 f"未找到 demo 脚本: {DEMO_VISUALIZATION_SCRIPT}"
             ) from import_err
 
+        env = os.environ.copy()
+        env["UAV_INSPECTION_SOURCE"] = inspection_point_source
+        env["UAV_IMAGE_PATH"] = image_path
         proc = subprocess.run(
             [sys.executable, str(DEMO_VISUALIZATION_SCRIPT)],
             cwd=str(ROOT),
@@ -192,6 +293,7 @@ def _run_image_demo_main() -> None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         if proc.returncode != 0:
             err_tail = (proc.stderr or proc.stdout or "")[-4000:]
@@ -200,7 +302,12 @@ def _run_image_demo_main() -> None:
             ) from import_err
 
 
-def ensure_image_pipeline_outputs(force: bool = False) -> Dict[str, Any]:
+def ensure_image_pipeline_outputs(
+    force: bool = False,
+    *,
+    inspection_point_source: str = "spacing",
+    image_path: str = DEFAULT_MAP_PATH,
+) -> Dict[str, Any]:
     """
     确保 result/latest/mission_output.json 存在。
     不存在或 force=True 时自动运行图像主线 demo。
@@ -209,6 +316,22 @@ def ensure_image_pipeline_outputs(force: bool = False) -> Dict[str, Any]:
 
     mission_rel = "result/latest/mission_output.json"
     html_rel = "result/latest/main_view_interactive.html"
+    image_path = _resolve_image_path(image_path)
+
+    existing_config: Dict[str, str] = {}
+    if LATEST_MISSION_PATH.exists():
+        try:
+            with LATEST_MISSION_PATH.open("r", encoding="utf-8") as f:
+                existing_config = _mission_generation_config(json.load(f))
+        except Exception:
+            existing_config = {}
+
+    config_changed = (
+        existing_config.get("inspection_point_source") != inspection_point_source
+        or existing_config.get("image_path") != image_path
+    )
+    if config_changed:
+        force = True
 
     if LATEST_MISSION_PATH.exists() and not force:
         return {
@@ -241,7 +364,10 @@ def ensure_image_pipeline_outputs(force: bool = False) -> Dict[str, Any]:
         _image_generating = True
         try:
             LATEST_DIR.mkdir(parents=True, exist_ok=True)
-            _run_image_demo_main()
+            _run_image_demo_main(
+                inspection_point_source=inspection_point_source,
+                image_path=image_path,
+            )
         finally:
             _image_generating = False
 
@@ -268,6 +394,7 @@ async def _run_image_replan(
     end: List[float],
     planning_spacing: float = 70.0,
     weather_context: Optional[Dict[str, Any]] = None,
+    mission_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     图像主线起终点重规划：planner/replan_start_end.py。
@@ -288,6 +415,9 @@ async def _run_image_replan(
     with LATEST_MISSION_PATH.open("r", encoding="utf-8") as f:
         baseline = json.load(f)
 
+    ctx = mission_context or build_mission_context(baseline)
+    _update_current_mission_context(ctx)
+
     try:
         new_mission = build_start_end_replan_mission(
             baseline,
@@ -295,6 +425,7 @@ async def _run_image_replan(
             end,
             planning_spacing=planning_spacing,
             weather_context=weather_context,
+            mission_context=ctx,
         )
     except ReplanValidationError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -302,13 +433,26 @@ async def _run_image_replan(
         raise HTTPException(status_code=500, detail=f"Replan failed: {e}") from e
 
     replan_meta = new_mission.get("replan_metadata") or {}
-    map_bg = get_background_map_config(ROOT, DEFAULT_MAP_PATH)
+    base_meta = baseline.get("metadata") or {}
+    map_rel = str(
+        ctx.get("clean_map_image")
+        or base_meta.get("clean_map_image")
+        or ctx.get("image_path")
+        or base_meta.get("map_image")
+        or DEFAULT_MAP_PATH
+    )
+    map_bg = get_background_map_config(ROOT, map_rel)
+    resolved_source = normalize_inspection_point_source(
+        replan_meta.get("inspection_point_source")
+        or ctx.get("inspection_point_source")
+        or base_meta.get("inspection_point_source")
+    )
     dashboard = build_dashboard_from_mission_json(
         new_mission,
         pipeline="image",
         source="replan:start_end",
         planner="start_end_replan",
-        input_file="data/test.png",
+        input_file=map_rel,
         spacing=planning_spacing,
         map_background=map_bg,
         coordinate_mode="image_fixed",
@@ -320,6 +464,11 @@ async def _run_image_replan(
             "end_connected": replan_meta.get("end_connected", False),
             "planning_spacing": replan_meta.get("planning_spacing", planning_spacing),
             "planning_point_count": replan_meta.get("planning_point_count"),
+            "inspection_point_source": resolved_source,
+            "map_image": ctx.get("image_path") or base_meta.get("map_image") or DEFAULT_MAP_PATH,
+            "clean_map_image": ctx.get("clean_map_image") or base_meta.get("clean_map_image"),
+            "image_detection_stats": ctx.get("image_detection_stats") or base_meta.get("image_detection_stats") or {},
+            "image_inspection_overlay": ctx.get("image_inspection_overlay") or base_meta.get("image_inspection_overlay") or [],
             "replan": replan_meta,
             "image_generation": gen,
             "weather_mode": "on" if (weather_context or {}).get("enabled") else "off",
@@ -388,14 +537,23 @@ def _run_optimized(
     }
 
 
-async def _plan_image_pipeline() -> Dict[str, Any]:
+async def _plan_image_pipeline(
+    *,
+    inspection_point_source: str = "spacing",
+    image_path: str = DEFAULT_MAP_PATH,
+) -> Dict[str, Any]:
     """图像主线：自动生成（如需）并加载 result/latest/mission_output.json。"""
-    gen = ensure_image_pipeline_outputs(force=False)
+    image_path = _resolve_image_path(image_path)
+    gen = ensure_image_pipeline_outputs(
+        force=False,
+        inspection_point_source=inspection_point_source,
+        image_path=image_path,
+    )
     if not gen.get("ok"):
         raise HTTPException(status_code=500, detail=gen.get("message", "Image pipeline generation failed"))
 
     try:
-        dashboard = build_image_pipeline_dashboard(LATEST_MISSION_PATH, ROOT)
+        dashboard = build_image_pipeline_dashboard(LATEST_MISSION_PATH, ROOT, map_rel=image_path)
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -406,6 +564,11 @@ async def _plan_image_pipeline() -> Dict[str, Any]:
     save_json(snapshot, mission_data)
 
     dashboard["metadata"]["image_generation"] = gen
+    dashboard["metadata"]["inspection_point_source"] = normalize_inspection_point_source(
+        inspection_point_source
+    )
+    dashboard["metadata"]["map_image"] = image_path
+    dashboard["image_inspection_overlay"] = dashboard.get("metadata", {}).get("image_inspection_overlay") or []
     dashboard["output_files"] = {
         "mission_snapshot": "latest_image_mission_snapshot.json",
         "source": "result/latest/mission_output.json",
@@ -421,6 +584,16 @@ async def _plan_image_pipeline() -> Dict[str, Any]:
     save_json(OUTPUT_DIR / "latest_dashboard.json", dashboard)
     dashboard["output_files"]["dashboard"] = "latest_dashboard.json"
 
+    _update_current_mission_context(
+        build_mission_context(
+            mission_data,
+            request={
+                "inspection_point_source": inspection_point_source,
+                "image_path": image_path,
+            },
+            dashboard=dashboard,
+        )
+    )
     return dashboard
 
 
@@ -589,16 +762,16 @@ async def api_datasets():
 
 
 @app.get("/api/map/config")
-async def api_map_config():
-    """仅 Image Pipeline 使用：data/test.png 固定坐标。"""
-    return get_background_map_config(ROOT, DEFAULT_MAP_PATH)
+async def api_map_config(path: str = DEFAULT_MAP_PATH):
+    """Image Pipeline 底图配置。"""
+    map_rel = _resolve_image_path(path)
+    return get_background_map_config(ROOT, map_rel)
 
 
 @app.get("/api/map/background")
-async def api_map_background():
-    map_path = resolve_map_path(ROOT, DEFAULT_MAP_PATH)
-    if not map_path.exists():
-        raise HTTPException(status_code=404, detail="Map image not found: data/test.png")
+async def api_map_background(path: str = DEFAULT_MAP_PATH):
+    map_rel = _resolve_image_path(path)
+    map_path = resolve_map_path(ROOT, map_rel)
     return FileResponse(map_path, media_type="image/png")
 
 
@@ -680,7 +853,12 @@ async def api_image_mission_status():
 
 @app.post("/api/image-mission/generate")
 async def api_image_mission_generate(req: ImageGenerateRequest):
-    result = ensure_image_pipeline_outputs(force=req.force)
+    image_path = _resolve_image_path(req.image_path)
+    result = ensure_image_pipeline_outputs(
+        force=req.force,
+        inspection_point_source=req.inspection_point_source,
+        image_path=image_path,
+    )
     status = 200 if result.get("ok") else 500
     return JSONResponse(result, status_code=status)
 
@@ -715,11 +893,15 @@ async def api_replan(req: ReplanRequest):
             enabled=bool(req.weather_aware),
             weather_weight=float(req.weather_weight),
         )
+        with LATEST_MISSION_PATH.open("r", encoding="utf-8") as f:
+            baseline = json.load(f)
+        mission_context = _build_replan_mission_context(baseline, req)
         dashboard = await _run_image_replan(
             req.start,
             req.end,
             planning_spacing=req.planning_spacing,
             weather_context=weather_ctx,
+            mission_context=mission_context,
         )
     except HTTPException:
         raise
@@ -759,7 +941,11 @@ async def api_plan(req: PlanRequest):
     pipeline = req.pipeline.lower()
 
     if pipeline == "image":
-        dashboard = await _plan_image_pipeline()
+        image_path = _resolve_image_path(req.image_path)
+        dashboard = await _plan_image_pipeline(
+            inspection_point_source=req.inspection_point_source,
+            image_path=image_path,
+        )
     elif pipeline == "unified":
         dashboard = await _plan_unified_pipeline(req)
     else:

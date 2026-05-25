@@ -4055,7 +4055,8 @@ def export_grouped_mission_to_json(
     line_inspection_points_by_line: Dict[str, List],
     output_path: str = "result/latest/mission_output.json",
     terrain_3d: Optional[np.ndarray] = None,
-    weather_info: Optional[dict] = None
+    weather_info: Optional[dict] = None,
+    extra_metadata: Optional[dict] = None,
 ) -> str:
     """
     将分组连续任务导出为标准 JSON 格式
@@ -4089,6 +4090,8 @@ def export_grouped_mission_to_json(
         "export_date": datetime.now().strftime("%Y-%m-%d"),
         "export_time": datetime.now().strftime("%H:%M:%S")
     }
+    if extra_metadata:
+        metadata.update(extra_metadata)
 
     # 2. 统计信息
     inspect_ratio = (mission.inspect_length / mission.total_length * 100
@@ -4340,6 +4343,8 @@ def export_grouped_mission_to_json(
         "inspection_points": inspection_points_data,
         "full_path": full_path_data
     }
+    if extra_metadata and extra_metadata.get("image_inspection_overlay") is not None:
+        output_data["image_inspection_overlay"] = extra_metadata.get("image_inspection_overlay")
 
     # 添加顶层天气信息（如果提供）
     if weather_info:

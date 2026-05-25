@@ -14,6 +14,10 @@
   --font: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
 }
 
+.hidden {
+  display: none !important;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -491,6 +495,44 @@ body {
   min-height: 0;
   width: 100%;
   height: 100%;
+  position: relative;
+}
+
+.predictive-warning-hud {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  padding: 0.55rem 1rem;
+  border-radius: 10px;
+  background: rgba(66, 32, 6, 0.86);
+  border: 1px solid rgba(250, 204, 21, 0.72);
+  box-shadow: 0 0 22px rgba(250, 204, 21, 0.42), inset 0 0 12px rgba(250, 204, 21, 0.12);
+  color: #fef08a;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.predictive-warning-hud.hidden {
+  display: none;
+}
+
+.adaptive-status.is-warning {
+  border-color: rgba(250, 204, 21, 0.55);
+  background: rgba(66, 32, 6, 0.72);
+  color: #fde68a;
+  box-shadow: 0 0 16px rgba(250, 204, 21, 0.28);
+}
+
+.adaptive-status.is-reroute {
+  border-color: rgba(34, 197, 94, 0.55);
+  background: rgba(6, 44, 28, 0.72);
+  color: #bbf7d0;
+  box-shadow: 0 0 16px rgba(34, 197, 94, 0.28);
 }
 
 .plot-stage-fs {

@@ -12,6 +12,118 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 INSPECTION_IMAGE_REL_DIR = Path("figures") / "inspection_images"
 
+IMAGE_INSPECTION_SOURCES = frozenset(
+    {"image", "image_points", "image-point", "image_detected", "image-point-source"}
+)
+
+
+def normalize_inspection_point_source(source: Optional[str]) -> str:
+    raw = str(source or "spacing").strip().lower()
+    if raw in IMAGE_INSPECTION_SOURCES:
+        return "image"
+    if raw in {"spacing", "manual"}:
+        return raw
+    return "spacing"
+
+
+def is_image_inspection_source(source: Optional[str]) -> bool:
+    return normalize_inspection_point_source(source) == "image"
+
+
+def is_image_inspection_point(point: Dict[str, Any]) -> bool:
+    ptype = str(point.get("point_type") or point.get("type") or "").lower()
+    reason = str(point.get("source_reason") or point.get("description") or "").lower()
+    pid = str(point.get("point_id") or point.get("id") or "")
+    if ptype == "image_detected":
+        return True
+    if "image" in reason or "black_dot" in reason:
+        return True
+    if pid.startswith("IP_"):
+        return True
+    if point.get("detection_result"):
+        return True
+    if point.get("raw_coord") or point.get("snapped_coord"):
+        return True
+    return False
+
+
+def merge_mission_metadata_into_dashboard(
+    metadata: Dict[str, Any],
+    mission_data: Optional[Dict[str, Any]],
+) -> None:
+    mission_meta = (mission_data or {}).get("metadata") or {}
+    if not mission_meta:
+        return
+    metadata["mission_metadata"] = mission_meta
+    for key in (
+        "inspection_point_source",
+        "map_image",
+        "clean_map_image",
+        "image_detection_stats",
+        "image_inspection_overlay",
+    ):
+        if key in mission_meta and metadata.get(key) in (None, "", {}):
+            metadata[key] = mission_meta[key]
+    overlay = (mission_data or {}).get("image_inspection_overlay")
+    if overlay and not metadata.get("image_inspection_overlay"):
+        metadata["image_inspection_overlay"] = overlay
+
+
+def build_mission_context(
+    baseline: Dict[str, Any],
+    *,
+    request: Optional[Dict[str, Any]] = None,
+    dashboard: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    base_meta = baseline.get("metadata") or {}
+    dash_meta = (dashboard or {}).get("metadata") or {}
+    req = request or {}
+
+    inspection_point_source = normalize_inspection_point_source(
+        req.get("inspection_point_source")
+        or dash_meta.get("inspection_point_source")
+        or base_meta.get("inspection_point_source")
+    )
+    image_path = (
+        req.get("image_path")
+        or dash_meta.get("map_image")
+        or base_meta.get("map_image")
+        or "data/test.png"
+    )
+    snap_threshold = req.get("snap_threshold")
+    if snap_threshold is None:
+        stats = base_meta.get("image_detection_stats") or dash_meta.get("image_detection_stats") or {}
+        cfg = stats.get("detector_config") or {}
+        snap_threshold = cfg.get("snap_threshold", 30.0)
+
+    inspection_points = req.get("inspection_points")
+    if not inspection_points:
+        cached = (dashboard or {}).get("inspection_points")
+        if cached and is_image_inspection_source(inspection_point_source):
+            inspection_points = cached
+
+    overlay = (
+        baseline.get("image_inspection_overlay")
+        or base_meta.get("image_inspection_overlay")
+        or dash_meta.get("image_inspection_overlay")
+        or []
+    )
+
+    return {
+        "dataset": req.get("dataset") or dash_meta.get("input_file") or base_meta.get("map_image"),
+        "pipeline": req.get("pipeline") or dash_meta.get("pipeline") or "image",
+        "planner": req.get("planner") or dash_meta.get("planner") or "legacy",
+        "inspection_point_source": inspection_point_source,
+        "image_path": str(image_path),
+        "spacing": float(req.get("spacing") if req.get("spacing") is not None else dash_meta.get("spacing") or 50.0),
+        "snap_threshold": float(snap_threshold or 30.0),
+        "inspection_points": inspection_points or [],
+        "image_inspection_overlay": overlay,
+        "image_detection_stats": base_meta.get("image_detection_stats") or dash_meta.get("image_detection_stats") or {},
+        "clean_map_image": base_meta.get("clean_map_image") or dash_meta.get("clean_map_image"),
+        "weather_aware": bool(req.get("weather_aware")),
+        "weather_weight": float(req.get("weather_weight") or 1.0),
+    }
 
 
 def _segment_to_dict(seg: Any, index: int) -> Dict[str, Any]:
@@ -289,6 +401,9 @@ def _inspection_points_from_json(
             "line_id": pt.get("line_id"),
             "visit_order": pt.get("visit_order"),
             "source_reason": pt.get("source_reason"),
+            "raw_coord": (pt.get("detection_result") or {}).get("raw_coord"),
+            "snapped_coord": (pt.get("detection_result") or {}).get("snapped_coord") or list(pos),
+            "detection_valid": True,
         })
     return enrich_inspection_points_for_dashboard(
         raw_points, segments, root=root, image_catalog=image_catalog
@@ -366,8 +481,7 @@ def build_dashboard_from_mission_json(
         metadata["background"] = "data/test.png"
     if extra_metadata:
         metadata.update(extra_metadata)
-    if data.get("metadata"):
-        metadata["mission_metadata"] = data["metadata"]
+    merge_mission_metadata_into_dashboard(metadata, data)
 
     payload: Dict[str, Any] = {
         "segments": segments,
@@ -380,6 +494,11 @@ def build_dashboard_from_mission_json(
         "output_files": output_files or {},
         "map_background": map_background,
         "map_mode": "image_overlay" if pipeline == "image" else "topology_only",
+        "image_inspection_overlay": (
+            data.get("image_inspection_overlay")
+            or metadata.get("image_inspection_overlay")
+            or []
+        ),
     }
 
     if coordinate_mode == "auto_fit":
@@ -417,24 +536,34 @@ def build_image_pipeline_dashboard(
     with mission_json_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    map_bg = get_background_map_config(root, map_rel, image_url)
+    meta = data.get("metadata") or {}
+    map_rel = str(meta.get("clean_map_image") or meta.get("map_image") or map_rel)
+    map_bg = get_background_map_config(root, map_rel)
     rel_source = mission_json_path.relative_to(root).as_posix() if mission_json_path.is_relative_to(root) else str(mission_json_path)
 
-    return build_dashboard_from_mission_json(
+    dashboard = build_dashboard_from_mission_json(
         data,
         pipeline="image",
         source=rel_source,
         planner="legacy",
-        input_file="data/test.png",
+        input_file=map_rel,
         spacing=0,
         map_background=map_bg,
         coordinate_mode="image_fixed",
         extra_metadata={
             "background": map_rel,
-            "map_image": map_rel,
+            "map_image": meta.get("map_image") or map_rel,
+            "clean_map_image": meta.get("clean_map_image"),
+            "inspection_point_source": normalize_inspection_point_source(
+                meta.get("inspection_point_source")
+            ),
+            "image_detection_stats": meta.get("image_detection_stats") or {},
+            "image_inspection_overlay": data.get("image_inspection_overlay") or meta.get("image_inspection_overlay") or [],
         },
         root=root,
     )
+    dashboard["image_inspection_overlay"] = dashboard.get("metadata", {}).get("image_inspection_overlay") or []
+    return dashboard
 
 
 def build_dashboard_payload(
