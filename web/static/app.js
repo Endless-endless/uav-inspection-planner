@@ -35,7 +35,7 @@ const state = {
   showBackground: false,
   showInspect: true,
   showConnect: true,
-  showWeatherLayer: true,
+  showWeatherLayer: false,
   pointMode: "key",
   weatherAware: false,
   weatherWeight: 1.0,
@@ -48,7 +48,7 @@ const state = {
     reasoning: "",
   },
   dynamicWeather: {
-    enabled: true,
+    enabled: false,
     zones: [],
     baseZones: [],
     elapsed: 0,
@@ -175,13 +175,6 @@ function updateSpacingControlsVisibility() {
   const planningField = $("planningSpacingFieldWrap") || $("planningSpacingInput")?.closest(".field");
   if (spacingField) spacingField.classList.toggle("hidden", hideSpacing);
   if (planningField) planningField.classList.toggle("hidden", hideSpacing);
-
-  const replanHint = $("replanHint");
-  if (replanHint && hideSpacing) {
-    replanHint.textContent = "仅重建 connect 段；保留图像巡检点与 ID。";
-  } else if (replanHint) {
-    replanHint.textContent = "调整起终点后重规划；spacing 模式下可配合「重规划采样间距」。";
-  }
 }
 
 function applyPipelineUi() {
@@ -272,7 +265,7 @@ function readUiToState() {
   state.weatherAware = $("weatherAwareToggle")?.checked === true;
   state.weatherWeight = Math.max(0, parseFloat($("weatherWeightInput")?.value || "1") || 1);
   state.experiment.overlay = $("experimentOverlayToggle")?.checked !== false;
-  state.dynamicWeather.enabled = $("dynamicWeatherToggle")?.checked !== false;
+  state.dynamicWeather.enabled = $("dynamicWeatherToggle")?.checked === true;
   state.dynamicWeather.riskThreshold = Math.max(
     0.1,
     parseFloat($("adaptiveRiskThresholdInput")?.value || "0.72") || 0.72
@@ -507,6 +500,7 @@ function updateMissionStatusHud() {
   const flash = state.dynamicWeather.adaptiveFlash;
   const risk = Number(state.dynamicWeather.predictedRisk || 0);
   const th = Number(state.dynamicWeather.riskThreshold || 0.72);
+  const weatherOn = state.weatherAware === true;
 
   let label = "NORMAL";
   let mod = "normal";
@@ -516,10 +510,10 @@ function updateMissionStatusHud() {
   } else if (flash) {
     label = "REROUTING";
     mod = "reroute";
-  } else if (phase === "adaptive_warning" || risk > th) {
+  } else if (weatherOn && (phase === "adaptive_warning" || risk > th)) {
     label = "WEATHER ALERT";
     mod = "alert";
-  } else if (risk > th * 0.55) {
+  } else if (weatherOn && risk > th * 0.55) {
     label = "WARNING";
     mod = "warn";
   }
@@ -580,7 +574,8 @@ function renderSystemStatus() {
   if ($("sysCurrentPoint")) $("sysCurrentPoint").textContent = pointText;
   if ($("sysCurrentSegment")) $("sysCurrentSegment").textContent = segmentText;
   if ($("playbackConsoleState")) $("playbackConsoleState").textContent = phaseText;
-  const rk = formatRiskTier(state.dynamicWeather.predictedRisk);
+  const weatherOn = state.weatherAware === true;
+  const rk = weatherOn ? formatRiskTier(state.dynamicWeather.predictedRisk) : "未启用";
   if ($("inspectCardRisk")) $("inspectCardRisk").textContent = rk;
   if ($("inspectCardRiskFs")) $("inspectCardRiskFs").textContent = rk;
   updateMissionStatusHud();
@@ -636,6 +631,7 @@ function renderStats(statistics) {
   const riskVal = Number(state.dynamicWeather.predictedRisk ?? 0);
   const wp = s.weather_penalty_total;
   const wpStr = wp != null && wp !== "" && Number.isFinite(Number(wp)) ? Number(wp).toFixed(2) : "—";
+  const weatherOn = state.weatherAware === true;
 
   const primary = $("statCardsPrimary");
   const secondary = $("statCardsSecondary");
@@ -643,7 +639,7 @@ function renderStats(statistics) {
     ["total_length", "总长度", s.total_length, " px"],
     ["num_inspection_points", "巡检点数", s.num_inspection_points, ""],
     ["phase", "任务状态", phaseText, ""],
-    ["predicted_risk", "天气风险", riskVal.toFixed(2), ""],
+    ["predicted_risk", "天气风险", weatherOn ? riskVal.toFixed(2) : "—", ""],
   ];
   if (primary) {
     primary.innerHTML = itemsPrimary
@@ -659,10 +655,15 @@ function renderStats(statistics) {
   const connectPct = cr != null && Number.isFinite(cr) ? (cr <= 1 ? cr * 100 : cr) : null;
   const itemsSecondary = [
     ["connect_ratio", "连接占比", connectPct != null ? connectPct.toFixed(1) : "—", connectPct != null ? "%" : ""],
-    ["risky_distance", "高风险穿越", s.risky_distance ?? "—", s.risky_distance != null ? " px" : ""],
-    ["pred_samples", "预测采样点", state.dynamicWeather.predictedAffectedSegments ?? 0, ""],
-    ["weather_penalty", "天气惩罚", wpStr, ""],
-    ["reroute", "预测重规划", state.dynamicWeather.predictiveReplanCount ?? 0, " 次"],
+    [
+      "risky_distance",
+      "高风险穿越",
+      weatherOn ? (s.risky_distance ?? "—") : "—",
+      weatherOn && s.risky_distance != null ? " px" : "",
+    ],
+    ["pred_samples", "预测采样点", weatherOn ? (state.dynamicWeather.predictedAffectedSegments ?? 0) : "—", ""],
+    ["weather_penalty", "天气惩罚", weatherOn ? wpStr : "—", ""],
+    ["reroute", "预测重规划", weatherOn ? (state.dynamicWeather.predictiveReplanCount ?? 0) : "—", weatherOn ? " 次" : ""],
   ];
   if (secondary) {
     secondary.innerHTML = itemsSecondary
@@ -1429,7 +1430,21 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("pointModeSelect")?.addEventListener("change", () => refreshMapView());
   $("weatherAwareToggle")?.addEventListener("change", () => {
     readUiToState();
+    if (!state.weatherAware) {
+      state.dynamicWeather.enabled = false;
+      if ($("dynamicWeatherToggle")) $("dynamicWeatherToggle").checked = false;
+      state.showWeatherLayer = false;
+      if ($("toggleWeatherLayer")) $("toggleWeatherLayer").checked = false;
+      stopDynamicWeatherLoop();
+      if (typeof setPredictiveWarningHud === "function") setPredictiveWarningHud(null);
+      syncStateToUi();
+    } else if ($("dynamicWeatherToggle")?.checked) {
+      state.dynamicWeather.enabled = true;
+      state.dynamicWeather.lastTick = performance.now();
+      startDynamicWeatherLoop();
+    }
     if (state.lastResult) renderMeta(state.lastResult.metadata || {});
+    refreshMapView();
   });
   $("weatherWeightInput")?.addEventListener("change", () => {
     readUiToState();
@@ -1442,6 +1457,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("dynamicWeatherToggle")?.addEventListener("change", () => {
     readUiToState();
     if (state.dynamicWeather.enabled) {
+      if (!state.weatherAware) {
+        state.dynamicWeather.enabled = false;
+        if ($("dynamicWeatherToggle")) $("dynamicWeatherToggle").checked = false;
+        return;
+      }
       state.dynamicWeather.lastTick = performance.now();
       startDynamicWeatherLoop();
       pushAdaptiveEvent("动态天气模拟已开启");
@@ -1458,7 +1478,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("predictionWindowSelect")?.addEventListener("change", () => {
     readUiToState();
     pushAdaptiveEvent(`预测窗口更新为 ${state.dynamicWeather.predictionWindow}s`);
-    updatePredictiveMetrics(predictFutureWeatherRisk());
+    if (state.weatherAware) updatePredictiveMetrics(predictFutureWeatherRisk());
   });
   $("autoPredictiveReplanToggle")?.addEventListener("change", () => {
     readUiToState();

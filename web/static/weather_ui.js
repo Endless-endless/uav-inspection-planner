@@ -41,7 +41,7 @@ function weatherColor(type, severity = 0.5) {
 }
 
 function buildWeatherZoneTraces(result) {
-  if (!state.showWeatherLayer) return [];
+  if (!state.weatherAware || !state.showWeatherLayer) return [];
   const zones = getWeatherZones(result);
   if (!zones.length) return [];
   const traces = [];
@@ -266,6 +266,7 @@ function setPredictiveWarningHud(text, durationMs = 6000) {
     state.dynamicWeather.predictiveHud = null;
     return;
   }
+  if (!state.weatherAware) return;
   ids.forEach((id) => {
     const el = $(id);
     if (!el) return;
@@ -317,7 +318,11 @@ function resetDynamicWeather(result) {
   setAdaptiveStatus("天气监测");
   pushAdaptiveEvent("动态天气监测初始化");
   updateWeatherDynamicSummary();
-  startDynamicWeatherLoop();
+  if (state.weatherAware && state.dynamicWeather.enabled) {
+    startDynamicWeatherLoop();
+  } else {
+    stopDynamicWeatherLoop();
+  }
 }
 
 function updateDynamicWeatherZones(dt) {
@@ -678,6 +683,7 @@ function triggerAdaptiveReplan(riskInfo, { predictive = false } = {}) {
 }
 
 function maybeTriggerAdaptiveReplan() {
+  if (!state.weatherAware) return;
   if (AppPhaseManager && !AppPhaseManager.canRunAdaptive()) return;
   const visual = typeof window.getPlaybackVisualState === "function" ? window.getPlaybackVisualState() : null;
   if (!visual || visual.status !== "playing") return;
@@ -728,8 +734,9 @@ function maybeTriggerAdaptiveReplan() {
 
 function startDynamicWeatherLoop() {
   stopDynamicWeatherLoop();
+  if (!state.weatherAware || !state.dynamicWeather.enabled) return;
   state.dynamicWeather.timer = window.setInterval(() => {
-    if (!getCurrentMission() || !state.dynamicWeather.enabled) return;
+    if (!getCurrentMission() || !state.dynamicWeather.enabled || !state.weatherAware) return;
     if (AppPhaseManager && ![AppPhase.PLAYING, AppPhase.ADAPTIVE_WARNING, AppPhase.MISSION_READY].includes(AppPhaseManager.getPhase())) {
       return;
     }

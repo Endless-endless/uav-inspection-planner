@@ -513,21 +513,25 @@ body {
 
 .predictive-warning-hud {
   position: absolute;
-  top: 52px;
-  left: 50%;
-  transform: translateX(-50%);
+  top: 10px;
+  right: 10px;
+  left: auto;
+  transform: none;
   z-index: 6;
-  padding: 0.42rem 0.85rem;
+  max-width: min(300px, 40vw);
+  padding: 0.38rem 0.65rem;
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.82);
-  border: 1px solid rgba(251, 191, 36, 0.45);
-  box-shadow: 0 0 14px rgba(251, 191, 36, 0.18), inset 0 0 0 1px rgba(30, 41, 59, 0.6);
+  background: rgba(15, 23, 42, 0.88);
+  border: 1px solid rgba(251, 191, 36, 0.5);
+  box-shadow: 0 0 16px rgba(251, 191, 36, 0.22), inset 0 0 0 1px rgba(30, 41, 59, 0.55);
   color: #fde68a;
-  font-size: 0.76rem;
+  font-size: 0.72rem;
   font-weight: 600;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.03em;
+  line-height: 1.35;
   pointer-events: none;
-  white-space: nowrap;
+  text-align: right;
+  white-space: normal;
 }
 
 .predictive-warning-hud.hidden {
