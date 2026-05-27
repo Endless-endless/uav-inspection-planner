@@ -265,7 +265,12 @@ function readUiToState() {
   state.weatherAware = $("weatherAwareToggle")?.checked === true;
   state.weatherWeight = Math.max(0, parseFloat($("weatherWeightInput")?.value || "1") || 1);
   state.experiment.overlay = $("experimentOverlayToggle")?.checked !== false;
-  state.dynamicWeather.enabled = $("dynamicWeatherToggle")?.checked === true;
+  const dwEl = $("dynamicWeatherToggle");
+  if (dwEl?.disabled) {
+    state.dynamicWeather.enabled = false;
+  } else {
+    state.dynamicWeather.enabled = dwEl?.checked === true;
+  }
   state.dynamicWeather.riskThreshold = Math.max(
     0.1,
     parseFloat($("adaptiveRiskThresholdInput")?.value || "0.72") || 0.72
@@ -281,6 +286,16 @@ function readUiToState() {
   );
 }
 
+function syncDynamicWeatherToggleFromState() {
+  const el = $("dynamicWeatherToggle");
+  if (!el) return;
+  if (!state.weatherAware) {
+    state.dynamicWeather.enabled = false;
+  }
+  el.disabled = !state.weatherAware;
+  el.checked = state.dynamicWeather.enabled;
+}
+
 function syncStateToUi() {
   if ($("toggleBaseMap")) $("toggleBaseMap").checked = state.showBackground;
   if ($("toggleInspect")) $("toggleInspect").checked = state.showInspect;
@@ -291,7 +306,7 @@ function syncStateToUi() {
   if ($("weatherAwareToggle")) $("weatherAwareToggle").checked = state.weatherAware;
   if ($("weatherWeightInput")) $("weatherWeightInput").value = String(state.weatherWeight);
   if ($("experimentOverlayToggle")) $("experimentOverlayToggle").checked = state.experiment.overlay;
-  if ($("dynamicWeatherToggle")) $("dynamicWeatherToggle").checked = state.dynamicWeather.enabled;
+  syncDynamicWeatherToggleFromState();
   if ($("adaptiveRiskThresholdInput")) $("adaptiveRiskThresholdInput").value = String(state.dynamicWeather.riskThreshold);
   if ($("predictionWindowSelect")) $("predictionWindowSelect").value = String(state.dynamicWeather.predictionWindow);
   if ($("autoPredictiveReplanToggle")) $("autoPredictiveReplanToggle").checked = state.dynamicWeather.autoPredictiveReplan;
@@ -1432,18 +1447,18 @@ document.addEventListener("DOMContentLoaded", async () => {
     readUiToState();
     if (!state.weatherAware) {
       state.dynamicWeather.enabled = false;
-      if ($("dynamicWeatherToggle")) $("dynamicWeatherToggle").checked = false;
       state.showWeatherLayer = false;
       if ($("toggleWeatherLayer")) $("toggleWeatherLayer").checked = false;
       stopDynamicWeatherLoop();
       if (typeof setPredictiveWarningHud === "function") setPredictiveWarningHud(null);
-      syncStateToUi();
-    } else if ($("dynamicWeatherToggle")?.checked) {
-      state.dynamicWeather.enabled = true;
+      if (typeof setAdaptiveStatus === "function") setAdaptiveStatus("天气监测已关闭");
+    } else if (state.dynamicWeather.enabled) {
       state.dynamicWeather.lastTick = performance.now();
       startDynamicWeatherLoop();
     }
+    syncStateToUi();
     if (state.lastResult) renderMeta(state.lastResult.metadata || {});
+    renderSystemStatus();
     refreshMapView();
   });
   $("weatherWeightInput")?.addEventListener("change", () => {
@@ -1455,21 +1470,36 @@ document.addEventListener("DOMContentLoaded", async () => {
     refreshMapView();
   });
   $("dynamicWeatherToggle")?.addEventListener("change", () => {
+    const dw = $("dynamicWeatherToggle");
+    if (dw?.disabled) {
+      if (dw) dw.checked = false;
+      state.dynamicWeather.enabled = false;
+      return;
+    }
     readUiToState();
     if (state.dynamicWeather.enabled) {
       if (!state.weatherAware) {
         state.dynamicWeather.enabled = false;
-        if ($("dynamicWeatherToggle")) $("dynamicWeatherToggle").checked = false;
+        syncDynamicWeatherToggleFromState();
         return;
       }
       state.dynamicWeather.lastTick = performance.now();
       startDynamicWeatherLoop();
       pushAdaptiveEvent("动态天气模拟已开启");
+      if (typeof setAdaptiveStatus === "function") setAdaptiveStatus("天气监测");
+      if (typeof updateWeatherDynamicSummary === "function") updateWeatherDynamicSummary();
+      if (typeof updateWeatherPlotTraces === "function") updateWeatherPlotTraces();
+      if (typeof updatePredictiveMetrics === "function" && typeof predictFutureWeatherRisk === "function") {
+        updatePredictiveMetrics(predictFutureWeatherRisk());
+      }
     } else {
       stopDynamicWeatherLoop();
-      setAdaptiveStatus("天气监测暂停");
+      if (typeof setAdaptiveStatus === "function") setAdaptiveStatus("天气监测空闲");
       pushAdaptiveEvent("动态天气模拟已暂停");
+      if (typeof updateWeatherDynamicSummary === "function") updateWeatherDynamicSummary();
+      if (typeof updateWeatherPlotTraces === "function") updateWeatherPlotTraces();
     }
+    renderSystemStatus();
   });
   $("adaptiveRiskThresholdInput")?.addEventListener("change", () => {
     readUiToState();

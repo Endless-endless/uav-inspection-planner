@@ -808,6 +808,12 @@ body {
   cursor: pointer;
 }
 
+label.toggle:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.72;
+  color: var(--muted);
+}
+
 .coord-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
