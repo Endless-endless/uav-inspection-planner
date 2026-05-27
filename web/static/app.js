@@ -171,16 +171,16 @@ function updateSpacingControlsVisibility() {
   const storeImage = window.MissionStore?.isImageSource?.() === true;
   const hideSpacing = imageMode || storeImage;
 
-  const spacingField = $("spacingInput")?.closest(".field");
-  const planningField = $("planningSpacingInput")?.closest(".field");
+  const spacingField = $("spacingFieldWrap") || $("spacingInput")?.closest(".field");
+  const planningField = $("planningSpacingFieldWrap") || $("planningSpacingInput")?.closest(".field");
   if (spacingField) spacingField.classList.toggle("hidden", hideSpacing);
   if (planningField) planningField.classList.toggle("hidden", hideSpacing);
 
   const replanHint = $("replanHint");
   if (replanHint && hideSpacing) {
-    replanHint.textContent = "保留图像巡检点 · 仅重排路径";
+    replanHint.textContent = "仅重建 connect 段；保留图像巡检点与 ID。";
   } else if (replanHint) {
-    replanHint.textContent = "调整起终点后重新规划路径";
+    replanHint.textContent = "调整起终点后重规划；spacing 模式下可配合「重规划采样间距」。";
   }
 }
 
@@ -209,14 +209,15 @@ function applyPipelineUi() {
       pl.innerHTML = '<option value="legacy" selected>legacy</option>';
       pl.disabled = true;
     }
-    if (sp) sp.disabled = true;
+    const hideSpacing = pointSource === "image";
+    if (sp) sp.disabled = hideSpacing;
     if (mm) {
       mm.innerHTML = `
       <option value="image_overlay" selected>图像底图</option>
       <option value="topology_only">深色拓扑</option>`;
       mm.disabled = false;
     }
-    if ($("runBtn")) $("runBtn").textContent = "加载巡检任务";
+    if ($("runBtn")) $("runBtn").textContent = "生成任务";
     forceBtn?.classList.remove("hidden");
   } else {
     if (pointSourceSel) pointSourceSel.disabled = true;
@@ -248,7 +249,7 @@ function applyPipelineUi() {
       <option value="topology_only" selected>深色拓扑</option>
       <option value="image_overlay">实验视图</option>`;
     }
-    if ($("runBtn")) $("runBtn").textContent = "加载巡检任务";
+    if ($("runBtn")) $("runBtn").textContent = "生成任务";
   }
   applyLayerDefaultsForPipeline();
   updateMapModeHint();
@@ -281,6 +282,10 @@ function readUiToState() {
     parseInt($("predictionWindowSelect")?.value || "10", 10) || 10
   );
   state.dynamicWeather.autoPredictiveReplan = $("autoPredictiveReplanToggle")?.checked !== false;
+  state.dynamicWeather.replanCooldownSec = Math.max(
+    3,
+    parseInt($("replanCooldownSelect")?.value || "10", 10) || 10
+  );
 }
 
 function syncStateToUi() {
@@ -297,6 +302,7 @@ function syncStateToUi() {
   if ($("adaptiveRiskThresholdInput")) $("adaptiveRiskThresholdInput").value = String(state.dynamicWeather.riskThreshold);
   if ($("predictionWindowSelect")) $("predictionWindowSelect").value = String(state.dynamicWeather.predictionWindow);
   if ($("autoPredictiveReplanToggle")) $("autoPredictiveReplanToggle").checked = state.dynamicWeather.autoPredictiveReplan;
+  if ($("replanCooldownSelect")) $("replanCooldownSelect").value = String(state.dynamicWeather.replanCooldownSec || 10);
 }
 
 function applyLayerDefaultsForPipeline() {
@@ -496,6 +502,46 @@ const PHASE_LABELS = {
   finished: "已完成",
 };
 
+function updateMissionStatusHud() {
+  const phase = window.AppPhaseManager?.getPhase?.() || window.AppPhase?.IDLE || "idle";
+  const flash = state.dynamicWeather.adaptiveFlash;
+  const risk = Number(state.dynamicWeather.predictedRisk || 0);
+  const th = Number(state.dynamicWeather.riskThreshold || 0.72);
+
+  let label = "NORMAL";
+  let mod = "normal";
+  if (phase === "replanning") {
+    label = "REPLANNING";
+    mod = "replan";
+  } else if (flash) {
+    label = "REROUTING";
+    mod = "reroute";
+  } else if (phase === "adaptive_warning" || risk > th) {
+    label = "WEATHER ALERT";
+    mod = "alert";
+  } else if (risk > th * 0.55) {
+    label = "WARNING";
+    mod = "warn";
+  }
+
+  const applyHud = (rootId, textId) => {
+    const el = $(rootId);
+    const tEl = $(textId);
+    if (!el || !tEl) return;
+    el.classList.remove(
+      "mission-status-hud--normal",
+      "mission-status-hud--warn",
+      "mission-status-hud--alert",
+      "mission-status-hud--reroute",
+      "mission-status-hud--replan"
+    );
+    el.classList.add(`mission-status-hud--${mod}`);
+    tEl.textContent = label;
+  };
+  applyHud("missionStatusHud", "missionStatusHudText");
+  applyHud("missionStatusHudFs", "missionStatusHudTextFs");
+}
+
 function renderSystemStatus() {
   const phase = window.AppPhaseManager?.getPhase?.() || window.AppPhase?.IDLE || "idle";
   const phaseText = PHASE_LABELS[phase] || "待命";
@@ -533,6 +579,11 @@ function renderSystemStatus() {
   }
   if ($("sysCurrentPoint")) $("sysCurrentPoint").textContent = pointText;
   if ($("sysCurrentSegment")) $("sysCurrentSegment").textContent = segmentText;
+  if ($("playbackConsoleState")) $("playbackConsoleState").textContent = phaseText;
+  const rk = formatRiskTier(state.dynamicWeather.predictedRisk);
+  if ($("inspectCardRisk")) $("inspectCardRisk").textContent = rk;
+  if ($("inspectCardRiskFs")) $("inspectCardRiskFs").textContent = rk;
+  updateMissionStatusHud();
 }
 
 window.renderSystemStatus = renderSystemStatus;
@@ -569,32 +620,63 @@ function formatMetricNumber(value) {
   return String(value).replace(/m\/s|m|%|px/gi, "").trim();
 }
 
+function formatRiskTier(riskVal) {
+  const r = Math.max(0, Number(riskVal || 0));
+  if (r >= 0.85) return "极高";
+  if (r >= 0.65) return "高";
+  if (r >= 0.45) return "中";
+  if (r >= 0.2) return "低";
+  return "正常";
+}
+
 function renderStats(statistics) {
   const s = statistics || {};
-  const visual = typeof window.getPlaybackVisualState === "function"
-    ? window.getPlaybackVisualState()
-    : null;
-  const pct = visual?.timelineLength
-    ? Math.min(100, Math.round((visual.timelineIndex / visual.timelineLength) * 100))
-    : null;
-  const telem = visual?.telemetry || {};
-  const host = $("statCards");
-  if (!host) return;
-  const items = [
+  const phase = window.AppPhaseManager?.getPhase?.() || window.AppPhase?.IDLE || "idle";
+  const phaseText = (PHASE_LABELS && PHASE_LABELS[phase]) || phase;
+  const riskVal = Number(state.dynamicWeather.predictedRisk ?? 0);
+  const wp = s.weather_penalty_total;
+  const wpStr = wp != null && wp !== "" && Number.isFinite(Number(wp)) ? Number(wp).toFixed(2) : "—";
+
+  const primary = $("statCardsPrimary");
+  const secondary = $("statCardsSecondary");
+  const itemsPrimary = [
     ["total_length", "总长度", s.total_length, " px"],
     ["num_inspection_points", "巡检点数", s.num_inspection_points, ""],
-    ["predicted_risk", "天气风险", Number(state.dynamicWeather.predictedRisk ?? 0).toFixed(2), ""],
-    ["progress", "当前进度", pct != null ? pct : "—", pct != null ? "%" : ""],
-    ["speed", "当前速度", formatMetricNumber(telem.speed), telem.speed ? " m/s" : ""],
-    ["altitude", "当前高度", formatMetricNumber(telem.altitude), telem.altitude ? " m" : ""],
+    ["phase", "任务状态", phaseText, ""],
+    ["predicted_risk", "天气风险", riskVal.toFixed(2), ""],
   ];
-  host.innerHTML = items
-    .map(
-      ([, label, val, unit]) => `
+  if (primary) {
+    primary.innerHTML = itemsPrimary
+      .map(
+        ([, label, val, unit]) => `
     <div class="card"><div class="label">${label}</div>
     <div class="value">${val ?? "—"}${unit}</div></div>`
-    )
-    .join("");
+      )
+      .join("");
+  }
+
+  const cr = s.connect_ratio != null ? Number(s.connect_ratio) : null;
+  const connectPct = cr != null && Number.isFinite(cr) ? (cr <= 1 ? cr * 100 : cr) : null;
+  const itemsSecondary = [
+    ["connect_ratio", "连接占比", connectPct != null ? connectPct.toFixed(1) : "—", connectPct != null ? "%" : ""],
+    ["risky_distance", "高风险穿越", s.risky_distance ?? "—", s.risky_distance != null ? " px" : ""],
+    ["pred_samples", "预测采样点", state.dynamicWeather.predictedAffectedSegments ?? 0, ""],
+    ["weather_penalty", "天气惩罚", wpStr, ""],
+    ["reroute", "预测重规划", state.dynamicWeather.predictiveReplanCount ?? 0, " 次"],
+  ];
+  if (secondary) {
+    secondary.innerHTML = itemsSecondary
+      .map(
+        ([, label, val, unit]) => `
+    <div class="card"><div class="label">${label}</div>
+    <div class="value">${val ?? "—"}${unit}</div></div>`
+      )
+      .join("");
+  }
+
+  const legacyHost = $("statCards");
+  if (legacyHost) legacyHost.innerHTML = "";
+
   renderAdvancedStats(s);
   renderSystemStatus();
 }
@@ -1300,7 +1382,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (window.MissionStore?.subscribePhase) {
       MissionStore.subscribePhase(() => renderSystemStatus());
     }
-    setStatus("就绪 · 点击「加载巡检任务」开始", "");
+    setStatus("就绪 · 点击「生成任务」开始", "");
   } catch (e) {
     setStatus(`初始化失败: ${e.message}`, "err");
   }
@@ -1383,6 +1465,12 @@ document.addEventListener("DOMContentLoaded", async () => {
     pushAdaptiveEvent(
       state.dynamicWeather.autoPredictiveReplan ? "预测式自动重规划已开启" : "预测式自动重规划已关闭"
     );
+  });
+  $("replanCooldownSelect")?.addEventListener("change", () => {
+    readUiToState();
+    if (typeof pushAdaptiveEvent === "function") {
+      pushAdaptiveEvent(`重规划冷却更新为 ${state.dynamicWeather.replanCooldownSec}s`);
+    }
   });
 
   $("pickStartBtn")?.addEventListener("click", () => {

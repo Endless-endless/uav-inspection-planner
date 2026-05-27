@@ -10,12 +10,34 @@ function getWeatherZones(result) {
 function weatherColor(type, severity = 0.5) {
   const t = String(type || "").toLowerCase();
   const sev = Math.max(0, Math.min(1, Number(severity || 0)));
-  const alpha = (0.12 + sev * 0.30).toFixed(3);
-  const glowAlpha = (0.18 + sev * 0.55).toFixed(3);
-  if (t === "wind") return { fill: `rgba(34, 211, 238, ${alpha})`, line: `rgba(34, 211, 238, ${glowAlpha})`, label: "强风区" };
-  if (t === "rain") return { fill: `rgba(59, 130, 246, ${alpha})`, line: `rgba(59, 130, 246, ${glowAlpha})`, label: "降雨区" };
-  if (t === "visibility") return { fill: `rgba(168, 85, 247, ${alpha})`, line: `rgba(168, 85, 247, ${glowAlpha})`, label: "低能见度" };
-  return { fill: `rgba(239, 68, 68, ${alpha})`, line: `rgba(239, 68, 68, ${glowAlpha})`, label: "风险区域" };
+  const alpha = (0.07 + sev * 0.16).toFixed(3);
+  const glowAlpha = (0.1 + sev * 0.22).toFixed(3);
+  if (t === "wind") {
+    return {
+      fill: `rgba(56, 132, 190, ${alpha})`,
+      line: `rgba(125, 211, 252, ${glowAlpha})`,
+      label: "强风",
+    };
+  }
+  if (t === "rain") {
+    return {
+      fill: `rgba(30, 58, 138, ${alpha})`,
+      line: `rgba(96, 165, 250, ${glowAlpha})`,
+      label: "降雨",
+    };
+  }
+  if (t === "visibility") {
+    return {
+      fill: `rgba(76, 29, 149, ${alpha})`,
+      line: `rgba(167, 139, 250, ${glowAlpha})`,
+      label: "低能见度",
+    };
+  }
+  return {
+    fill: `rgba(180, 83, 9, ${alpha})`,
+    line: `rgba(253, 186, 116, ${glowAlpha})`,
+    label: "风险",
+  };
 }
 
 function buildWeatherZoneTraces(result) {
@@ -42,7 +64,7 @@ function buildWeatherZoneTraces(result) {
       xs.push(cx + radius * Math.cos(a));
       ys.push(cy + radius * Math.sin(a));
     }
-    const lineW = 1.2 + Math.max(0, Math.min(1, sev)) * 2.4;
+    const lineW = 0.9 + Math.max(0, Math.min(1, sev)) * 1.6;
     traces.push({
       x: xs,
       y: ys,
@@ -65,7 +87,7 @@ function buildWeatherZoneTraces(result) {
       mode: "text",
       name: "天气标签",
       text: lt,
-      textfont: { size: 10, color: "#e2e8f0" },
+      textfont: { size: 9, color: "#94a3b8" },
       textposition: "middle center",
       hoverinfo: "skip",
       showlegend: false,
@@ -294,6 +316,7 @@ function resetDynamicWeather(result) {
   state.dynamicWeather.events = [];
   setAdaptiveStatus("天气监测");
   pushAdaptiveEvent("动态天气监测初始化");
+  updateWeatherDynamicSummary();
   startDynamicWeatherLoop();
 }
 
@@ -331,6 +354,29 @@ function updateDynamicWeatherZones(dt) {
       state.dynamicWeather.movementLogged = true;
     }
   }
+  updateWeatherDynamicSummary();
+}
+
+function updateWeatherDynamicSummary() {
+  const el = document.getElementById("weatherDynamicSummary");
+  if (!el) return;
+  const zs = state.dynamicWeather.zones;
+  if (!zs?.length) {
+    el.textContent = "动态天气待命";
+    return;
+  }
+  let moving = 0;
+  let sev = 0;
+  zs.forEach((z) => {
+    sev += Number(z.severity || 0);
+    if (
+      z.dynamic
+      && (Math.abs(Number(z.velocity?.[0] || 0)) + Math.abs(Number(z.velocity?.[1] || 0)) > 0.05)
+    ) {
+      moving += 1;
+    }
+  });
+  el.textContent = `区域 ${zs.length} · 漂移 ${moving} · 平均强度 ${(sev / zs.length).toFixed(2)}`;
 }
 
 function pointZoneRisk(point, zone) {
@@ -643,7 +689,7 @@ function maybeTriggerAdaptiveReplan() {
   if (prediction?.predicted_risk > threshold) {
     const label = prediction.zoneLabel || "风险区";
     const eta = Math.max(1, Math.round(prediction.time_to_risk ?? prediction.prediction_window ?? 10));
-    setPredictiveWarningHud(`⚠ 预计 ${eta}s 后进入${label}`);
+    setPredictiveWarningHud(`风险预警 · 预计 ${eta}s 后进入${label}`);
     setAdaptiveStatus("预测风险分析", "warning");
     const now = performance.now();
     const warnCooldownMs = 5000;
