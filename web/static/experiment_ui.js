@@ -220,6 +220,8 @@ async function runWeatherExperiment() {
     renderMeta(mission?.metadata || {});
     renderExperimentResult();
     refreshMapView();
+    const advanced = $("advancedExperimentPanel");
+    if (advanced) advanced.open = true;
 
     const bypassText = metrics.high_risk_bypass ? "已触发高风险绕行" : "未触发明显高风险绕行";
     setStatus(

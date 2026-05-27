@@ -9,13 +9,26 @@ from __future__ import annotations
 
 import copy
 import math
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 from weather.weather_cost import compute_edge_weather_penalty
 
-from planner.mission_result_builder import is_image_inspection_point, is_image_inspection_source
+from core.topo import TopoGraph
+from core.topo_task import EdgeTask
+from planner.mission_result_builder import (
+    is_image_inspection_point,
+    is_image_inspection_source,
+    normalize_inspection_point_source,
+)
+from planner.topo_dijkstra import generate_connection_segment_with_planner
 
 IMAGE_WIDTH = 916
 IMAGE_HEIGHT = 960
+
+# Degenerate connect warning (two-point geometry = likely straight graph fallback)
+STRAIGHT_FALLBACK_WARN_PX = 150.0
 
 Point = Tuple[float, float]
 
@@ -132,7 +145,7 @@ def _slice_polyline(polyline: List[Point], s0: float, s1: float) -> List[Point]:
 
 
 def _interpolate_line(p0: Point, p1: Point, step: float = 5.0) -> List[Point]:
-    """Dense connect polyline for display (similar to legacy mission connects)."""
+    """Dense Euclidean polyline (legacy fallback when TopoGraph is unavailable)."""
     total = _dist(p0, p1)
     if total < 1e-6:
         return [p0, p1]
@@ -142,6 +155,137 @@ def _interpolate_line(p0: Point, p1: Point, step: float = 5.0) -> List[Point]:
         t = i / (n - 1)
         out.append((p0[0] + t * (p1[0] - p0[0]), p0[1] + t * (p1[1] - p0[1])))
     out[-1] = (float(p1[0]), float(p1[1]))
+    return out
+
+
+def _warn_straight_fallback(geometry: List[Point], role: str) -> None:
+    if len(geometry) == 2:
+        d = _dist(geometry[0], geometry[1])
+        if d > STRAIGHT_FALLBACK_WARN_PX:
+            print(
+                f"[WARN] straight fallback (role={role}, points=2, dist={d:.1f}px)"
+            )
+
+
+def _weather_cost_config_for_dijkstra(
+    weather_context: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not weather_context or not weather_context.get("enabled"):
+        return None
+    return {
+        "length_field": "len2d",
+        "weather": {
+            "enabled": True,
+            "weather_zones": weather_context.get("weather_zones") or [],
+            "type_weights": weather_context.get("type_weights"),
+            "weather_weight": float(weather_context.get("weather_weight", 1.0)),
+        },
+    }
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _abs_map_path(project_root: Path, rel: str) -> str:
+    p = Path(str(rel).replace("\\", "/"))
+    if p.is_absolute():
+        return str(p.resolve())
+    return str((project_root / p).resolve())
+
+
+def _try_load_topo_for_replan(
+    project_root: Path,
+    image_rel: str,
+    inspection_point_source: str,
+    inspection_spacing: float,
+) -> Tuple[Optional[TopoGraph], Dict[str, EdgeTask]]:
+    """
+    Rebuild TopoGraph + EdgeTask map from the same PNG pipeline as the image dashboard.
+    Used so connect segments follow graph geometry (Dijkstra) instead of Euclidean chords.
+    """
+    try:
+        from planner.powerline_planner_v3_final import PowerlinePlannerV3
+    except Exception as exc:  # pragma: no cover - import guard
+        print(f"[WARN] replan topo: cannot import PowerlinePlannerV3: {exc}")
+        return None, {}
+
+    abs_img = _abs_map_path(project_root, image_rel)
+    try:
+        planner = PowerlinePlannerV3(image_path=abs_img, flight_height=30, weather_scene="calm")
+        planner.inspection_point_source = inspection_point_source
+        planner.step1_extract_redline_hsv()
+        planner.step2_fix_breaks()
+        planner.step3_skeletonize()
+        planner.step4_extract_independent_lines()
+        if inspection_point_source == "image":
+            planner.step5_detect_image_inspection_points()
+        else:
+            planner.step5_generate_line_inspection_points(spacing=inspection_spacing)
+
+        terrain = np.zeros((planner.height, planner.width), dtype=np.float32)
+        if inspection_point_source == "image":
+            planner.step6_smooth_terrain(terrain)
+        else:
+            planner.step6_map_line_points_to_3d(terrain)
+
+        planner.step7_5_build_topo()
+        if inspection_point_source == "image":
+            planner.step5_finalize_image_inspection_points()
+            planner._map_existing_points_to_3d()
+
+        edge_tasks = planner.step8_5_build_edge_tasks() or []
+        edge_map = {et.edge_id: et for et in edge_tasks}
+        tg = planner.topo_graph
+        if tg is None or not edge_map:
+            return None, {}
+        return tg, edge_map
+    except Exception as exc:
+        print(f"[WARN] replan topo rebuild failed ({image_rel}): {exc}")
+        return None, {}
+
+
+def _connect_geometry_topo(
+    point_a: Point,
+    point_b: Point,
+    *,
+    role: str,
+    from_edge_id: Optional[str],
+    to_edge_id: Optional[str],
+    topo_graph: Optional[TopoGraph],
+    edge_task_map: Dict[str, EdgeTask],
+    cost_config: Optional[Dict[str, Any]],
+) -> List[Point]:
+    """
+    Connect along TopoGraph via Dijkstra (planner/topo_dijkstra.py).
+    Falls back to dense Euclidean interpolation only if topo is missing or planner errors.
+    """
+    if topo_graph is not None and edge_task_map:
+        try:
+            geom, _ = generate_connection_segment_with_planner(
+                point_a,
+                point_b,
+                topo_graph,
+                edge_task_map,
+                connect_planner="dijkstra",
+                cost_config=cost_config,
+                use_proximity_bfs=False,
+                from_edge_id=from_edge_id,
+                to_edge_id=to_edge_id,
+            )
+            out = [(float(p[0]), float(p[1])) for p in geom]
+            _warn_straight_fallback(out, role)
+            return out
+        except Exception as exc:
+            print(f"[WARN] topo Dijkstra connect failed role={role}: {exc}")
+
+    out = _interpolate_line(point_a, point_b)
+    if len(out) == 2 and _dist(out[0], out[1]) > STRAIGHT_FALLBACK_WARN_PX:
+        d = _dist(out[0], out[1])
+        print(
+            f"[WARN] straight fallback (role={role}, points=2, dist={d:.1f}px, "
+            "euclidean_fallback)"
+        )
     return out
 
 
@@ -550,13 +694,49 @@ def build_start_end_replan_mission(
         visit_order, tasks, start, weather_context=weather_context
     )
 
+    ctx_pre = mission_context or {}
+    base_meta_early = base_mission.get("metadata") or {}
+    image_rel = str(
+        ctx_pre.get("image_path")
+        or base_meta_early.get("map_image")
+        or "data/test.png"
+    ).replace("\\", "/")
+    src_for_topo = normalize_inspection_point_source(
+        ctx_pre.get("inspection_point_source")
+        or base_meta_early.get("inspection_point_source")
+        or "spacing"
+    )
+    topo_graph, edge_task_map = _try_load_topo_for_replan(
+        _project_root(),
+        image_rel,
+        src_for_topo,
+        spacing,
+    )
+    cost_cfg = _weather_cost_config_for_dijkstra(weather_context)
+    topo_reload_ok = topo_graph is not None and bool(edge_task_map)
+    missing_topo_edges = [eid for eid in visit_order if eid not in edge_task_map]
+    if topo_reload_ok and missing_topo_edges:
+        print(
+            f"[WARN] replan: baseline visit_order has edges not in rebuilt topo "
+            f"(count={len(missing_topo_edges)}): {missing_topo_edges[:8]}"
+        )
+
     segments_out: List[Dict[str, Any]] = []
     directions: Dict[str, bool] = {}
     seg_idx = 0
     current: Point = start
     prev_edge: Optional[str] = None
 
-    connect_start_geom = _interpolate_line(start, first_entry)
+    connect_start_geom = _connect_geometry_topo(
+        start,
+        first_entry,
+        role="from_start",
+        from_edge_id=None,
+        to_edge_id=visit_order[0],
+        topo_graph=topo_graph,
+        edge_task_map=edge_task_map,
+        cost_config=cost_cfg,
+    )
     segments_out.append(
         _make_connect_segment(
             seg_idx,
@@ -585,7 +765,16 @@ def build_start_end_replan_mission(
         exit_pt: Point = inspect_geom[-1]
 
         if i > 0 and _dist(current, entry) > 0.5:
-            connect_geom = _interpolate_line(current, entry)
+            connect_geom = _connect_geometry_topo(
+                current,
+                entry,
+                role="between_edges",
+                from_edge_id=prev_edge,
+                to_edge_id=eid,
+                topo_graph=topo_graph,
+                edge_task_map=edge_task_map,
+                cost_config=cost_cfg,
+            )
             segments_out.append(
                 _make_connect_segment(
                     seg_idx,
@@ -611,8 +800,17 @@ def build_start_end_replan_mission(
         current = exit_pt
         prev_edge = eid
 
-    connect_end_geom = _interpolate_line(current, end)
-    end_connected = _dist(connect_end_geom[-1], end) < 1.0
+    connect_end_geom = _connect_geometry_topo(
+        current,
+        end,
+        role="to_end",
+        from_edge_id=prev_edge,
+        to_edge_id=None,
+        topo_graph=topo_graph,
+        edge_task_map=edge_task_map,
+        cost_config=cost_cfg,
+    )
+    end_connected = _dist(connect_end_geom[-1], end) < 2.0
     segments_out.append(
         _make_connect_segment(
             seg_idx,
@@ -708,12 +906,17 @@ def build_start_end_replan_mission(
             "planner": "start_end_replan",
             "start": [start[0], start[1]],
             "end": [end[0], end[1]],
-            "end_connected": True,
+            "end_connected": end_connected,
             "planning_spacing": spacing,
             "planning_point_count": len(planning_points),
             "inspection_point_source": resolved_source,
             "weather_aware": bool((weather_context or {}).get("enabled")),
             "weather_weight": float((weather_context or {}).get("weather_weight", 1.0)),
+            "connect_planner": "dijkstra",
+            "topo_context_reload": topo_reload_ok,
+            "topo_reload_image": image_rel,
+            "topo_reload_source": src_for_topo,
+            "topo_missing_edges": missing_topo_edges[:32],
         },
     }
     if is_image_inspection_source(resolved_source):

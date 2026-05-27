@@ -150,3 +150,18 @@ async function runReplan() {
     $("runReplanBtn").disabled = false;
   }
 }
+
+document.addEventListener("DOMContentLoaded", () => {
+  $("clearReplanBtn")?.addEventListener("click", () => {
+    ["replanStartX", "replanStartY", "replanEndX", "replanEndY"].forEach((id) => {
+      const el = $(id);
+      if (el) el.value = "";
+    });
+    state.pickPhase = null;
+    updatePickHint();
+    if (getCurrentMission() && window.MissionStore) {
+      MissionStore.updateMarkers({});
+    }
+    refreshMapView?.();
+  });
+});

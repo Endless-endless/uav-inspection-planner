@@ -567,11 +567,13 @@ function adaptiveStatusText(status) {
 function setAdaptiveStatus(status, tone = "normal") {
   state.dynamicWeather.status = adaptiveStatusText(status);
   const el = $("adaptiveStatus");
-  if (!el) return;
-  el.textContent = state.dynamicWeather.status;
-  el.classList.remove("is-warning", "is-reroute");
-  if (tone === "warning") el.classList.add("is-warning");
-  if (tone === "reroute") el.classList.add("is-reroute");
+  if (el) {
+    el.textContent = state.dynamicWeather.status;
+    el.classList.remove("is-warning", "is-reroute");
+    if (tone === "warning") el.classList.add("is-warning");
+    if (tone === "reroute") el.classList.add("is-reroute");
+  }
+  if (typeof window.renderSystemStatus === "function") window.renderSystemStatus();
 }
 
 function pushAdaptiveEvent(text) {

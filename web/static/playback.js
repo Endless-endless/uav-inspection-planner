@@ -469,12 +469,21 @@
     });
   }
 
+  function hudDisplayValue(raw, kind) {
+    if (raw == null || raw === "" || raw === "--") return "--";
+    const text = String(raw);
+    if (kind === "speed") return text.replace(/m\/s/gi, "").trim();
+    if (kind === "altitude") return text.replace(/m$/i, "").trim();
+    if (kind === "battery") return text.replace(/%$/i, "").trim();
+    return text;
+  }
+
   function renderTelemetry() {
     setForBoth("inspectHudFps", PLAYBACK.telemetry.fps);
     setForBoth("inspectHudSignal", PLAYBACK.telemetry.signal);
-    setForBoth("inspectHudBattery", PLAYBACK.telemetry.battery);
-    setForBoth("inspectHudAlt", PLAYBACK.telemetry.altitude);
-    setForBoth("inspectHudSpeed", PLAYBACK.telemetry.speed);
+    setForBoth("inspectHudBattery", hudDisplayValue(PLAYBACK.telemetry.battery, "battery"));
+    setForBoth("inspectHudAlt", hudDisplayValue(PLAYBACK.telemetry.altitude, "altitude"));
+    setForBoth("inspectHudSpeed", hudDisplayValue(PLAYBACK.telemetry.speed, "speed"));
 
     setForBoth("inspectTelemSignal", PLAYBACK.telemetry.signal);
     setForBoth("inspectTelemBattery", PLAYBACK.telemetry.battery);
@@ -853,6 +862,8 @@
       timelineIndex: PLAYBACK.index,
       timelineLength: PLAYBACK.timeline.length,
       playbackSpeed: PLAYBACK.speed || 1,
+      telemetry: PLAYBACK.telemetry ? { ...PLAYBACK.telemetry } : null,
+      currentEvent: PLAYBACK.timeline[PLAYBACK.index] || null,
     };
   };
 
@@ -956,18 +967,39 @@
     $("playbackPauseBtn")?.toggleAttribute("disabled", !running);
     $("playbackResumeBtn")?.toggleAttribute("disabled", !paused);
     $("playbackResetBtn")?.toggleAttribute("disabled", PLAYBACK.status === "idle" && !hasTimeline);
+    const pct = hasTimeline
+      ? Math.min(100, Math.round((PLAYBACK.index / PLAYBACK.timeline.length) * 100))
+      : 0;
+    const stateText = STATE_TEXT[PLAYBACK.missionState] || "执行中";
+    const ev = PLAYBACK.timeline[PLAYBACK.index];
+    const segLabel = ev?.segment_id
+      ? `区段 ${String(ev.segment_id).replace(/^seg_/, "")}`
+      : ev?.type === "inspect"
+        ? "巡检点"
+        : "区段 —";
+    if ($("timelinePercent")) $("timelinePercent").textContent = `${pct}%`;
+    if ($("timelineSegment")) $("timelineSegment").textContent = segLabel;
+    if ($("timelineFill")) $("timelineFill").style.width = `${pct}%`;
+    if ($("timelineScrubber")) {
+      $("timelineScrubber").value = String(pct);
+      $("timelineScrubber").max = "100";
+    }
+    if ($("headerSpeedBadge")) {
+      $("headerSpeedBadge").textContent = `${PLAYBACK.speed || 1}x`;
+    }
     const prog = $("playbackProgress");
     if (!prog) return;
     if (!hasTimeline) {
       prog.textContent = "待命";
+      if (typeof window.renderSystemStatus === "function") window.renderSystemStatus();
       return;
     }
-    const pct = Math.min(
-      100,
-      Math.round((PLAYBACK.index / PLAYBACK.timeline.length) * 100)
-    );
-    const stateText = STATE_TEXT[PLAYBACK.missionState] || "执行中";
-    prog.textContent = `${pct}% · ${PLAYBACK.index}/${PLAYBACK.timeline.length} · ${stateText}`;
+    prog.textContent = `${pct}% · ${stateText}`;
+    if (typeof window.renderSystemStatus === "function") window.renderSystemStatus();
+    if (typeof window.renderStats === "function") {
+      const mission = window.MissionStore?.getCurrentMission?.() || window.state?.lastResult;
+      if (mission?.statistics) window.renderStats(mission.statistics);
+    }
   }
 
   function scheduleNext(delayMs) {

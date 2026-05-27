@@ -176,18 +176,20 @@ function updateSpacingControlsVisibility() {
   if (spacingField) spacingField.classList.toggle("hidden", hideSpacing);
   if (planningField) planningField.classList.toggle("hidden", hideSpacing);
 
-  const replanHint = document.querySelector("#replanPanel .subpanel-hint");
+  const replanHint = $("replanHint");
   if (replanHint && hideSpacing) {
-    replanHint.textContent = "图像管线 · 保留图像巡检点 · 仅重排路径";
+    replanHint.textContent = "保留图像巡检点 · 仅重排路径";
   } else if (replanHint) {
-    replanHint.textContent = "图像管线 · 全局重排序 · 端点冗余规避";
+    replanHint.textContent = "调整起终点后重新规划路径";
   }
 }
 
 function applyPipelineUi() {
   const image = isImagePipeline();
   const pointSource = getInspectionPointSource();
-  $("pipelineBadge").textContent = image ? "图像管线" : "统一 JSON";
+  if ($("pipelineBadge")) {
+    $("pipelineBadge").textContent = image ? "图像任务" : "统一任务";
+  }
 
   const ds = $("datasetSelect");
   const pl = $("plannerSelect");
@@ -198,41 +200,55 @@ function applyPipelineUi() {
 
   if (image) {
     const imagePath = getImagePathForSource(pointSource);
-    ds.innerHTML = `<option value="${imagePath}">${imagePath}</option>`;
-    ds.disabled = true;
+    if (ds) {
+      ds.innerHTML = `<option value="${imagePath}">${imagePath}</option>`;
+      ds.disabled = true;
+    }
     if (pointSourceSel) pointSourceSel.disabled = false;
-    pl.innerHTML = '<option value="legacy">传统任务模式</option>';
-    pl.disabled = true;
-    sp.disabled = true;
-    mm.innerHTML = `<option value="image_overlay" selected>图像叠加（${imagePath}）</option>`;
-    mm.disabled = true;
-    $("runBtn").textContent = pointSource === "image" ? "生成/加载图像巡检点任务" : "生成/加载图像主线任务";
-    forceBtn.classList.remove("hidden");
+    if (pl) {
+      pl.innerHTML = '<option value="legacy" selected>legacy</option>';
+      pl.disabled = true;
+    }
+    if (sp) sp.disabled = true;
+    if (mm) {
+      mm.innerHTML = `
+      <option value="image_overlay" selected>图像底图</option>
+      <option value="topology_only">深色拓扑</option>`;
+      mm.disabled = false;
+    }
+    if ($("runBtn")) $("runBtn").textContent = "加载巡检任务";
+    forceBtn?.classList.remove("hidden");
   } else {
     if (pointSourceSel) pointSourceSel.disabled = true;
-    forceBtn.classList.add("hidden");
-    $("dlLegacyHtml").classList.add("hidden");
-    ds.disabled = false;
-    ds.innerHTML = "";
-    state.datasets.forEach((d) => {
-      const opt = document.createElement("option");
-      opt.value = d.path;
-      opt.textContent = d.label;
-      ds.appendChild(opt);
-    });
-    const topo = state.datasets.find((d) => d.id.includes("topo"));
-    if (topo) ds.value = topo.path;
-    pl.disabled = false;
-    pl.innerHTML = `
-      <option value="baseline">基线方案</option>
-      <option value="optimized">优化方案</option>
-      <option value="dijkstra">Dijkstra 最短路</option>`;
-    sp.disabled = false;
-    mm.disabled = false;
-    mm.innerHTML = `
-      <option value="topology_only" selected>仅拓扑</option>
-      <option value="image_overlay">样式化（无 test.png）</option>`;
-    $("runBtn").textContent = "运行统一管线规划";
+    forceBtn?.classList.add("hidden");
+    $("dlLegacyHtml")?.classList.add("hidden");
+    if (ds) {
+      ds.disabled = false;
+      ds.innerHTML = "";
+      state.datasets.forEach((d) => {
+        const opt = document.createElement("option");
+        opt.value = d.path;
+        opt.textContent = d.label;
+        ds.appendChild(opt);
+      });
+      const topo = state.datasets.find((d) => d.id.includes("topo"));
+      if (topo) ds.value = topo.path;
+    }
+    if (pl) {
+      pl.disabled = false;
+      pl.innerHTML = `
+      <option value="baseline">baseline</option>
+      <option value="optimized">optimized</option>
+      <option value="dijkstra">dijkstra</option>`;
+    }
+    if (sp) sp.disabled = false;
+    if (mm) {
+      mm.disabled = false;
+      mm.innerHTML = `
+      <option value="topology_only" selected>深色拓扑</option>
+      <option value="image_overlay">实验视图</option>`;
+    }
+    if ($("runBtn")) $("runBtn").textContent = "加载巡检任务";
   }
   applyLayerDefaultsForPipeline();
   updateMapModeHint();
@@ -247,7 +263,11 @@ function readUiToState() {
   state.showInspect = $("toggleInspect")?.checked !== false;
   state.showConnect = $("toggleConnect")?.checked !== false;
   state.showWeatherLayer = $("toggleWeatherLayer")?.checked === true;
-  state.pointMode = $("pointModeSelect")?.value || "key";
+  if ($("togglePointsLayer")) {
+    state.pointMode = $("togglePointsLayer").checked ? "key" : "hidden";
+  } else {
+    state.pointMode = $("pointModeSelect")?.value || "key";
+  }
   state.weatherAware = $("weatherAwareToggle")?.checked === true;
   state.weatherWeight = Math.max(0, parseFloat($("weatherWeightInput")?.value || "1") || 1);
   state.experiment.overlay = $("experimentOverlayToggle")?.checked !== false;
@@ -268,6 +288,7 @@ function syncStateToUi() {
   if ($("toggleInspect")) $("toggleInspect").checked = state.showInspect;
   if ($("toggleConnect")) $("toggleConnect").checked = state.showConnect;
   if ($("toggleWeatherLayer")) $("toggleWeatherLayer").checked = state.showWeatherLayer;
+  if ($("togglePointsLayer")) $("togglePointsLayer").checked = state.pointMode !== "hidden";
   if ($("pointModeSelect")) $("pointModeSelect").value = state.pointMode;
   if ($("weatherAwareToggle")) $("weatherAwareToggle").checked = state.weatherAware;
   if ($("weatherWeightInput")) $("weatherWeightInput").value = String(state.weatherWeight);
@@ -280,7 +301,7 @@ function syncStateToUi() {
 
 function applyLayerDefaultsForPipeline() {
   if (isImagePipeline()) {
-    state.showBackground = false;
+    state.showBackground = getMapMode() === "image_overlay";
     state.pointMode = "key";
   } else {
     state.showBackground = false;
@@ -391,22 +412,23 @@ function refreshMapView() {
 }
 
 function setStatus(text, cls = "") {
-  $("statusBox").textContent = text;
-  $("statusBox").className = "status " + cls;
+  const box = $("statusBox");
+  if (!box) return;
+  box.textContent = text;
+  box.className = `status status-compact${cls ? ` ${cls}` : ""}`;
 }
 
 function updateMapModeHint() {
   const hint = $("mapModeHint");
   if (!hint) return;
   if (isImagePipeline()) {
-    const avail = state.imageMissionAvailable ? "任务已就绪" : "将自动生成任务";
-    hint.textContent = `图像主线 · ${avail} · 默认无底图`;
+    hint.textContent = state.imageMissionAvailable ? "任务已就绪" : "请先加载任务";
     $("mapPlot")?.classList.add("overlay-mode");
   } else {
     hint.textContent =
       getMapMode() === "topology_only"
-        ? "统一管线 · 拓扑自适应"
-        : "统一管线 · 无底图";
+        ? "深色拓扑视图"
+        : "实验视图";
     $("mapPlot")?.classList.remove("overlay-mode");
   }
 }
@@ -444,36 +466,16 @@ function updateDownloadLinks(outputFiles, pipeline) {
 }
 
 function renderMeta(metadata) {
-  const pipelineMap = {
-    image: "图像主线",
-    unified: "统一管线",
-  };
-  const plannerMap = {
-    baseline: "基线规划",
-    optimized: "全局优化规划",
-    dijkstra: "全局优化规划",
-    legacy: "全局优化规划",
-    start_end_replan: "全局优化规划",
-  };
-  const pipelineText = pipelineMap[metadata.pipeline] || "—";
-  const plannerText = plannerMap[metadata.planner] || "全局优化规划";
+  const box = $("metaBox");
+  if (!box) return;
   const lines = [
-    `管线: ${pipelineText}`,
-    `规划器: ${plannerText}`,
-    (metadata.inspection_point_source === "image")
-      ? "巡检点来源: 图像巡检点"
-      : metadata.inspection_point_source === "spacing"
-        ? "巡检点来源: 自动采样"
-        : null,
-    metadata.image_detection_stats?.merged_points != null
-      ? `图像检测: ${metadata.image_detection_stats.merged_points} 个 / 有效吸附 ${metadata.image_detection_stats.valid_snapped_points ?? "—"} 个`
+    metadata?.weather_mode === "on" ? "天气感知已开启" : "天气感知关闭",
+    state.dynamicWeather.predictiveReplanCount
+      ? `预测重规划 ${state.dynamicWeather.predictiveReplanCount} 次`
       : null,
-    metadata.map_image ? `输入图像: ${metadata.map_image}` : null,
-    metadata.planning_spacing != null ? `巡检点间距: ${metadata.planning_spacing}px` : null,
-    `天气感知: ${metadata.weather_mode === "on" ? "开启" : "关闭"}`,
-    metadata.weather_mode === "on" ? `天气权重: ${metadata.weather_weight ?? 1.0}` : null,
   ].filter(Boolean);
-  $("metaBox").innerHTML = lines.map((l) => `<div>${escapeHtml(l)}</div>`).join("");
+  box.innerHTML = lines.map((l) => `<div>${escapeHtml(l)}</div>`).join("");
+  renderSystemStatus();
 }
 
 function escapeHtml(s) {
@@ -483,37 +485,123 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;");
 }
 
-function renderStats(statistics) {
+const PHASE_LABELS = {
+  idle: "待命",
+  planning: "规划中",
+  mission_ready: "任务就绪",
+  playing: "巡检中",
+  paused: "已暂停",
+  replanning: "重规划中",
+  adaptive_warning: "风险预警",
+  finished: "已完成",
+};
+
+function renderSystemStatus() {
+  const phase = window.AppPhaseManager?.getPhase?.() || window.AppPhase?.IDLE || "idle";
+  const phaseText = PHASE_LABELS[phase] || "待命";
+  if ($("sysPhase")) $("sysPhase").textContent = phaseText;
+  if ($("missionPhaseBadge")) $("missionPhaseBadge").textContent = phaseText;
+
+  const weatherText = state.dynamicWeather.status || "正常";
+  if ($("sysWeather")) $("sysWeather").textContent = weatherText;
+
+  let replanText = "未触发";
+  if (state.dynamicWeather.replanTriggered) replanText = "已触发绕行";
+  else if (MissionStore?.current?.last_update_kind === "server_replan") replanText = "已完成重规划";
+  if ($("sysReplan")) $("sysReplan").textContent = replanText;
+
+  const visual = typeof window.getPlaybackVisualState === "function"
+    ? window.getPlaybackVisualState()
+    : null;
+  const mission = getCurrentMission();
+  let pointText = "—";
+  let segmentText = "—";
+  if (visual?.currentPointId && mission?.inspection_points?.length) {
+    const pt = mission.inspection_points.find(
+      (p) => (p.id || p.point_id) === visual.currentPointId
+    );
+    if (pt) {
+      pointText = String(pt.point_id || pt.id || "—").replace(/^point_/, "巡检点 ");
+      if (pt.segment_id) {
+        segmentText = String(pt.segment_id).replace(/^seg_/, "区段 ");
+      }
+    }
+  }
+  const segLabel = $("timelineSegment")?.textContent;
+  if (segmentText === "—" && segLabel && !segLabel.includes("--")) {
+    segmentText = segLabel.replace(/^区段\s*/, "区段 ");
+  }
+  if ($("sysCurrentPoint")) $("sysCurrentPoint").textContent = pointText;
+  if ($("sysCurrentSegment")) $("sysCurrentSegment").textContent = segmentText;
+}
+
+window.renderSystemStatus = renderSystemStatus;
+
+function renderAdvancedStats(statistics) {
+  const host = $("advancedStatCards");
+  if (!host) return;
+  const advancedOpen = document.getElementById("advancedExperimentPanel")?.open;
+  if (!advancedOpen && !state.experiment.active) {
+    host.classList.add("hidden");
+    host.innerHTML = "";
+    return;
+  }
   const s = statistics || {};
   const items = [
-    ["total_length", "总长度", s.total_length, " px"],
-    ["inspect_length", "巡检长度", s.inspect_length, " px"],
-    ["connect_length", "连接长度", s.connect_length, " px"],
     ["connect_ratio", "连接占比", ((s.connect_ratio || 0) * 100).toFixed(1), "%"],
-    ["num_segments", "区段数", s.num_segments, ""],
-    ["num_inspection_points", "巡检点数", s.num_inspection_points, ""],
-    ["weather_penalty_total", "天气惩罚", s.weather_penalty_total ?? 0, ""],
     ["total_cost", "实际总代价", s.total_cost ?? s.total_length ?? 0, ""],
-    ["weather_affected_edges", "受天气影响区段", s.weather_affected_edges ?? 0, ""],
-    ["risky_distance", "高风险穿越长度", s.risky_distance ?? 0, " px"],
-    ["weather_mode", "天气感知", s.weather_mode === "on" ? "开启" : "关闭", ""],
-    ["predicted_risk", "预测风险", state.dynamicWeather.predictedRisk ?? 0, ""],
-    ["prediction_window", "预测窗口", `${state.dynamicWeather.predictionWindow ?? 10}s`, ""],
     ["predicted_affected_segments", "预测影响采样点", state.dynamicWeather.predictedAffectedSegments ?? 0, ""],
     ["time_to_risk", "预计进入风险", state.dynamicWeather.timeToRisk != null ? `${state.dynamicWeather.timeToRisk}s` : "—", ""],
-    ["predictive_replan_count", "预测式重规划", state.dynamicWeather.predictiveReplanCount ?? 0, ""],
+    ["risky_distance", "高风险穿越", s.risky_distance ?? 0, " px"],
+    ["predictive_replan_count", "预测重规划", state.dynamicWeather.predictiveReplanCount ?? 0, ""],
   ];
-  $("statCards").innerHTML = items
+  host.classList.remove("hidden");
+  host.innerHTML = items
+    .map(
+      ([, label, val, unit]) =>
+        `<div class="card"><div class="label">${label}</div><div class="value">${val ?? "—"}${unit}</div></div>`
+    )
+    .join("");
+}
+
+function formatMetricNumber(value) {
+  if (value == null || value === "" || value === "—") return "—";
+  return String(value).replace(/m\/s|m|%|px/gi, "").trim();
+}
+
+function renderStats(statistics) {
+  const s = statistics || {};
+  const visual = typeof window.getPlaybackVisualState === "function"
+    ? window.getPlaybackVisualState()
+    : null;
+  const pct = visual?.timelineLength
+    ? Math.min(100, Math.round((visual.timelineIndex / visual.timelineLength) * 100))
+    : null;
+  const telem = visual?.telemetry || {};
+  const host = $("statCards");
+  if (!host) return;
+  const items = [
+    ["total_length", "总长度", s.total_length, " px"],
+    ["num_inspection_points", "巡检点数", s.num_inspection_points, ""],
+    ["predicted_risk", "天气风险", Number(state.dynamicWeather.predictedRisk ?? 0).toFixed(2), ""],
+    ["progress", "当前进度", pct != null ? pct : "—", pct != null ? "%" : ""],
+    ["speed", "当前速度", formatMetricNumber(telem.speed), telem.speed ? " m/s" : ""],
+    ["altitude", "当前高度", formatMetricNumber(telem.altitude), telem.altitude ? " m" : ""],
+  ];
+  host.innerHTML = items
     .map(
       ([, label, val, unit]) => `
     <div class="card"><div class="label">${label}</div>
     <div class="value">${val ?? "—"}${unit}</div></div>`
     )
     .join("");
+  renderAdvancedStats(s);
+  renderSystemStatus();
 }
 
 function renderVisitOrder(visitOrder) {
   const chips = $("visitChips");
+  if (!chips) return;
   if (!visitOrder?.length) {
     chips.innerHTML = '<span class="chip">（无）</span>';
     return;
@@ -839,9 +927,9 @@ function getFullscreenPlotSize() {
 }
 
 function buildBackgroundImages(result) {
-  if (!state.showBackground) return [];
   const pipeline = result.metadata?.pipeline || getPipeline();
   if (pipeline !== "image") return [];
+  if (getMapMode() === "topology_only") return [];
 
   const mapBg = result.map_background || state.mapConfig;
   if (!mapBg?.available) return [];
@@ -882,7 +970,9 @@ function buildMissionLayout(result, options = {}) {
   };
 
   if (isImage) {
+    const darkTopology = getMapMode() === "topology_only";
     const { width, height } = getImageSize(result);
+    layout.plot_bgcolor = darkTopology ? "#243044" : "rgba(255,255,255,0.06)";
     layout.xaxis = {
       title: "",
       range: [0, width],
@@ -1171,7 +1261,7 @@ async function runPlanning() {
 
 async function forceRegenerateImage() {
   $("forceRegenBtn").disabled = true;
-  setStatus("强制重新生成图像主线（约 1–2 分钟）…", "running");
+  setStatus("正在重新生成任务（约 1–2 分钟）…", "running");
   try {
     const res = await fetch("/api/image-mission/generate", {
       method: "POST",
@@ -1206,7 +1296,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderExperimentResult();
     renderAdaptiveEvents();
     setAdaptiveStatus("正常巡航");
-    setStatus("就绪 · 运行 python app.py 后点击加载即可", "");
+    renderSystemStatus();
+    if (window.MissionStore?.subscribePhase) {
+      MissionStore.subscribePhase(() => renderSystemStatus());
+    }
+    setStatus("就绪 · 点击「加载巡检任务」开始", "");
   } catch (e) {
     setStatus(`初始化失败: ${e.message}`, "err");
   }
@@ -1245,9 +1339,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("modalBackdrop")?.addEventListener("click", closeFullscreen);
   $("runReplanBtn")?.addEventListener("click", runReplan);
 
-  ["toggleBaseMap", "toggleInspect", "toggleConnect", "toggleWeatherLayer"].forEach((id) => {
+  ["toggleBaseMap", "toggleInspect", "toggleConnect", "toggleWeatherLayer", "togglePointsLayer"].forEach((id) => {
     $(id)?.addEventListener("change", () => refreshMapView());
   });
+  $("fullscreenBtnHeader")?.addEventListener("click", openFullscreen);
+  $("toolsFullscreenBtn")?.addEventListener("click", openFullscreen);
   $("pointModeSelect")?.addEventListener("change", () => refreshMapView());
   $("weatherAwareToggle")?.addEventListener("change", () => {
     readUiToState();
@@ -1300,7 +1396,10 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   $("mapModeSelect")?.addEventListener("change", () => {
     if (state.lastResult && !isImagePipeline()) runPlanning();
-    else updateMapModeHint();
+    else {
+      updateMapModeHint();
+      refreshMapView();
+    }
   });
 
   window.addEventListener("resize", () => {
