@@ -595,6 +595,15 @@ function applyFixedSatelliteToLayout(layout, result) {
   const base = layout && typeof layout === "object" ? layout : {};
   const transparent =
     isImagePipeline() && usesImagePixelCoords(result || (typeof getCurrentMission === "function" ? getCurrentMission() : null));
+  const hiddenPixelAxes = transparent
+    ? {
+        showgrid: false,
+        zeroline: false,
+        showline: false,
+        showticklabels: false,
+        ticks: "",
+      }
+    : null;
   return {
     ...base,
     paper_bgcolor: transparent ? "rgba(0,0,0,0)" : base.paper_bgcolor || "#1a2332",
@@ -604,6 +613,7 @@ function applyFixedSatelliteToLayout(layout, result) {
       ...(base.xaxis || {}),
       range: [0, width],
       autorange: false,
+      ...(hiddenPixelAxes || {}),
     },
     yaxis: {
       ...(base.yaxis || {}),
@@ -612,6 +622,7 @@ function applyFixedSatelliteToLayout(layout, result) {
       scaleanchor: "x",
       scaleratio: 1,
       constrain: "domain",
+      ...(hiddenPixelAxes || {}),
     },
   };
 }
@@ -710,19 +721,28 @@ function renderInitialMapPreview(targetId = "mapPlot") {
   const el = document.getElementById(targetId);
   if (!el) return;
   const layout = applyFixedSatelliteToLayout(plot.layout, buildIdleImageMapPayload());
+  const tracesFresh = Array.isArray(plot.traces) ? plot.traces.slice() : [];
   const draw = () => {
     bindMapClick(targetId);
     syncHtmlBasemapImages(getCurrentMission() || buildIdleImageMapPayload());
   };
   if (state.plotReady[targetId] && el.data) {
-    Plotly.react(targetId, plot.traces, layout, plot.config).then(draw);
+    Plotly.newPlot(targetId, tracesFresh, layout, plot.config).then(draw);
   } else {
-    Plotly.newPlot(targetId, plot.traces, layout, plot.config).then(() => {
+    Plotly.newPlot(targetId, tracesFresh, layout, plot.config).then(() => {
       state.plotReady[targetId] = true;
       draw();
     });
   }
 }
+
+/** 服务端重规划写入前：清掉可能残留的拓扑/实验图层（不碰天气层） */
+window.prepareMissionPlotForServerReplan = function prepareMissionPlotForServerReplan() {
+  if (window.LayerManager && window.LayerIds) {
+    window.LayerManager.clearLayer(window.LayerIds.L1_TOPOLOGY);
+    window.LayerManager.clearLayer(window.LayerIds.T3_AB_EXPERIMENT);
+  }
+};
 
 function refreshMissionMap(targetId = "mapPlot", options = {}) {
   const mission = getCurrentMission();
@@ -1059,8 +1079,29 @@ function flattenMissionPathPoints(result) {
 
 
 
-function buildMissionTraces(result) {
-  const mission = getCurrentMission() || result;
+function isSkippableMissionDebugSegment(seg) {
+  if (!seg || typeof seg !== "object") return true;
+  const typ = String(seg.type || "").toLowerCase();
+  const role = String(seg.role || "").toLowerCase();
+  const skipTypes = new Set([
+    "debug",
+    "overlay",
+    "redline",
+    "topo",
+    "raw",
+    "skeleton",
+    "hsv",
+    "legacy",
+    "image_trace",
+    "mask",
+  ]);
+  if (skipTypes.has(typ)) return true;
+  if (/debug|overlay|redline|topo|raw|skeleton|hsv|legacy|mask|dummy|placeholder/.test(role)) return true;
+  return false;
+}
+
+function buildMissionTraces(missionPayload) {
+  const mission = missionPayload || getCurrentMission();
   const segments = mission?.segments || [];
   const inspectX = [],
     inspectY = [],
@@ -1070,19 +1111,20 @@ function buildMissionTraces(result) {
     connectCustom = [];
 
   segments.forEach((seg) => {
+    if (isSkippableMissionDebugSegment(seg)) return;
     const geom = seg.geometry_2d || [];
     if (geom.length < 2) return;
     const segLabel = seg.segment_id
       ? `巡检区段 ${String(seg.segment_id).replace(/^seg_/, "")}`
       : "巡检区段";
-    const typeLabel = seg.type === "inspect" ? "巡检段" : "连接段";
-    const hoverLine = `${segLabel}<br>${typeLabel} · ${Math.round(seg.length)}px`;
+    const typeLabel = seg.type === "inspect" ? "巡检段" : seg.type === "connect" ? "连接段" : "区段";
+    const hoverLine = `${segLabel}<br>${typeLabel} · ${Math.round(seg.length || 0)}px`;
 
     if (seg.type === "inspect") {
       inspectX.push(...geom.map((p) => p[0]), null);
       inspectY.push(...geom.map((p) => p[1]), null);
       inspectCustom.push(...geom.map(() => hoverLine), null);
-    } else {
+    } else if (seg.type === "connect") {
       connectX.push(...geom.map((p) => p[0]), null);
       connectY.push(...geom.map((p) => p[1]), null);
       connectCustom.push(...geom.map(() => hoverLine), null);
@@ -1269,7 +1311,7 @@ function buildMissionTraces(result) {
     }
   }
 
-  const markers = result.markers || {};
+  const markers = mission.markers || {};
   if (markers.start) {
     traces.push({
       x: [markers.start.x],
@@ -1357,6 +1399,15 @@ function buildMissionLayout(result, options = {}) {
   const mission = result || buildIdleImageMapPayload();
   const { width, height } = getPipelineBackgroundSpec(mission);
   const transparent = isImagePipeline() && usesImagePixelCoords(mission);
+  const hiddenPixelAxes = transparent
+    ? {
+        showgrid: false,
+        zeroline: false,
+        showline: false,
+        showticklabels: false,
+        ticks: "",
+      }
+    : null;
   const margin = transparent
     ? { l: 0, r: 0, t: 0, b: 0 }
     : fullscreen
@@ -1371,7 +1422,7 @@ function buildMissionLayout(result, options = {}) {
     legend: buildLegendLayout(fullscreen),
     hovermode: "closest",
     images: [],
-    uirevision: "mission-map-v3",
+    uirevision: `mission-map-v3-${typeof MissionStore !== "undefined" && MissionStore.version != null ? MissionStore.version : 0}`,
     autosize: true,
     xaxis: {
       title: "",
@@ -1380,10 +1431,12 @@ function buildMissionLayout(result, options = {}) {
       autorange: false,
       fixedrange: true,
       constrain: "domain",
-      showgrid: true,
-      gridcolor: "rgba(255,255,255,0.10)",
-      tickfont: { size: 9, color: "#5a7a94" },
-      zeroline: false,
+      ...(hiddenPixelAxes || {
+        showgrid: true,
+        gridcolor: "rgba(255,255,255,0.10)",
+        tickfont: { size: 9, color: "#5a7a94" },
+        zeroline: false,
+      }),
     },
     yaxis: {
       title: "",
@@ -1394,10 +1447,12 @@ function buildMissionLayout(result, options = {}) {
       scaleanchor: "x",
       scaleratio: 1,
       constrain: "domain",
-      showgrid: true,
-      gridcolor: "rgba(255,255,255,0.10)",
-      tickfont: { size: 9, color: "#5a7a94" },
-      zeroline: false,
+      ...(hiddenPixelAxes || {
+        showgrid: true,
+        gridcolor: "rgba(255,255,255,0.10)",
+        tickfont: { size: 9, color: "#5a7a94" },
+        zeroline: false,
+      }),
     },
   };
 
@@ -1426,10 +1481,16 @@ function plotlyUpdateMissionPlot(plotId, traces, mission, options = {}) {
   };
   const el = document.getElementById(plotId);
   if (!el) return Promise.resolve();
+  const tracesCopy = Array.isArray(traces) ? traces.slice() : [];
   if (state.plotReady[plotId] && el.data) {
-    return Plotly.react(plotId, traces, layout, config);
+    if (plotId === "mapPlot" || plotId === "mapPlotFs") {
+      return Plotly.newPlot(plotId, tracesCopy, layout, config).then(() => {
+        state.plotReady[plotId] = true;
+      });
+    }
+    return Plotly.react(plotId, tracesCopy, layout, config);
   }
-  return Plotly.newPlot(plotId, traces, layout, config).then(() => {
+  return Plotly.newPlot(plotId, tracesCopy, layout, config).then(() => {
     state.plotReady[plotId] = true;
   });
 }
@@ -1442,7 +1503,7 @@ function buildPlotFromMission(result, options = {}) {
   }
   const layout = buildMissionLayout(normalized, options);
   return {
-    traces,
+    traces: Array.isArray(traces) ? traces.slice() : [],
     layout,
     config: {
       responsive: !options.fullscreen,
@@ -1475,6 +1536,12 @@ function onMissionLoaded(result, options = {}) {
   }
   resetDynamicWeather(getCurrentMission() || normalized);
   updateSpacingControlsVisibility();
+  if (typeof updateReplanInputLimits === "function") {
+    updateReplanInputLimits();
+  }
+  if (typeof prefillReplanFormFromMission === "function") {
+    prefillReplanFormFromMission(getCurrentMission() || normalized);
+  }
   if (typeof window.onMissionLoadedForPlayback === "function") {
     window.onMissionLoadedForPlayback(getCurrentMission() || normalized);
   }
@@ -1551,11 +1618,12 @@ function renderMission(result, targetId = "mapPlot", options = {}) {
   };
 
   const layout = applyFixedSatelliteToLayout(plot.layout, normalized);
+  const tracesFresh = Array.isArray(plot.traces) ? plot.traces.slice() : [];
 
   if (state.plotReady[targetId] && el.data) {
-    Plotly.react(targetId, plot.traces, layout, plot.config).then(afterDraw);
+    Plotly.newPlot(targetId, tracesFresh, layout, plot.config).then(afterDraw);
   } else {
-    Plotly.newPlot(targetId, plot.traces, layout, plot.config).then(() => {
+    Plotly.newPlot(targetId, tracesFresh, layout, plot.config).then(() => {
       state.plotReady[targetId] = true;
       afterDraw();
     });

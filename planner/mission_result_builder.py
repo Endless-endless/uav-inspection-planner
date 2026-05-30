@@ -59,10 +59,22 @@ def merge_mission_metadata_into_dashboard(
         "inspection_point_source",
         "map_image",
         "clean_map_image",
+        "display_map_image",
+        "point_image",
+        "line_image",
+        "coordinate_mode",
+        "pixel_coordinate_mode",
+        "image_width",
+        "image_height",
         "image_detection_stats",
         "image_inspection_overlay",
+        "topo_edges_pixel",
     ):
-        if key in mission_meta and metadata.get(key) in (None, "", {}):
+        cur = metadata.get(key)
+        missing = cur in (None, "", {}) or (
+            key == "topo_edges_pixel" and isinstance(cur, list) and len(cur) == 0
+        )
+        if key in mission_meta and missing:
             metadata[key] = mission_meta[key]
     overlay = (mission_data or {}).get("image_inspection_overlay")
     if overlay and not metadata.get("image_inspection_overlay"):
@@ -76,6 +88,7 @@ def build_mission_context(
     dashboard: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     base_meta = baseline.get("metadata") or {}
+    nested_mm = base_meta.get("mission_metadata") if isinstance(base_meta.get("mission_metadata"), dict) else {}
     dash_meta = (dashboard or {}).get("metadata") or {}
     req = request or {}
 
@@ -88,6 +101,7 @@ def build_mission_context(
         req.get("image_path")
         or dash_meta.get("map_image")
         or base_meta.get("map_image")
+        or nested_mm.get("map_image")
         or "data/test.png"
     )
     snap_threshold = req.get("snap_threshold")
@@ -105,6 +119,7 @@ def build_mission_context(
     overlay = (
         baseline.get("image_inspection_overlay")
         or base_meta.get("image_inspection_overlay")
+        or nested_mm.get("image_inspection_overlay")
         or dash_meta.get("image_inspection_overlay")
         or []
     )
@@ -120,7 +135,9 @@ def build_mission_context(
         "inspection_points": inspection_points or [],
         "image_inspection_overlay": overlay,
         "image_detection_stats": base_meta.get("image_detection_stats") or dash_meta.get("image_detection_stats") or {},
-        "clean_map_image": base_meta.get("clean_map_image") or dash_meta.get("clean_map_image"),
+        "clean_map_image": base_meta.get("clean_map_image")
+        or dash_meta.get("clean_map_image")
+        or nested_mm.get("clean_map_image"),
         "weather_aware": bool(req.get("weather_aware")),
         "weather_weight": float(req.get("weather_weight") or 1.0),
     }
@@ -490,10 +507,17 @@ def build_dashboard_from_mission_json(
         "spacing": spacing,
         "coordinate_mode": coordinate_mode,
     }
-    if pipeline == "image":
-        metadata["background"] = "data/test.png"
     if extra_metadata:
         metadata.update(extra_metadata)
+    if pipeline == "image":
+        bg_src = (
+            metadata.get("clean_map_image")
+            or metadata.get("display_map_image")
+            or metadata.get("map_image")
+            or input_file
+            or "data/test.png"
+        )
+        metadata["background"] = str(bg_src).replace("\\", "/")
     merge_mission_metadata_into_dashboard(metadata, data)
 
     payload: Dict[str, Any] = {

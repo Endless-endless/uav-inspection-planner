@@ -61,6 +61,36 @@ function validateReplanCoords() {
   }
   return { ok: true, start: [sx, sy], end: [ex, ey] };
 }
+function cloneMissionSnapshotForReplan(mission) {
+  if (!mission || typeof mission !== "object") return null;
+  try {
+    if (typeof structuredClone === "function") {
+      return structuredClone(mission);
+    }
+  } catch (_) {
+    /* fall through */
+  }
+  try {
+    return JSON.parse(JSON.stringify(mission));
+  } catch (_) {
+    return null;
+  }
+}
+
+function prefillReplanFormFromMission(mission) {
+  if (!mission) return;
+  if (typeof isImagePipeline === "function" && !isImagePipeline()) return;
+  const mk = mission.markers || {};
+  if (mk.start && $("replanStartX") && $("replanStartY")) {
+    $("replanStartX").value = String(Math.round(Number(mk.start.x)));
+    $("replanStartY").value = String(Math.round(Number(mk.start.y)));
+  }
+  if (mk.end && $("replanEndX") && $("replanEndY")) {
+    $("replanEndX").value = String(Math.round(Number(mk.end.x)));
+    $("replanEndY").value = String(Math.round(Number(mk.end.y)));
+  }
+}
+
 function buildReplanPayload(check) {
   const base = {
     pipeline: "image",
@@ -81,6 +111,7 @@ function buildReplanPayload(check) {
     inspection_point_source: normalizeInspectionPointSource?.(getInspectionPointSource()) || getInspectionPointSource(),
     image_path: meta.map_image || getImagePathForSource(getInspectionPointSource()),
     inspection_points: getCurrentMission()?.inspection_points || [],
+    baseline_mission: cloneMissionSnapshotForReplan(getCurrentMission()),
   };
 }
 
@@ -115,21 +146,22 @@ async function runReplan() {
     }
 
     const dashboard = normalizeMissionResult(data.dashboard || data);
-    if (isImagePipeline?.() || getPipeline?.() === "image") {
-      const displayPath =
-        typeof resolveCleanMapImagePath === "function"
-          ? resolveCleanMapImagePath(dashboard)
-          : null;
-      if (displayPath && typeof loadMapConfig === "function") {
-        await loadMapConfig(displayPath);
-      }
-    }
     if (window.MissionStore) {
       MissionStore.applyServerReplan(dashboard, {
         mission_json_path: dashboard.output_files?.mission_snapshot || "latest_replan_mission.json",
       });
     } else {
       state.lastResult = dashboard;
+    }
+    if (isImagePipeline?.() || getPipeline?.() === "image") {
+      const missionForMap = typeof getCurrentMission === "function" ? getCurrentMission() : null;
+      const displayPath =
+        typeof resolveCleanMapImagePath === "function"
+          ? resolveCleanMapImagePath(missionForMap || dashboard)
+          : null;
+      if (displayPath && typeof loadMapConfig === "function") {
+        await loadMapConfig(displayPath);
+      }
     }
     state.experiment.active = false;
     if (window.LayerManager) LayerManager.clearLayer(window.LayerIds?.T3_AB_EXPERIMENT);
@@ -142,6 +174,12 @@ async function runReplan() {
     updateDownloadLinks(dashboard.output_files || {}, "image");
     updateSpacingControlsVisibility();
     syncPlaybackAfterMissionChange({ restart: wasPlaying });
+    if (typeof updateReplanInputLimits === "function") {
+      updateReplanInputLimits();
+    }
+    if (typeof prefillReplanFormFromMission === "function") {
+      prefillReplanFormFromMission(mission);
+    }
 
     const connected = mission?.metadata?.end_connected ?? dashboard.metadata?.end_connected;
     setStatus(

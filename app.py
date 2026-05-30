@@ -14,6 +14,7 @@ UAV 电网巡检 — 统一 Web Dashboard
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
@@ -48,10 +49,10 @@ from planner.mission_result_builder import (
     save_json,
 )
 from planner.replan_start_end import (
-    IMAGE_HEIGHT,
-    IMAGE_WIDTH,
     ReplanValidationError,
+    baseline_has_inspect_segments,
     build_start_end_replan_mission,
+    replan_image_bounds_from_baseline,
     validate_image_coords,
 )
 from visualization.dashboard_map import get_background_map_config, resolve_map_path
@@ -156,6 +157,8 @@ class ReplanRequest(BaseModel):
     spacing: Optional[float] = None
     snap_threshold: Optional[float] = None
     inspection_points: Optional[List[Dict[str, Any]]] = None
+    # 当前 Dashboard 任务快照（含 segments / visit_order / metadata）；缺失时回退 latest mission_output.json
+    baseline_mission: Optional[Dict[str, Any]] = None
 
 
 def _resolve_input_path(input_file: str) -> Path:
@@ -523,7 +526,176 @@ def ensure_image_pipeline_outputs(
     }
 
 
+def _debug_replan_log_baseline(
+    label: str,
+    baseline: Dict[str, Any],
+    start: List[float],
+    end: List[float],
+) -> None:
+    """调试：确认 replan 使用的 baseline 是否与 Dashboard 一致（不改业务逻辑）。"""
+    meta = (baseline or {}).get("metadata") or {}
+    segs = (baseline or {}).get("segments") or []
+    n_inspect = sum(1 for s in segs if s.get("type") == "inspect")
+    print(
+        f"[replan-debug] {label} (1) start={list(start)} end={list(end)}",
+        flush=True,
+    )
+    print(
+        f"[replan-debug] {label} (2) baseline.metadata.coordinate_mode={meta.get('coordinate_mode')!r}",
+        flush=True,
+    )
+    print(
+        f"[replan-debug] {label} (3) baseline.metadata.image_width={meta.get('image_width')!r} "
+        f"image_height={meta.get('image_height')!r}",
+        flush=True,
+    )
+    print(
+        f"[replan-debug] {label} (4) baseline.metadata.map_image={meta.get('map_image')!r}",
+        flush=True,
+    )
+    print(
+        f"[replan-debug] {label} (5) baseline segments count={len(segs)}",
+        flush=True,
+    )
+    print(
+        f"[replan-debug] {label} (6) baseline inspect segments count={n_inspect}",
+        flush=True,
+    )
+
+
+def _is_placeholder_test_map_asset(path: Optional[str]) -> bool:
+    """识别默认测试/样例底图，避免 replan 回退覆盖真实地图。"""
+    if not path:
+        return True
+    s = str(path).replace("\\", "/").lower()
+    if "sample_" in s:
+        return True
+    if "clean_test" in s or "test_point" in s:
+        return True
+    if s.endswith("test.png") or "/test.png" in s:
+        return True
+    if s.endswith("test_point.png") or "/test_point" in s:
+        return True
+    return False
+
+
+def _flatten_baseline_mission_metadata(baseline: Dict[str, Any]) -> Dict[str, Any]:
+    """合并 metadata.mission_metadata，供 replan 继承底图与像素坐标系。"""
+    meta = dict((baseline or {}).get("metadata") or {})
+    nested = meta.get("mission_metadata")
+    if isinstance(nested, dict):
+        for k, v in nested.items():
+            if meta.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
+                meta[k] = copy.deepcopy(v) if isinstance(v, (dict, list)) else v
+    return meta
+
+
+_REPLAN_PRESERVE_BASELINE_META_KEYS = (
+    "map_image",
+    "display_map_image",
+    "clean_map_image",
+    "point_image",
+    "line_image",
+    "coordinate_mode",
+    "pixel_coordinate_mode",
+    "image_width",
+    "image_height",
+    "image_detection_stats",
+    "topo_edges_pixel",
+    "image_inspection_overlay",
+)
+
+
+def _patch_replan_preserve_baseline_map_identity(
+    baseline: Dict[str, Any],
+    *,
+    dashboard: Dict[str, Any],
+    new_mission: Dict[str, Any],
+) -> None:
+    """
+    重规划只改路径/统计，底图元数据必须与 replan 前 baseline 一致。
+    """
+    src = _flatten_baseline_mission_metadata(baseline)
+    dmeta = dashboard.setdefault("metadata", {})
+    mmeta = new_mission.setdefault("metadata", {})
+    for k in _REPLAN_PRESERVE_BASELINE_META_KEYS:
+        if k not in src:
+            continue
+        v = src[k]
+        if v is None:
+            continue
+        if isinstance(v, (list, dict)) and len(v) == 0 and k != "image_inspection_overlay":
+            continue
+        dmeta[k] = copy.deepcopy(v) if isinstance(v, (dict, list)) else v
+        mmeta[k] = copy.deepcopy(v) if isinstance(v, (dict, list)) else v
+
+    ov = baseline.get("image_inspection_overlay") or src.get("image_inspection_overlay")
+    if ov:
+        dashboard["image_inspection_overlay"] = copy.deepcopy(ov)
+        new_mission["image_inspection_overlay"] = copy.deepcopy(ov)
+
+    display_rel = str(
+        dmeta.get("clean_map_image")
+        or dmeta.get("display_map_image")
+        or dmeta.get("map_image")
+        or DEFAULT_MAP_PATH
+    )
+    if _is_placeholder_test_map_asset(display_rel) and not _is_placeholder_test_map_asset(
+        str(src.get("clean_map_image") or src.get("map_image") or "")
+    ):
+        display_rel = str(src.get("clean_map_image") or src.get("display_map_image") or src.get("map_image"))
+        dmeta["map_image"] = src.get("map_image", dmeta.get("map_image"))
+        dmeta["clean_map_image"] = src.get("clean_map_image", dmeta.get("clean_map_image"))
+        dmeta["display_map_image"] = src.get("display_map_image", dmeta.get("display_map_image"))
+        dmeta["point_image"] = src.get("point_image", dmeta.get("point_image"))
+
+    dashboard["map_background"] = get_background_map_config(ROOT, display_rel)
+
+    iw, ih = dmeta.get("image_width"), dmeta.get("image_height")
+    if iw and ih:
+        dashboard["bounds"] = {
+            "x_range": [0.0, float(iw)],
+            "y_range": [float(ih), 0.0],
+            "width": float(iw),
+            "height": float(ih),
+        }
+
+
+def _debug_replan_log_output(label: str, dashboard: Dict[str, Any]) -> None:
+    """调试：replan 输出前几段几何点与 metadata.coordinate_mode。"""
+    meta = (dashboard or {}).get("metadata") or {}
+    first_coords: List[Any] = []
+    for seg in (dashboard or {}).get("segments") or []:
+        for p in seg.get("geometry_2d") or []:
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                first_coords.append([float(p[0]), float(p[1])])
+            if len(first_coords) >= 5:
+                break
+        if len(first_coords) >= 5:
+            break
+    print(
+        f"[replan-debug] {label} (7) first 5 geometry_2d points={first_coords!r}",
+        flush=True,
+    )
+    print(
+        f"[replan-debug] {label} (8) output metadata.coordinate_mode={meta.get('coordinate_mode')!r}",
+        flush=True,
+    )
+
+
+def _load_latest_baseline_mission() -> Dict[str, Any]:
+    with LATEST_MISSION_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _resolve_replan_baseline(req: ReplanRequest) -> Dict[str, Any]:
+    if req.baseline_mission and baseline_has_inspect_segments(req.baseline_mission):
+        return req.baseline_mission
+    return _load_latest_baseline_mission()
+
+
 async def _run_image_replan(
+    baseline: Dict[str, Any],
     start: List[float],
     end: List[float],
     planning_spacing: float = 70.0,
@@ -533,9 +705,12 @@ async def _run_image_replan(
     """
     图像主线起终点重规划：planner/replan_start_end.py。
     仅写入 result/web_app/，不覆盖 result/latest/。
+    baseline 须与当前地图任务一致（通常由前端传入 baseline_mission）。
     """
+    _debug_replan_log_baseline("_run_image_replan.input", baseline, start, end)
+    iw, ih = replan_image_bounds_from_baseline(baseline)
     try:
-        validate_image_coords(start, end, width=IMAGE_WIDTH, height=IMAGE_HEIGHT)
+        validate_image_coords(start, end, width=iw, height=ih)
     except ReplanValidationError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -545,9 +720,6 @@ async def _run_image_replan(
             status_code=500,
             detail=gen.get("message", "Image pipeline not ready for replan"),
         )
-
-    with LATEST_MISSION_PATH.open("r", encoding="utf-8") as f:
-        baseline = json.load(f)
 
     ctx = mission_context or build_mission_context(baseline)
     _update_current_mission_context(ctx)
@@ -567,14 +739,27 @@ async def _run_image_replan(
         raise HTTPException(status_code=500, detail=f"Replan failed: {e}") from e
 
     replan_meta = new_mission.get("replan_metadata") or {}
-    base_meta = baseline.get("metadata") or {}
+    base_meta = new_mission.get("metadata") or {}
+    flat_bl = _flatten_baseline_mission_metadata(baseline)
     map_rel = str(
-        ctx.get("clean_map_image")
+        flat_bl.get("clean_map_image")
+        or flat_bl.get("display_map_image")
+        or flat_bl.get("map_image")
         or base_meta.get("clean_map_image")
-        or ctx.get("image_path")
+        or base_meta.get("display_map_image")
         or base_meta.get("map_image")
+        or ctx.get("clean_map_image")
+        or ctx.get("image_path")
         or DEFAULT_MAP_PATH
     )
+    if _is_placeholder_test_map_asset(map_rel) and not _is_placeholder_test_map_asset(
+        str(flat_bl.get("map_image") or flat_bl.get("clean_map_image") or "")
+    ):
+        map_rel = str(
+            flat_bl.get("clean_map_image")
+            or flat_bl.get("display_map_image")
+            or flat_bl.get("map_image")
+        )
     map_bg = get_background_map_config(ROOT, map_rel)
     resolved_source = normalize_inspection_point_source(
         replan_meta.get("inspection_point_source")
@@ -599,10 +784,6 @@ async def _run_image_replan(
             "planning_spacing": replan_meta.get("planning_spacing", planning_spacing),
             "planning_point_count": replan_meta.get("planning_point_count"),
             "inspection_point_source": resolved_source,
-            "map_image": ctx.get("image_path") or base_meta.get("map_image") or DEFAULT_MAP_PATH,
-            "clean_map_image": ctx.get("clean_map_image") or base_meta.get("clean_map_image"),
-            "image_detection_stats": ctx.get("image_detection_stats") or base_meta.get("image_detection_stats") or {},
-            "image_inspection_overlay": ctx.get("image_inspection_overlay") or base_meta.get("image_inspection_overlay") or [],
             "replan": replan_meta,
             "image_generation": gen,
             "weather_mode": "on" if (weather_context or {}).get("enabled") else "off",
@@ -614,6 +795,10 @@ async def _run_image_replan(
         start=(float(start[0]), float(start[1])),
         end=(float(end[0]), float(end[1])),
     )
+
+    _patch_replan_preserve_baseline_map_identity(baseline, dashboard=dashboard, new_mission=new_mission)
+
+    _debug_replan_log_output("_run_image_replan.output", dashboard)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     save_json(OUTPUT_DIR / "latest_replan_mission.json", new_mission)
@@ -1285,16 +1470,18 @@ async def api_replan(req: ReplanRequest):
             enabled=bool(req.weather_aware),
             weather_weight=float(req.weather_weight),
         )
-        with LATEST_MISSION_PATH.open("r", encoding="utf-8") as f:
-            baseline = json.load(f)
-        mission_context = _build_replan_mission_context(baseline, req)
+        baseline = _resolve_replan_baseline(req)
+        _debug_replan_log_baseline("api_replan", baseline, req.start, req.end)
+        mission_context = _build_replan_mission_context(baseline, req, dashboard=baseline)
         dashboard = await _run_image_replan(
+            baseline,
             req.start,
             req.end,
             planning_spacing=req.planning_spacing,
             weather_context=weather_ctx,
             mission_context=mission_context,
         )
+        _debug_replan_log_output("api_replan.output", dashboard)
     except HTTPException:
         raise
     except Exception as e:

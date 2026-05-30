@@ -183,10 +183,93 @@
       return MissionStore.getMission();
     },
 
+    mergeReplanWithCurrentDashboard(current, replan) {
+      if (!replan) return current;
+      if (!current) return replan;
+
+      const c = current;
+      const r = replan;
+      const cm = { ...(c.metadata || {}) };
+      const rm = { ...(r.metadata || {}) };
+
+      function cloneVal(v) {
+        if (v == null) return v;
+        try {
+          if (typeof structuredClone === "function") return structuredClone(v);
+        } catch (_) {
+          /* fall through */
+        }
+        try {
+          return JSON.parse(JSON.stringify(v));
+        } catch (_) {
+          return v;
+        }
+      }
+
+      const metadata = {
+        ...rm,
+        map_image: cm.map_image,
+        display_map_image: cm.display_map_image,
+        clean_map_image: cm.clean_map_image,
+        point_image: cm.point_image,
+        image_width: cm.image_width,
+        image_height: cm.image_height,
+        coordinate_mode: cm.coordinate_mode,
+        pixel_coordinate_mode: cm.pixel_coordinate_mode,
+        map_background: cm.map_background != null ? cloneVal(cm.map_background) : cm.map_background,
+        image_detection_stats:
+          cm.image_detection_stats != null ? cloneVal(cm.image_detection_stats) : cm.image_detection_stats,
+        topo_edges_pixel:
+          cm.topo_edges_pixel != null ? cloneVal(cm.topo_edges_pixel) : cm.topo_edges_pixel,
+        image_inspection_overlay:
+          cm.image_inspection_overlay != null
+            ? cloneVal(cm.image_inspection_overlay)
+            : c.image_inspection_overlay != null
+              ? cloneVal(c.image_inspection_overlay)
+              : rm.image_inspection_overlay,
+      };
+      if (cm.line_image != null && cm.line_image !== "") {
+        metadata.line_image = cm.line_image;
+      }
+      if (cm.dataset_type != null && cm.dataset_type !== "") {
+        metadata.dataset_type = cm.dataset_type;
+      }
+      if (cm.dataset != null && cm.dataset !== "") {
+        metadata.dataset = cm.dataset;
+      }
+      metadata.inspection_point_source = MissionStore.normalizeSource(
+        cm.inspection_point_source || metadata.inspection_point_source
+      );
+
+      return {
+        ...c,
+        ...r,
+        segments: r.segments,
+        statistics: r.statistics,
+        visit_order: r.visit_order,
+        markers: r.markers,
+        inspection_points: r.inspection_points,
+        group_visit_order: r.group_visit_order != null ? r.group_visit_order : c.group_visit_order,
+        weather_zones: r.weather_zones != null ? r.weather_zones : c.weather_zones,
+        output_files: r.output_files ?? c.output_files,
+        map_background: c.map_background != null ? cloneVal(c.map_background) : c.map_background,
+        bounds: c.bounds != null ? cloneVal(c.bounds) : c.bounds,
+        image_inspection_overlay:
+          c.image_inspection_overlay != null ? cloneVal(c.image_inspection_overlay) : undefined,
+        metadata,
+      };
+    },
+
     applyServerReplan(dashboard, options = {}) {
+      if (typeof window.prepareMissionPlotForServerReplan === "function") {
+        window.prepareMissionPlotForServerReplan();
+      }
       const prevPoints = MissionStore.getInspectionPoints();
       const prevSource = MissionStore.getSource();
-      MissionStore.loadFromDashboard(dashboard, {
+      const current = MissionStore.getMission();
+      const normalized = MissionStore.normalizeDashboard(dashboard);
+      const merged = MissionStore.mergeReplanWithCurrentDashboard(current, normalized);
+      MissionStore.loadFromDashboard(merged, {
         ...options,
         kind: "server_replan",
       });
@@ -274,6 +357,23 @@
       MissionStore._emitMission();
     },
 
+    buildBaselineMissionForReplan() {
+      const d = MissionStore.getMission();
+      if (!d || typeof d !== "object") return null;
+      try {
+        if (typeof structuredClone === "function") {
+          return structuredClone(d);
+        }
+      } catch (_) {
+        /* fall through */
+      }
+      try {
+        return JSON.parse(JSON.stringify(d));
+      } catch (_) {
+        return null;
+      }
+    },
+
     buildReplanPayload(basePayload = {}) {
       const snap = MissionStore.current;
       const meta = snap?.metadata || snap?.dashboard?.metadata || {};
@@ -296,6 +396,7 @@
           detection_result: pt.detection_result,
           visit_order: pt.visit_order,
         })),
+        baseline_mission: MissionStore.buildBaselineMissionForReplan(),
       };
     },
   };

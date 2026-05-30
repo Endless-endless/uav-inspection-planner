@@ -33,6 +33,47 @@ STRAIGHT_FALLBACK_WARN_PX = 150.0
 Point = Tuple[float, float]
 
 
+def _merge_mission_metadata_nested(base_mission: Dict[str, Any]) -> None:
+    """
+    Dashboard 将完整 mission metadata 放在 metadata.mission_metadata。
+    重规划需要 topo_edges_pixel、image_width 等与 mission_output.json 顶层一致。
+    """
+    meta = base_mission.get("metadata")
+    if not isinstance(meta, dict):
+        return
+    nested = meta.get("mission_metadata")
+    if not isinstance(nested, dict):
+        return
+    for k, v in nested.items():
+        cur = meta.get(k)
+        if cur in (None, "", [], {}) and v not in (None, "", [], {}):
+            meta[k] = copy.deepcopy(v) if isinstance(v, (dict, list)) else v
+
+
+def replan_image_bounds_from_baseline(base_mission: Dict[str, Any]) -> Tuple[int, int]:
+    """像素坐标系宽高：metadata / mission_metadata → bounds → map_background → 默认 916×960。"""
+    meta = base_mission.get("metadata") or {}
+    nested = meta.get("mission_metadata") if isinstance(meta.get("mission_metadata"), dict) else {}
+    bounds = base_mission.get("bounds") or {}
+    mb = base_mission.get("map_background") or {}
+    w = meta.get("image_width") or nested.get("image_width") or bounds.get("width") or mb.get("width")
+    h = meta.get("image_height") or nested.get("image_height") or bounds.get("height") or mb.get("height")
+    if w and h:
+        return int(float(w)), int(float(h))
+    return IMAGE_WIDTH, IMAGE_HEIGHT
+
+
+def baseline_has_inspect_segments(base_mission: Optional[Dict[str, Any]]) -> bool:
+    if not base_mission:
+        return False
+    for seg in base_mission.get("segments") or []:
+        if seg.get("type") == "inspect" and seg.get("edge_id"):
+            geom = seg.get("geometry_2d") or []
+            if len(geom) >= 2:
+                return True
+    return False
+
+
 class ReplanValidationError(ValueError):
     """Invalid start/end coordinates or mission data."""
 
@@ -682,7 +723,10 @@ def build_start_end_replan_mission(
     """
     Build full mission JSON: start → inspect all edges (dense polylines) → end.
     """
-    start, end = validate_image_coords(start_xy, end_xy)
+    base_mission = copy.deepcopy(base_mission)
+    _merge_mission_metadata_nested(base_mission)
+    iw, ih = replan_image_bounds_from_baseline(base_mission)
+    start, end = validate_image_coords(start_xy, end_xy, width=iw, height=ih)
     spacing = max(20.0, float(planning_spacing))
 
     tasks = _extract_inspect_tasks(base_mission)
@@ -848,15 +892,12 @@ def build_start_end_replan_mission(
     )
     if is_image_inspection_source(resolved_source):
         resolved_source = "image"
-        if ctx.get("image_path"):
-            base_meta["map_image"] = ctx.get("image_path")
-        if ctx.get("clean_map_image"):
-            base_meta["clean_map_image"] = ctx.get("clean_map_image")
-        if ctx.get("image_detection_stats"):
+        # 底图路径以 baseline 为准，禁止用 planning ctx 覆盖为 test.png 等默认图
+        if ctx.get("image_detection_stats") and not base_meta.get("image_detection_stats"):
             base_meta["image_detection_stats"] = copy.deepcopy(ctx.get("image_detection_stats"))
-        overlay = ctx.get("image_inspection_overlay")
-        if overlay:
-            base_meta["image_inspection_overlay"] = copy.deepcopy(overlay)
+        ovr = ctx.get("image_inspection_overlay")
+        if ovr and not (base_meta.get("image_inspection_overlay") or []):
+            base_meta["image_inspection_overlay"] = copy.deepcopy(ovr)
     else:
         resolved_source = "spacing"
     base_meta["inspection_point_source"] = resolved_source
