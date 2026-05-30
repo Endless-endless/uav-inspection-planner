@@ -1384,29 +1384,52 @@ def _slice_polyline_by_distance(
     start_s: float,
     end_s: float,
 ) -> List[Tuple[float, float]]:
+    """沿折线弧长子段，保留中间顶点（避免 inspect 几何退化为首尾两点弦）。"""
     total = _polyline_length(polyline)
     if total < 1e-9:
+        return [tuple(polyline[0])] if polyline else []
+    if len(polyline) < 2:
         return [tuple(polyline[0])] if polyline else []
     s0 = max(0.0, min(float(start_s), total))
     s1 = max(0.0, min(float(end_s), total))
     if s1 < s0:
         s0, s1 = s1, s0
-    start_pt = _point_at_polyline_distance(polyline, s0)
-    end_pt = _point_at_polyline_distance(polyline, s1)
-    out: List[Tuple[float, float]] = [start_pt]
+    if s1 - s0 < 1e-4:
+        mid = 0.5 * (s0 + s1)
+        delta = min(8.0, max(3.0, total * 0.02))
+        s0 = max(0.0, mid - delta)
+        s1 = min(total, mid + delta)
+
+    out: List[Tuple[float, float]] = []
     cum = 0.0
     for i in range(len(polyline) - 1):
-        p0 = np.array(polyline[i], dtype=np.float64)
-        p1 = np.array(polyline[i + 1], dtype=np.float64)
-        seg_len = float(np.linalg.norm(p1 - p0))
-        next_cum = cum + seg_len
-        if seg_len >= 1e-9 and cum > s0 + 1e-9 and cum < s1 - 1e-9:
-            out.append((float(p0[0]), float(p0[1])))
-        cum = next_cum
-    if np.linalg.norm(np.array(out[-1]) - np.array(end_pt)) > 1e-6:
-        out.append(end_pt)
-    if len(out) == 1:
-        out.append(end_pt)
+        p_a = np.array(polyline[i], dtype=np.float64)
+        p_b = np.array(polyline[i + 1], dtype=np.float64)
+        seg_len = float(np.linalg.norm(p_b - p_a))
+        if seg_len < 1e-9:
+            continue
+        seg_lo, seg_hi = cum, cum + seg_len
+        lo = max(s0, seg_lo)
+        hi = min(s1, seg_hi)
+        if hi < lo - 1e-9:
+            cum += seg_len
+            continue
+        t_lo = max(0.0, min(1.0, (lo - seg_lo) / seg_len))
+        t_hi = max(0.0, min(1.0, (hi - seg_lo) / seg_len))
+        q_lo = p_a + t_lo * (p_b - p_a)
+        q_hi = p_a + t_hi * (p_b - p_a)
+        if not out:
+            out.append((float(q_lo[0]), float(q_lo[1])))
+        elif float(np.linalg.norm(np.array(out[-1]) - q_lo)) > 1e-4:
+            out.append((float(q_lo[0]), float(q_lo[1])))
+        if float(np.linalg.norm(q_hi - q_lo)) > 1e-4:
+            out.append((float(q_hi[0]), float(q_hi[1])))
+        cum += seg_len
+
+    if len(out) < 2:
+        p0 = _point_at_polyline_distance(polyline, s0)
+        p1 = _point_at_polyline_distance(polyline, min(total, s0 + max(1.0, total * 0.001)))
+        return [p0, p1]
     return out
 
 

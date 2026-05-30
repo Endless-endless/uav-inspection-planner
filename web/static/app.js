@@ -7,6 +7,13 @@ const $ = (id) => document.getElementById(id);
 const MAP_STYLES = {
   inspectColor: "#1f77b4",
   connectColor: "#ff7f0e",
+  /** 拓扑参考：未巡检电网（与历史红线一致） */
+  pendingTopoLine: {
+    color: "red",
+    width: 3,
+    dash: "solid",
+    opacity: 1,
+  },
   pointColor: "#2563eb",
   pointLine: "#e2e8f0",
 };
@@ -1079,6 +1086,59 @@ function flattenMissionPathPoints(result) {
 
 
 
+/** 拓扑边像素折线（全量电网参考，非 Mission 路径段） */
+function getTopoEdgesPixelList(mission) {
+  const m = mission || {};
+  const meta = m.metadata || {};
+  const nested = meta.mission_metadata || {};
+  const list = meta.topo_edges_pixel || nested.topo_edges_pixel || m.topo_edges_pixel;
+  return Array.isArray(list) ? list : [];
+}
+
+/**
+ * 单条 Plotly lines trace：所有拓扑边合并，置于巡检/连接路径之下绘制。
+ */
+function buildPendingTopoEdgesTrace(mission) {
+  const edges = getTopoEdgesPixelList(mission);
+  if (!edges.length) return null;
+  const xs = [];
+  const ys = [];
+  const sty = MAP_STYLES.pendingTopoLine;
+  edges.forEach((edge) => {
+    const pl =
+      edge.pixel_polyline || edge.image_polyline || edge.original_polyline || [];
+    if (!Array.isArray(pl) || pl.length < 2) return;
+    pl.forEach((pt) => {
+      if (!pt || pt.length < 2) return;
+      xs.push(Number(pt[0]));
+      ys.push(Number(pt[1]));
+    });
+    xs.push(null);
+    ys.push(null);
+  });
+  while (xs.length && xs[xs.length - 1] === null) {
+    xs.pop();
+    ys.pop();
+  }
+  if (xs.length < 2) return null;
+  return {
+    x: xs,
+    y: ys,
+    mode: "lines",
+    name: "未巡检线路",
+    opacity: sty.opacity != null ? sty.opacity : 1,
+    line: {
+      color: sty.color,
+      width: sty.width,
+      dash: sty.dash,
+    },
+    hoverinfo: "skip",
+    showlegend: true,
+    legendgroup: "pending_topo",
+    legendrank: 3,
+  };
+}
+
 function isSkippableMissionDebugSegment(seg) {
   if (!seg || typeof seg !== "object") return true;
   const typ = String(seg.type || "").toLowerCase();
@@ -1146,6 +1206,11 @@ function buildMissionTraces(missionPayload) {
     traces.push(...(window.LayerManager?.getLayer(window.LayerIds?.T1_ADAPTIVE_FLASH) || buildAdaptiveReplanTraces()));
   }
 
+  const pendingTopo = buildPendingTopoEdgesTrace(mission);
+  if (pendingTopo) {
+    traces.push(pendingTopo);
+  }
+
   if (state.showInspect && inspectX.length) {
     traces.push({
       x: inspectX,
@@ -1157,6 +1222,7 @@ function buildMissionTraces(missionPayload) {
       hovertext: inspectCustom,
       showlegend: true,
       legendgroup: "inspect",
+      legendrank: 1,
     });
   }
 
@@ -1171,6 +1237,7 @@ function buildMissionTraces(missionPayload) {
       hovertext: connectCustom,
       showlegend: true,
       legendgroup: "connect",
+      legendrank: 2,
     });
   }
 
@@ -1245,6 +1312,7 @@ function buildMissionTraces(missionPayload) {
           "进度: %{customdata[2]}<extra></extra>",
         showlegend: true,
         legendgroup: "points",
+        legendrank: 4,
       });
     }
 
@@ -1269,6 +1337,7 @@ function buildMissionTraces(missionPayload) {
           "进度: %{customdata[2]}<extra></extra>",
         showlegend: true,
         legendgroup: "points",
+        legendrank: 5,
       });
     }
 
@@ -1307,6 +1376,7 @@ function buildMissionTraces(missionPayload) {
           "进度: %{customdata[2]}<extra></extra>",
         showlegend: true,
         legendgroup: "points",
+        legendrank: 6,
       });
     }
   }
@@ -1330,6 +1400,7 @@ function buildMissionTraces(missionPayload) {
       hovertemplate: "起点 (%{x:.0f}, %{y:.0f})<extra></extra>",
       showlegend: true,
       legendgroup: "start",
+      legendrank: 7,
     });
   }
   if (markers.end) {
@@ -1350,6 +1421,7 @@ function buildMissionTraces(missionPayload) {
       hovertemplate: "终点 (%{x:.0f}, %{y:.0f})<extra></extra>",
       showlegend: true,
       legendgroup: "end",
+      legendrank: 8,
     });
   }
 
@@ -1357,17 +1429,19 @@ function buildMissionTraces(missionPayload) {
 }
 
 function buildLegendLayout(fullscreen = false) {
-  // Legend inside the plot area at bottom-left — zero bottom margin waste
   return {
-    orientation: "h",
-    x: 0.01,
-    y: 0.003,
+    orientation: "v",
+    x: 0.02,
+    y: 0.02,
     xanchor: "left",
     yanchor: "bottom",
     bgcolor: "rgba(10, 16, 28, 0.72)",
     bordercolor: "rgba(100,160,200,0.18)",
     borderwidth: 1,
-    font: { size: fullscreen ? 11 : 10, color: "#94b8cc" },
+    font: { size: fullscreen ? 11 : 10, color: "#b8d4e8" },
+    traceorder: "normal",
+    itemsizing: "constant",
+    itemwidth: 28,
   };
 }
 

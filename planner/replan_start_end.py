@@ -160,28 +160,60 @@ def _project_to_polyline_distance(point: Point, polyline: List[Point]) -> Option
 
 
 def _slice_polyline(polyline: List[Point], s0: float, s1: float) -> List[Point]:
+    """
+    沿折线弧长 [s0,s1] 的子路径，保留中间顶点（避免仅 [起点,终点] 的直线弦）。
+    """
     total = _path_length(polyline)
     if total < 1e-9:
-        return list(polyline)
-    start_s = max(0.0, min(total, s0))
-    end_s = max(0.0, min(total, s1))
-    if end_s < start_s:
-        start_s, end_s = end_s, start_s
-    start_pt = _point_at_distance(polyline, start_s)
-    end_pt = _point_at_distance(polyline, end_s)
-    out: List[Point] = [start_pt]
+        return [(float(polyline[0][0]), float(polyline[0][1]))] if polyline else []
+    if len(polyline) < 2:
+        return [(float(polyline[0][0]), float(polyline[0][1]))]
+
+    a0 = max(0.0, min(total, min(s0, s1)))
+    a1 = max(0.0, min(total, max(s0, s1)))
+    if a1 - a0 < 1e-4:
+        mid = 0.5 * (a0 + a1)
+        delta = min(8.0, max(3.0, total * 0.02))
+        a0 = max(0.0, mid - delta)
+        a1 = min(total, mid + delta)
+
+    out: List[Point] = []
     cum = 0.0
     for i in range(len(polyline) - 1):
-        seg_len = _dist(polyline[i], polyline[i + 1])
+        p_a, p_b = polyline[i], polyline[i + 1]
+        seg_len = _dist(p_a, p_b)
         if seg_len < 1e-9:
             continue
-        if cum > start_s + 1e-9 and cum < end_s - 1e-9:
-            out.append((float(polyline[i][0]), float(polyline[i][1])))
+        seg_lo, seg_hi = cum, cum + seg_len
+        lo = max(a0, seg_lo)
+        hi = min(a1, seg_hi)
+        if hi < lo - 1e-9:
+            cum += seg_len
+            continue
+        t_lo = max(0.0, min(1.0, (lo - seg_lo) / seg_len))
+        t_hi = max(0.0, min(1.0, (hi - seg_lo) / seg_len))
+        q_lo = (
+            p_a[0] + t_lo * (p_b[0] - p_a[0]),
+            p_a[1] + t_lo * (p_b[1] - p_a[1]),
+        )
+        q_hi = (
+            p_a[0] + t_hi * (p_b[0] - p_a[0]),
+            p_a[1] + t_hi * (p_b[1] - p_a[1]),
+        )
+        if not out:
+            out.append((float(q_lo[0]), float(q_lo[1])))
+        elif _dist(out[-1], q_lo) > 1e-4:
+            out.append((float(q_lo[0]), float(q_lo[1])))
+        if _dist(q_lo, q_hi) > 1e-4:
+            out.append((float(q_hi[0]), float(q_hi[1])))
         cum += seg_len
-    if _dist(out[-1], end_pt) > 1e-6:
-        out.append(end_pt)
-    if len(out) == 1:
-        out.append(end_pt)
+
+    if len(out) < 2:
+        p0 = _point_at_distance(polyline, a0)
+        p1 = _point_at_distance(polyline, a1)
+        if _dist(p0, p1) < 1e-6:
+            return [p0, (p0[0] + 0.5, p0[1] + 0.5)]
+        return [p0, p1]
     return out
 
 
@@ -300,7 +332,26 @@ def _connect_geometry_topo(
     """
     Connect along TopoGraph via Dijkstra (planner/topo_dijkstra.py).
     Falls back to dense Euclidean interpolation only if topo is missing or planner errors.
+    同一 edge 上两点：沿该边 pixel_polyline 截取子折线，不拉直线、不走跨边 Dijkstra。
     """
+    if (
+        from_edge_id
+        and to_edge_id
+        and from_edge_id == to_edge_id
+        and edge_task_map
+        and from_edge_id in edge_task_map
+    ):
+        from core.image_pixel_coords import edge_pixel_polyline
+
+        poly = edge_pixel_polyline(edge_task_map[from_edge_id])
+        if len(poly) >= 2:
+            sa = _project_to_polyline_distance(point_a, poly)
+            sb = _project_to_polyline_distance(point_b, poly)
+            if sa is not None and sb is not None:
+                seg = _slice_polyline(poly, sa, sb)
+                if len(seg) >= 2:
+                    return seg
+
     if topo_graph is not None and edge_task_map:
         try:
             geom, _ = generate_connection_segment_with_planner(
@@ -391,52 +442,168 @@ def _sample_polyline(
     return sampled
 
 
-def _extract_inspect_tasks(base_mission: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    edge_points: Dict[str, List[Point]] = {}
-    for pt in base_mission.get("inspection_points", []) or []:
-        edge_id = pt.get("edge_id")
-        pos = pt.get("pixel_position") or [pt.get("x"), pt.get("y")]
-        if not edge_id or not pos or len(pos) < 2:
+def _topo_pixel_polyline_for_edge(base_mission: Dict[str, Any], eid: str) -> Optional[List[Point]]:
+    """metadata / mission_metadata 中 topo_edges_pixel 的折线（与电网红线一致）。"""
+    meta = base_mission.get("metadata") or {}
+    nested = meta.get("mission_metadata") if isinstance(meta.get("mission_metadata"), dict) else {}
+    edges = meta.get("topo_edges_pixel") or nested.get("topo_edges_pixel") or base_mission.get("topo_edges_pixel")
+    if not isinstance(edges, list):
+        return None
+    for row in edges:
+        if str(row.get("edge_id")) != str(eid):
             continue
-        edge_points.setdefault(edge_id, []).append((float(pos[0]), float(pos[1])))
+        raw = row.get("pixel_polyline") or row.get("image_polyline") or row.get("original_polyline")
+        if raw and len(raw) >= 2:
+            return [(float(p[0]), float(p[1])) for p in raw if p is not None and len(p) >= 2]
+    return None
 
-    tasks: Dict[str, Dict[str, Any]] = {}
-    for seg in base_mission.get("segments", []):
-        if seg.get("type") != "inspect":
-            continue
-        eid = seg.get("edge_id")
-        if not eid:
+
+def _baseline_inspect_polyline_for_edge(base_mission: Dict[str, Any], eid: str) -> Optional[List[Point]]:
+    """baseline 中该 edge 最长的一条 inspect geometry。"""
+    best: Optional[List[Point]] = None
+    best_len = -1.0
+    for seg in base_mission.get("segments", []) or []:
+        if seg.get("type") != "inspect" or str(seg.get("edge_id")) != str(eid):
             continue
         geom = seg.get("geometry_2d") or []
-        polyline: List[Point] = [
-            (float(p[0]), float(p[1])) for p in geom if len(p) >= 2
-        ]
-        if len(polyline) < 2:
+        poly = [(float(p[0]), float(p[1])) for p in geom if len(p) >= 2]
+        ln = _path_length(poly)
+        if len(poly) >= 2 and ln > best_len:
+            best_len = ln
+            best = poly
+    return best
+
+
+def _reference_polyline_for_edge(
+    base_mission: Dict[str, Any],
+    eid: str,
+    edge_task_map: Optional[Dict[str, EdgeTask]],
+) -> Optional[List[Point]]:
+    """EdgeTask 像素折线 → topo_edges_pixel → baseline inspect。"""
+    if edge_task_map and eid in edge_task_map:
+        from core.image_pixel_coords import edge_pixel_polyline
+
+        pl = edge_pixel_polyline(edge_task_map[eid])
+        if len(pl) >= 2:
+            return pl
+    pl_topo = _topo_pixel_polyline_for_edge(base_mission, eid)
+    if pl_topo and len(pl_topo) >= 2:
+        return pl_topo
+    return _baseline_inspect_polyline_for_edge(base_mission, eid)
+
+
+def _candidate_edge_ids_ordered(base_mission: Dict[str, Any]) -> List[str]:
+    """visit_order JSON + inspect 段顺序，去重。"""
+    visit = base_mission.get("visit_order", {})
+    if isinstance(visit, dict):
+        raw_order = list(visit.get("edge_visit_order") or [])
+    elif isinstance(visit, list):
+        raw_order = list(visit)
+    else:
+        raw_order = []
+    seen = set()
+    out: List[str] = []
+    for tok in raw_order:
+        s = str(tok or "").strip()
+        if len(s) >= 2 and s[-1] in "+-":
+            s = s[:-1]
+        if not s or s in seen:
             continue
-        required_points = edge_points.get(eid, [])
-        if required_points:
-            projected = [
-                _project_to_polyline_distance(pt, polyline)
-                for pt in required_points
-            ]
-            projected = [s for s in projected if s is not None]
-            if projected:
-                s_min = min(projected)
-                s_max = max(projected)
-                trimmed = _slice_polyline(polyline, s_min, s_max)
-                if len(trimmed) >= 2:
-                    print(
-                        f"[DEBUG] dead-end branch skipped/truncated edge={eid} "
-                        f"slice=({s_min:.2f},{s_max:.2f}) full={_path_length(polyline):.2f} "
-                        f"trimmed={_path_length(trimmed):.2f}"
-                    )
-                    polyline = trimmed
+        seen.add(s)
+        out.append(s)
+    for seg in base_mission.get("segments", []) or []:
+        if seg.get("type") != "inspect" or not seg.get("edge_id"):
+            continue
+        eid = str(seg["edge_id"])
+        if eid not in seen:
+            seen.add(eid)
+            out.append(eid)
+    return out
+
+
+def _extract_inspect_tasks(
+    base_mission: Dict[str, Any],
+    *,
+    edge_task_map: Optional[Dict[str, EdgeTask]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    每条 edge 一条沿像素折线的巡检几何：弧长上仅覆盖该边所有巡检点之间的区间，
+    避免 inspect 段退化为 [首,末] 两点直线。
+    """
+    edge_points: Dict[str, List[Point]] = {}
+    for pt in base_mission.get("inspection_points", []) or []:
+        eid = pt.get("edge_id")
+        pos = pt.get("pixel_position") or [pt.get("x"), pt.get("y")]
+        if not eid or not pos or len(pos) < 2:
+            continue
+        edge_points.setdefault(str(eid), []).append((float(pos[0]), float(pos[1])))
+
+    tasks: Dict[str, Dict[str, Any]] = {}
+
+    if not edge_points:
+        for seg in base_mission.get("segments", []) or []:
+            if seg.get("type") != "inspect":
+                continue
+            eid = str(seg.get("edge_id") or "")
+            if not eid:
+                continue
+            geom = seg.get("geometry_2d") or []
+            polyline = [(float(p[0]), float(p[1])) for p in geom if len(p) >= 2]
+            if len(polyline) < 2:
+                continue
+            ref = _reference_polyline_for_edge(base_mission, eid, edge_task_map) or polyline
+            tasks[eid] = {
+                "edge_id": eid,
+                "polyline": ref,
+                "length": round(_path_length(ref), 2),
+            }
+        return tasks
+
+    for eid in _candidate_edge_ids_ordered(base_mission):
+        if eid not in edge_points:
+            continue
+        ref = _reference_polyline_for_edge(base_mission, eid, edge_task_map)
+        if not ref or len(ref) < 2:
+            print(f"[WARN] replan: no reference polyline for edge={eid}, skip")
+            continue
+        pts = edge_points[eid]
+        projected: List[float] = []
+        for pt in pts:
+            s = _project_to_polyline_distance(pt, ref)
+            if s is not None:
+                projected.append(s)
+        if not projected:
+            print(f"[WARN] replan: cannot project points onto edge={eid}, skip")
+            continue
+        s_min, s_max = min(projected), max(projected)
+        trimmed = _slice_polyline(ref, s_min, s_max)
+        if len(trimmed) < 2:
+            total = _path_length(ref)
+            trimmed = _slice_polyline(ref, max(0.0, s_min - 3.0), min(total, s_max + 3.0))
+        if len(trimmed) < 2:
+            continue
         tasks[eid] = {
             "edge_id": eid,
-            "polyline": polyline,
-            "length": round(_path_length(polyline), 2),
+            "polyline": trimmed,
+            "length": round(_path_length(trimmed), 2),
         }
+        print(
+            f"[replan-inspect-task] edge={eid} n_inspection_pts={len(pts)} "
+            f"s_range=({min(projected):.2f},{max(projected):.2f}) "
+            f"ref_len={_path_length(ref):.1f} out_pts={len(trimmed)}"
+        )
     return tasks
+
+
+def _strip_visit_direction_suffix(edge_token: str) -> str:
+    """
+    mission JSON 中 visit_order.edge_visit_order 常为 'L_001_edge_0+' / 'L_001_edge_0-'，
+    与 segment.edge_id（无后缀）不一致；重规划须归一化后再与 tasks 对齐。
+    """
+    s = str(edge_token or "").strip()
+    if len(s) >= 2 and s[-1] in "+-":
+        return s[:-1]
+    return s
 
 
 def _edge_visit_order(base_mission: Dict[str, Any], tasks: Dict[str, Dict[str, Any]]) -> List[str]:
@@ -448,15 +615,23 @@ def _edge_visit_order(base_mission: Dict[str, Any], tasks: Dict[str, Dict[str, A
     else:
         order = []
 
-    ordered = [eid for eid in order if eid in tasks]
+    seen = set()
+    ordered: List[str] = []
+    for raw in order:
+        eid = _strip_visit_direction_suffix(raw)
+        if eid in tasks and eid not in seen:
+            seen.add(eid)
+            ordered.append(eid)
     for eid in tasks:
-        if eid not in ordered:
+        if eid not in seen:
+            seen.add(eid)
             ordered.append(eid)
     if not ordered:
         for seg in base_mission.get("segments", []):
             if seg.get("type") == "inspect" and seg.get("edge_id"):
-                eid = seg["edge_id"]
-                if eid not in ordered:
+                eid = str(seg["edge_id"])
+                if eid in tasks and eid not in seen:
+                    seen.add(eid)
                     ordered.append(eid)
     return ordered
 
@@ -712,6 +887,135 @@ def _make_inspect_segment(
     }
 
 
+def _log_replan_path_debug(
+    segments: List[Dict[str, Any]],
+    visit_order_edges: List[str],
+    *,
+    tag: str = "start_end_replan",
+) -> None:
+    """控制台调试：段数量、visit_order、各 connect 起终点、重复 connect 与相邻 connect 检查。"""
+    inspect_segs = [s for s in segments if s.get("type") == "inspect"]
+    connect_segs = [s for s in segments if s.get("type") == "connect"]
+    n_insp = len(inspect_segs)
+    n_conn = len(connect_segs)
+    print(f"\n[{tag}] path-debug ===")
+    print(f"  inspect_segment_count={n_insp}")
+    print(f"  connect_segment_count={n_conn}")
+    print(f"  visit_order (len={len(visit_order_edges)}): {visit_order_edges}")
+
+    for i, s in enumerate(connect_segs):
+        geom = s.get("geometry_2d") or []
+        role = s.get("role") or "?"
+        fe = s.get("from_edge_id")
+        te = s.get("to_edge_id")
+        if len(geom) >= 1:
+            p0 = geom[0]
+            p1 = geom[-1] if len(geom) >= 2 else p0
+        else:
+            p0 = ("?", "?")
+            p1 = ("?", "?")
+        print(
+            f"  connect[{i}] role={role} from_edge={fe!r} to_edge={te!r} "
+            f"start=({float(p0[0]):.1f},{float(p0[1]):.1f}) "
+            f"end=({float(p1[0]):.1f},{float(p1[1]):.1f}) npts={len(geom)}"
+        )
+
+    for i, s in enumerate(inspect_segs):
+        geom = s.get("geometry_2d") or []
+        eid = s.get("edge_id")
+        if len(geom) >= 1:
+            q0 = geom[0]
+            q1 = geom[-1] if len(geom) >= 2 else q0
+        else:
+            q0 = ("?", "?")
+            q1 = ("?", "?")
+        print(
+            f"  inspect[{i}] edge_id={eid!r} start=({float(q0[0]):.1f},{float(q0[1]):.1f}) "
+            f"end=({float(q1[0]):.1f},{float(q1[1]):.1f}) npts={len(geom)}"
+        )
+
+    dup_keys: Dict[tuple, int] = {}
+    for s in connect_segs:
+        key = (s.get("from_edge_id"), s.get("to_edge_id"), s.get("role"))
+        dup_keys[key] = dup_keys.get(key, 0) + 1
+    dup_report = {str(k): v for k, v in dup_keys.items() if v > 1}
+    if dup_report:
+        print(f"  [WARN] duplicate connect (from_edge,to_edge,role) -> counts: {dup_report}")
+    else:
+        print("  duplicate_connect_keys: none")
+
+    bad_adj: List[int] = []
+    for i in range(len(segments) - 1):
+        if segments[i].get("type") == "connect" and segments[i + 1].get("type") == "connect":
+            bad_adj.append(i)
+    if bad_adj:
+        print(f"  [ERROR] consecutive connect segment pairs at indices {bad_adj}")
+    else:
+        print("  consecutive_connect_check: ok")
+
+    types = [s.get("type") for s in segments]
+    gap_doubles: List[int] = []
+    for i in range(len(types) - 3):
+        if (
+            types[i] == "inspect"
+            and types[i + 1] == "connect"
+            and types[i + 2] == "connect"
+            and types[i + 3] == "inspect"
+        ):
+            gap_doubles.append(i)
+    if gap_doubles:
+        print(
+            f"  [ERROR] two connect segments between one inspect pair "
+            f"(pattern at seg indices): {gap_doubles}"
+        )
+    else:
+        print("  at_most_one_connect_between_inspects: ok")
+
+    if n_insp > 0 and n_conn > n_insp + 1:
+        print(
+            f"  [WARN] connect_segment_count ({n_conn}) > inspect_count+1 ({n_insp + 1}); "
+            "possible redundant gap connects"
+        )
+
+    insp_edges = [s.get("edge_id") for s in inspect_segs]
+    dup_insp = [e for e in set(insp_edges) if insp_edges.count(e) > 1]
+    if dup_insp:
+        print(f"  [WARN] same edge_id appears in multiple inspect segments: {dup_insp}")
+    else:
+        print("  duplicate_inspect_edge: none")
+
+    print(f"[{tag}] path-debug === end\n")
+
+
+def _log_replan_point_projections(
+    base_mission: Dict[str, Any],
+    tasks: Dict[str, Dict[str, Any]],
+    visit_order: List[str],
+) -> None:
+    """每个巡检点在其 inspect 折线上的投影弧长 projected_s；按边、按 s 排序。"""
+    print("\n[replan-projection] ===")
+    edge_rows: Dict[str, List[Tuple[float, str, Point]]] = {}
+    for pt in base_mission.get("inspection_points", []) or []:
+        eid = str(pt.get("edge_id") or "")
+        if eid not in tasks:
+            continue
+        pid = str(pt.get("point_id") or pt.get("id") or "?")
+        pos = pt.get("pixel_position") or [pt.get("x"), pt.get("y")]
+        if not pos or len(pos) < 2:
+            continue
+        xy = (float(pos[0]), float(pos[1]))
+        s = _project_to_polyline_distance(xy, tasks[eid]["polyline"])
+        if s is None:
+            continue
+        edge_rows.setdefault(eid, []).append((s, pid, xy))
+    for eid in visit_order:
+        rows = sorted(edge_rows.get(eid, []), key=lambda r: r[0])
+        print(f"  edge={eid} inspection_points_along_polyline (n={len(rows)}):")
+        for s, pid, xy in rows:
+            print(f"    point_id={pid} projected_s={s:.2f} xy=({xy[0]:.1f},{xy[1]:.1f})")
+    print("[replan-projection] === end\n")
+
+
 def build_start_end_replan_mission(
     base_mission: Dict[str, Any],
     start_xy: List[float],
@@ -728,15 +1032,6 @@ def build_start_end_replan_mission(
     iw, ih = replan_image_bounds_from_baseline(base_mission)
     start, end = validate_image_coords(start_xy, end_xy, width=iw, height=ih)
     spacing = max(20.0, float(planning_spacing))
-
-    tasks = _extract_inspect_tasks(base_mission)
-    if not tasks:
-        raise ReplanValidationError("No inspect segments in baseline mission")
-
-    visit_order = _edge_visit_order(base_mission, tasks)
-    visit_order, first_forward, first_entry = _rotate_order_nearest_start(
-        visit_order, tasks, start, weather_context=weather_context
-    )
 
     ctx_pre = mission_context or {}
     base_meta_early = base_mission.get("metadata") or {}
@@ -756,6 +1051,24 @@ def build_start_end_replan_mission(
         src_for_topo,
         spacing,
     )
+
+    tasks = _extract_inspect_tasks(base_mission, edge_task_map=edge_task_map or {})
+    if not tasks:
+        raise ReplanValidationError("No inspect segments in baseline mission")
+
+    visit_order = _edge_visit_order(base_mission, tasks)
+    visit_order = [e for e in visit_order if e in tasks]
+    if not visit_order:
+        raise ReplanValidationError(
+            "No edges with inspection tasks after pruning empty branches"
+        )
+
+    visit_order, first_forward, first_entry = _rotate_order_nearest_start(
+        visit_order, tasks, start, weather_context=weather_context
+    )
+
+    _log_replan_point_projections(base_mission, tasks, visit_order)
+
     cost_cfg = _weather_cost_config_for_dijkstra(weather_context)
     topo_reload_ok = topo_graph is not None and bool(edge_task_map)
     missing_topo_edges = [eid for eid in visit_order if eid not in edge_task_map]
@@ -967,4 +1280,5 @@ def build_start_end_replan_mission(
             or base_mission.get("image_inspection_overlay")
             or []
         )
+    _log_replan_path_debug(segments_out, visit_order, tag="start_end_replan")
     return mission
