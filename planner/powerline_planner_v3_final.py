@@ -134,7 +134,7 @@ class PowerlinePlannerV3:
         self.independent_lines = []  # List[IndependentLine]
         self.line_inspection_points = []  # List[LineInspectionPoint]
         self.line_inspection_points_by_line = {}  # Dict[line_id, List[LineInspectionPoint]]
-        self.inspection_point_source = "spacing"  # spacing | image
+        self.inspection_point_source = "spacing"  # spacing | image | manual
         self.image_inspection_detections = []
         self.image_inspection_overlay = []
         self.clean_map_path = None
@@ -189,6 +189,29 @@ class PowerlinePlannerV3:
 
         self.img_array = np.array(self.image).astype(np.float32) / 255.0
 
+        try:
+            from core.real_map_cv import extract_real_map_red_mask, is_real_map_detection_image
+
+            if is_real_map_detection_image(self.image_path):
+                rgb_u8 = np.array(self.image.convert("RGB"))
+                self.mask = extract_real_map_red_mask(rgb_u8)
+                pixel_count = int(np.sum(self.mask > 0))
+                print(f"  [真实地图] 高饱和红线像素: {pixel_count}")
+                os.makedirs("result", exist_ok=True)
+                os.makedirs("result/debug", exist_ok=True)
+                mask_img = Image.fromarray(self.mask)
+                mask_img.save("result/step1_hsv_mask.png")
+                try:
+                    from core.real_map_cv import is_real_map_detection_image, save_chengdu_red_mask
+
+                    if is_real_map_detection_image(self.image_path):
+                        save_chengdu_red_mask(self.mask)
+                except Exception:
+                    pass
+                return self.mask
+        except ImportError:
+            pass
+
         # HSV转换（降级处理）
         if rgb2hsv is not None:
             try:
@@ -225,6 +248,18 @@ class PowerlinePlannerV3:
 
         if self.mask is None:
             self.step1_extract_redline_hsv()
+
+        try:
+            from core.real_map_cv import is_real_map_detection_image
+
+            if is_real_map_detection_image(self.image_path):
+                pixel_count = int(np.sum(self.mask > 0))
+                print(f"  [真实地图] 红线已在 step1 完成 close+dilate，像素: {pixel_count}")
+                mask_img = Image.fromarray(self.mask)
+                mask_img.save("result/step2_fixed_mask.png")
+                return self.mask
+        except ImportError:
+            pass
 
         # 膨胀连接断裂（降级处理）
         if dilation is not None:
@@ -2287,6 +2322,19 @@ class PowerlinePlannerV3:
             sort_polylines=True
         )
 
+        try:
+            from core.real_map_cv import (
+                filter_independent_lines_for_real_map,
+                is_real_map_detection_image,
+            )
+
+            if is_real_map_detection_image(self.image_path):
+                self.independent_lines = filter_independent_lines_for_real_map(
+                    self.independent_lines
+                )
+        except ImportError:
+            pass
+
         # 设置主线路ID（最长线路）
         if self.independent_lines:
             self.primary_line_id = self.independent_lines[0].id
@@ -2384,38 +2432,78 @@ class PowerlinePlannerV3:
 
         return self.line_inspection_points
 
+    def load_real_satellite_manual_annotations(self, manual_json_path: str):
+        """从手工标注 JSON 加载线路与巡检点（跳过 CV 检测）。"""
+        from core.real_satellite_manual import apply_manual_dataset_to_planner
+
+        return apply_manual_dataset_to_planner(self, manual_json_path)
+
     def step5_detect_image_inspection_points(self, detector_config=None):
-        """Detect hollow black-ring inspection points from the input image."""
+        """Detect inspection points from the input image (green circles on real map)."""
         print("[STEP 5] 检测图像巡检点...")
         from core.inspection_point_detector import (
-            DEFAULT_DETECTOR_CONFIG,
             detect_black_inspection_points_with_stats,
             generate_clean_map,
+            resolve_detector_config,
         )
 
-        cfg = detector_config or DEFAULT_DETECTOR_CONFIG
+        cfg = resolve_detector_config(self.image_path, detector_config)
         self.inspection_detector_config = cfg
+        red_mask = self.mask if getattr(self, "mask", None) is not None else None
         self.image_inspection_detections, self.image_detection_stats = (
-            detect_black_inspection_points_with_stats(self.image_path, config=cfg)
+            detect_black_inspection_points_with_stats(
+                self.image_path, config=cfg, red_mask=red_mask
+            )
         )
+        try:
+            from core.real_map_cv import (
+                extract_real_map_green_mask,
+                is_real_map_detection_image,
+                save_green_mask,
+            )
+
+            if is_real_map_detection_image(self.image_path):
+                rgb_u8 = np.array(self.image.convert("RGB"))
+                green_mask = extract_real_map_green_mask(rgb_u8, red_mask=red_mask)
+                save_green_mask(green_mask)
+        except Exception as exc:
+            print(f"[WARN] 真实地图绿色点 mask 调试输出失败: {exc}")
         print("[巡检点检测] 统计:")
+        print(f"  - detector: {self.image_detection_stats.get('detector', 'legacy')}")
         print(f"  - raw contour candidates: {self.image_detection_stats.get('contour_candidates', 0)}")
-        print(f"  - hough candidates: {self.image_detection_stats.get('hough_candidates', 0)}")
         print(f"  - merged inspection points: {self.image_detection_stats.get('merged_points', 0)}")
         try:
-            self.clean_map_path = generate_clean_map(
-                self.image_path,
-                detections=self.image_inspection_detections,
-                config=cfg,
-            )
-            print(f"[图像底图] 已生成无黑圈底图: {self.clean_map_path}")
-        except Exception as exc:
-            self.clean_map_path = None
-            print(f"[WARN] clean map 生成失败: {exc}")
+            from core.real_map_cv import is_real_map_detection_image
+
+            real_map_same_image = is_real_map_detection_image(self.image_path)
+        except ImportError:
+            real_map_same_image = False
+
+        if real_map_same_image:
+            self.clean_map_path = str(self.image_path).replace("\\", "/")
+            print(f"[图像底图] 真实地图同源标注图: {self.clean_map_path}")
+        elif os.environ.get("UAV_DISPLAY_MAP", "").strip() and os.path.isfile(
+            os.environ.get("UAV_DISPLAY_MAP", "").strip()
+        ):
+            display_map = os.environ.get("UAV_DISPLAY_MAP", "").strip()
+            self.clean_map_path = display_map.replace("\\", "/")
+            print(f"[图像底图] 使用固定显示底图: {self.clean_map_path}")
+        else:
+            try:
+                self.clean_map_path = generate_clean_map(
+                    self.image_path,
+                    detections=self.image_inspection_detections,
+                    config=cfg,
+                )
+                print(f"[图像底图] 已生成无黑圈底图: {self.clean_map_path}")
+            except Exception as exc:
+                self.clean_map_path = None
+                print(f"[WARN] clean map 生成失败: {exc}")
         self.inspection_point_source = "image"
         self.line_inspection_points = []
         self.line_inspection_points_by_line = {}
-        print(f"[图像巡检点] 检测到 {len(self.image_inspection_detections)} 个黑色空心圆")
+        label = "绿色巡检圆" if self.image_detection_stats.get("detector") == "green_hsv" else "图像特征点"
+        print(f"[图像巡检点] 检测到 {len(self.image_inspection_detections)} 个{label}")
         return self.image_inspection_detections
 
     def step5_finalize_image_inspection_points(self, max_snap_distance: float = None):
@@ -2435,7 +2523,8 @@ class PowerlinePlannerV3:
         from core.inspection_point_detector import DEFAULT_DETECTOR_CONFIG
 
         cfg = self.inspection_detector_config or DEFAULT_DETECTOR_CONFIG
-        snap_threshold = float(max_snap_distance if max_snap_distance is not None else cfg.snap_threshold)
+        default_snap = 120.0 if getattr(cfg, "real_map_mode", False) else cfg.snap_threshold
+        snap_threshold = float(max_snap_distance if max_snap_distance is not None else default_snap)
         terrain = self.height_map_smooth if hasattr(self, "height_map_smooth") else None
         (
             self.line_inspection_points,
@@ -2463,6 +2552,35 @@ class PowerlinePlannerV3:
             self.image_path,
             "result/step5_line_inspection_points.png",
         )
+        try:
+            from core.real_map_cv import (
+                extract_real_map_green_mask,
+                extract_real_map_red_mask,
+                is_real_map_detection_image,
+                save_real_map_detection_debug,
+            )
+
+            if is_real_map_detection_image(self.image_path):
+                rgb_u8 = np.array(self.image.convert("RGB"))
+                red_mask = self.mask if getattr(self, "mask", None) is not None else None
+                if red_mask is None:
+                    red_mask = extract_real_map_red_mask(rgb_u8)
+                green_mask = extract_real_map_green_mask(rgb_u8, red_mask=red_mask)
+                polylines = [
+                    list(getattr(line, "ordered_pixels", None) or getattr(line, "polyline", []) or [])
+                    for line in (self.independent_lines or [])
+                ]
+                save_real_map_detection_debug(
+                    self.image_path,
+                    red_mask,
+                    green_mask,
+                    self.image_inspection_detections,
+                    polylines=polylines,
+                    line_count=len(self.independent_lines or []),
+                    stats=self.image_detection_stats,
+                )
+        except Exception as exc:
+            print(f"[WARN] 真实地图调试输出失败: {exc}")
         return self.line_inspection_points
 
     def _map_existing_points_to_3d(self):
@@ -2751,8 +2869,14 @@ class PowerlinePlannerV3:
         # 检测拓扑节点
         self.topo_nodes = detect_topo_nodes(self.independent_lines)
 
-        # 合并重复节点（距离相近的端点）
-        self.topo_nodes, old_to_new_id = merge_duplicate_nodes(self.topo_nodes, thresh=25.0)
+        # 合并重复节点（距离相近的端点）；真实地图像素模式跳过，避免 merged_* 锚点拉偏连线
+        from core.image_pixel_coords import use_image_pixel_coords
+
+        if use_image_pixel_coords():
+            old_to_new_id = {node.id: node.id for node in self.topo_nodes}
+            print("  [节点聚类] 真实地图模式：跳过节点合并，保留原图像素锚点")
+        else:
+            self.topo_nodes, old_to_new_id = merge_duplicate_nodes(self.topo_nodes, thresh=25.0)
 
         # 更新3D坐标
         if self.height_map_smooth is not None:

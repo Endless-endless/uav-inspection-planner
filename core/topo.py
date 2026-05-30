@@ -75,6 +75,9 @@ class TopoEdge:
     line_id: str                     # 所属线路ID
     polyline: List[Tuple[float, float]] # 2D几何（从u到v的骨架段）
     len2d: float                     # 长度
+    pixel_polyline: List[Tuple[float, float]] = field(default_factory=list)
+    original_polyline: List[Tuple[float, float]] = field(default_factory=list)
+    image_polyline: List[Tuple[float, float]] = field(default_factory=list)
     pts_idx: List[int] = field(default_factory=list)  # 该边对应的巡检点索引
     meta: Dict = field(default_factory=dict)
 
@@ -622,13 +625,23 @@ def update_edges_after_merge(edges: List[TopoEdge],
             removed_count += 1
             continue
 
+        px = list(
+            edge.pixel_polyline
+            or edge.original_polyline
+            or edge.image_polyline
+            or edge.polyline
+            or []
+        )
         # 创建更新后的边
         updated_edge = TopoEdge(
             id=edge.id,
             u=new_u,
             v=new_v,
             line_id=edge.line_id,
-            polyline=edge.polyline,
+            polyline=px,
+            pixel_polyline=list(px),
+            original_polyline=list(px),
+            image_polyline=list(px),
             len2d=edge.len2d,
             pts_idx=edge.pts_idx,
             is_straight=edge.is_straight,
@@ -737,12 +750,16 @@ def split_line_to_edges(line, nodes_on_line: List[TopoNode],
                             max_dev = max(max_dev, dev)
                         is_straight = max_dev < 5.0
 
+                px = [(float(p[0]), float(p[1])) for p in edge_polyline]
                 edge = TopoEdge(
                     id=f"{line.id}_edge_0",
                     u=u_node.id,
                     v=v_node.id,
                     line_id=line.id,
-                    polyline=edge_polyline,
+                    polyline=px,
+                    pixel_polyline=list(px),
+                    original_polyline=list(px),
+                    image_polyline=list(px),
                     len2d=edge_len,
                     is_straight=is_straight,
                     split_reason=None
@@ -817,12 +834,16 @@ def split_line_to_edges(line, nodes_on_line: List[TopoNode],
         if v_node.kind == "split":
             split_reason = v_node.split_reason
 
+        px = [(float(p[0]), float(p[1])) for p in edge_polyline]
         edge = TopoEdge(
             id=f"{line.id}_edge_{i}",
             u=u_node.id,
             v=v_node.id,
             line_id=line.id,
-            polyline=edge_polyline,
+            polyline=px,
+            pixel_polyline=list(px),
+            original_polyline=list(px),
+            image_polyline=list(px),
             len2d=edge_len,
             is_straight=is_straight,
             split_reason=split_reason

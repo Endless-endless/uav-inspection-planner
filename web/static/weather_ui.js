@@ -761,7 +761,22 @@ function replaceTraceSet(plotId, predicate, traces) {
   const el = document.getElementById(plotId);
   if (!el?.data || !state.plotReady[plotId]) return;
   const keep = el.data.filter((t) => !predicate(t));
-  Plotly.react(plotId, keep.concat(traces), el.layout, { responsive: plotId !== "mapPlotFs", displayModeBar: true, scrollZoom: true });
+  const mission = typeof getCurrentMission === "function" ? getCurrentMission() : null;
+  const layout =
+    typeof applyFixedSatelliteToLayout === "function"
+      ? applyFixedSatelliteToLayout(el.layout, mission)
+      : {
+          ...(el.layout || {}),
+          images:
+            typeof getFixedSatelliteLayoutImages === "function"
+              ? getFixedSatelliteLayoutImages(mission)
+              : el.layout?.images || [],
+        };
+  Plotly.react(plotId, keep.concat(traces), layout, {
+    responsive: plotId !== "mapPlotFs",
+    displayModeBar: true,
+    scrollZoom: true,
+  });
 }
 
 function updateWeatherPlotTraces() {

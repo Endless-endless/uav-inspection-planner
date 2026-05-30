@@ -15,6 +15,7 @@ UAV 电网巡检 — 统一 Web Dashboard
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -23,7 +24,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -70,6 +71,11 @@ LATEST_MISSION_PATH = LATEST_DIR / "mission_output.json"
 LATEST_HTML_PATH = LATEST_DIR / "main_view_interactive.html"
 DEFAULT_MAP_PATH = "data/test.png"
 DEFAULT_POINT_MAP_PATH = "data/test_point.png"
+IMAGE_DATASETS_PATH = DATA_DIR / "image_datasets.json"
+REAL_SATELLITE_POINT_MAP = "data/chengdu_real_point.png"
+REAL_SATELLITE_DISPLAY_MAP = REAL_SATELLITE_POINT_MAP
+REAL_SATELLITE_LINE_MAP = "data/chengdu_real_line.png"
+REAL_SATELLITE_POINT_MAP = "data/chengdu_real_point.png"
 InspectionPointSource = Literal["spacing", "image"]
 DEMO_VISUALIZATION_SCRIPT = ROOT / "demo" / "demo_visualization_main.py"
 _image_gen_lock = threading.Lock()
@@ -96,6 +102,27 @@ app.add_middleware(
 
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+if DATA_DIR.is_dir():
+    app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data_files")
+
+
+@app.on_event("startup")
+async def _debug_log_app_identity():
+    """启动时打印本文件路径；若由 python app.py 启动，环境变量含实际监听 URL。"""
+    app_path = Path(__file__).resolve()
+    listen = os.environ.get("_UAV_APP_LISTEN_URL", "")
+    print("\n" + "=" * 60, flush=True)
+    print("[app startup] FastAPI 已加载，当前 app 定义自:", flush=True)
+    print(f"  __file__ = {app_path}", flush=True)
+    if listen:
+        print(f"  监听地址 = {listen}", flush=True)
+        print(f"  健康检查: {listen}/debug/ping", flush=True)
+    else:
+        print(
+            "  监听地址 = (未设置 _UAV_APP_LISTEN_URL；可能由 uvicorn CLI 启动，请看上方 'Uvicorn running on ...')",
+            flush=True,
+        )
+    print("=" * 60 + "\n", flush=True)
 
 
 class PlanRequest(BaseModel):
@@ -112,7 +139,7 @@ class PlanRequest(BaseModel):
 
 class ImageGenerateRequest(BaseModel):
     force: bool = False
-    inspection_point_source: InspectionPointSource = "spacing"
+    inspection_point_source: InspectionPointSource = "image"
     image_path: str = DEFAULT_MAP_PATH
 
 
@@ -188,6 +215,82 @@ def _attach_weather_dashboard_fields(
     dashboard["weather_zones"] = zones
 
 
+def _load_image_dataset_registry() -> Dict[str, Any]:
+    if not IMAGE_DATASETS_PATH.exists():
+        return {
+            "default_id": "legacy_test",
+            "datasets": [
+                {
+                    "id": "legacy_test",
+                    "dataset": DEFAULT_POINT_MAP_PATH,
+                    "clean_map_image": "auto",
+                    "line_image": DEFAULT_MAP_PATH,
+                    "point_image": DEFAULT_POINT_MAP_PATH,
+                    "dataset_type": "legacy",
+                }
+            ],
+        }
+    with IMAGE_DATASETS_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _image_dataset_profiles() -> List[Dict[str, Any]]:
+    return list(_load_image_dataset_registry().get("datasets") or [])
+
+
+def resolve_image_dataset_profile(image_path: str) -> Dict[str, Any]:
+    """根据请求路径匹配图像数据集配置（真实卫星 / 旧 test 图）。"""
+    rel = str(image_path or "").replace("\\", "/")
+    profiles = _image_dataset_profiles()
+    for profile in profiles:
+        candidates = {
+            str(profile.get("dataset") or ""),
+            str(profile.get("point_image") or ""),
+            str(profile.get("line_image") or ""),
+            str(profile.get("clean_map_image") or ""),
+        }
+        if rel and rel in candidates:
+            return dict(profile)
+    default_id = _load_image_dataset_registry().get("default_id")
+    for profile in profiles:
+        if profile.get("id") == default_id:
+            return dict(profile)
+    if profiles:
+        return dict(profiles[0])
+    return {
+        "id": "legacy_test",
+        "dataset": DEFAULT_POINT_MAP_PATH,
+        "clean_map_image": "auto",
+        "line_image": DEFAULT_MAP_PATH,
+        "point_image": DEFAULT_POINT_MAP_PATH,
+        "dataset_type": "legacy",
+    }
+
+
+def resolve_detection_image_path(
+    profile: Dict[str, Any],
+    inspection_point_source: str,
+) -> str:
+    source = normalize_inspection_point_source(inspection_point_source)
+    if source == "image":
+        return str(profile.get("point_image") or profile.get("dataset") or DEFAULT_POINT_MAP_PATH)
+    return str(profile.get("line_image") or profile.get("dataset") or DEFAULT_MAP_PATH)
+
+
+def resolve_display_map_path(profile: Dict[str, Any]) -> Optional[str]:
+    if str(profile.get("dataset_type") or "") == "real_satellite":
+        return str(
+            profile.get("point_image")
+            or profile.get("clean_map_image")
+            or profile.get("dataset")
+            or REAL_SATELLITE_POINT_MAP
+        )
+    clean = str(profile.get("clean_map_image") or "")
+    if clean and clean != "auto":
+        return clean
+    return None
+
+
 def _resolve_image_path(image_path: str) -> str:
     rel = str(image_path or DEFAULT_MAP_PATH).replace("\\", "/")
     path = resolve_map_path(ROOT, rel)
@@ -203,10 +306,14 @@ def _resolve_image_path(image_path: str) -> str:
 def _mission_generation_config(mission_data: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     meta = (mission_data or {}).get("metadata") or {}
     source = normalize_inspection_point_source(meta.get("inspection_point_source"))
-    image_path = str(meta.get("map_image") or DEFAULT_MAP_PATH)
+    image_path = str(meta.get("map_image") or meta.get("point_image") or DEFAULT_MAP_PATH)
+    display_map = str(meta.get("clean_map_image") or meta.get("display_map_image") or "")
+    dataset_type = str(meta.get("dataset_type") or "")
     return {
         "inspection_point_source": source,
         "image_path": image_path,
+        "display_map_image": display_map,
+        "dataset_type": dataset_type,
     }
 
 
@@ -263,12 +370,23 @@ def _run_image_demo_main(
     *,
     inspection_point_source: str = "spacing",
     image_path: str = DEFAULT_MAP_PATH,
+    display_map_path: Optional[str] = None,
+    dataset_profile: Optional[Dict[str, Any]] = None,
 ) -> None:
     """调用图像主线 demo（优先 import main，失败则 subprocess）。"""
     import os
 
     os.environ["UAV_INSPECTION_SOURCE"] = inspection_point_source
     os.environ["UAV_IMAGE_PATH"] = image_path
+    if display_map_path:
+        os.environ["UAV_DISPLAY_MAP"] = display_map_path
+    else:
+        os.environ.pop("UAV_DISPLAY_MAP", None)
+    os.environ.pop("UAV_MANUAL_JSON_PATH", None)
+    if dataset_profile:
+        os.environ["UAV_DATASET_TYPE"] = str(dataset_profile.get("dataset_type") or "")
+        if str(dataset_profile.get("dataset_type") or "") == "real_satellite":
+            os.environ["UAV_IMAGE_PIXEL_COORDS"] = "1"
     try:
         from demo.demo_visualization_main import main as demo_main
 
@@ -286,6 +404,14 @@ def _run_image_demo_main(
         env = os.environ.copy()
         env["UAV_INSPECTION_SOURCE"] = inspection_point_source
         env["UAV_IMAGE_PATH"] = image_path
+        if display_map_path:
+            env["UAV_DISPLAY_MAP"] = display_map_path
+        elif "UAV_DISPLAY_MAP" in env:
+            del env["UAV_DISPLAY_MAP"]
+        if "UAV_MANUAL_JSON_PATH" in env:
+            del env["UAV_MANUAL_JSON_PATH"]
+        if dataset_profile:
+            env["UAV_DATASET_TYPE"] = str(dataset_profile.get("dataset_type") or "")
         proc = subprocess.run(
             [sys.executable, str(DEMO_VISUALIZATION_SCRIPT)],
             cwd=str(ROOT),
@@ -326,9 +452,15 @@ def ensure_image_pipeline_outputs(
         except Exception:
             existing_config = {}
 
+    profile = resolve_image_dataset_profile(image_path)
+    display_map = resolve_display_map_path(profile)
     config_changed = (
         existing_config.get("inspection_point_source") != inspection_point_source
         or existing_config.get("image_path") != image_path
+        or (
+            display_map
+            and existing_config.get("display_map_image") != display_map
+        )
     )
     if config_changed:
         force = True
@@ -367,6 +499,8 @@ def ensure_image_pipeline_outputs(
             _run_image_demo_main(
                 inspection_point_source=inspection_point_source,
                 image_path=image_path,
+                display_map_path=display_map,
+                dataset_profile=profile,
             )
         finally:
             _image_generating = False
@@ -543,17 +677,26 @@ async def _plan_image_pipeline(
     image_path: str = DEFAULT_MAP_PATH,
 ) -> Dict[str, Any]:
     """图像主线：自动生成（如需）并加载 result/latest/mission_output.json。"""
-    image_path = _resolve_image_path(image_path)
+    profile = resolve_image_dataset_profile(image_path)
+    detection_path = _resolve_image_path(
+        resolve_detection_image_path(profile, inspection_point_source)
+    )
+    display_map = resolve_display_map_path(profile)
+    if display_map:
+        display_map = _resolve_image_path(display_map)
     gen = ensure_image_pipeline_outputs(
         force=False,
         inspection_point_source=inspection_point_source,
-        image_path=image_path,
+        image_path=detection_path,
     )
     if not gen.get("ok"):
         raise HTTPException(status_code=500, detail=gen.get("message", "Image pipeline generation failed"))
 
+    map_rel_for_dashboard = display_map or detection_path
     try:
-        dashboard = build_image_pipeline_dashboard(LATEST_MISSION_PATH, ROOT, map_rel=image_path)
+        dashboard = build_image_pipeline_dashboard(
+            LATEST_MISSION_PATH, ROOT, map_rel=map_rel_for_dashboard
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -567,7 +710,34 @@ async def _plan_image_pipeline(
     dashboard["metadata"]["inspection_point_source"] = normalize_inspection_point_source(
         inspection_point_source
     )
-    dashboard["metadata"]["map_image"] = image_path
+    dashboard["metadata"]["map_image"] = detection_path
+    dashboard["metadata"]["point_image"] = str(profile.get("point_image") or detection_path)
+    dashboard["metadata"]["line_image"] = str(profile.get("line_image") or detection_path)
+    if display_map:
+        dashboard["metadata"]["clean_map_image"] = display_map
+        dashboard["metadata"]["display_map_image"] = display_map
+        if dashboard.get("map_background"):
+            map_bg = get_background_map_config(ROOT, display_map)
+            dashboard["map_background"] = map_bg
+    dashboard["metadata"]["dataset"] = str(profile.get("dataset") or detection_path)
+    dashboard["metadata"]["dataset_type"] = str(profile.get("dataset_type") or "legacy")
+    dashboard["metadata"]["image_dataset_id"] = str(profile.get("id") or "")
+    if dashboard["metadata"].get("dataset_type") == "real_satellite" or "chengdu_real_point" in str(
+        map_rel_for_dashboard
+    ):
+        mb = dashboard.get("map_background") or {}
+        iw, ih = mb.get("width"), mb.get("height")
+        dashboard["metadata"]["coordinate_mode"] = "image_pixel_fixed"
+        dashboard["metadata"]["pixel_coordinate_mode"] = True
+        if iw and ih:
+            dashboard["metadata"]["image_width"] = iw
+            dashboard["metadata"]["image_height"] = ih
+            dashboard["bounds"] = {
+                "x_range": [0, float(iw)],
+                "y_range": [float(ih), 0],
+                "width": float(iw),
+                "height": float(ih),
+            }
     dashboard["image_inspection_overlay"] = dashboard.get("metadata", {}).get("image_inspection_overlay") or []
     dashboard["output_files"] = {
         "mission_snapshot": "latest_image_mission_snapshot.json",
@@ -589,7 +759,8 @@ async def _plan_image_pipeline(
             mission_data,
             request={
                 "inspection_point_source": inspection_point_source,
-                "image_path": image_path,
+                "image_path": detection_path,
+                "display_map_image": display_map,
             },
             dashboard=dashboard,
         )
@@ -761,6 +932,16 @@ async def api_datasets():
     return {"datasets": _list_datasets()}
 
 
+@app.get("/api/image-datasets")
+async def api_image_datasets():
+    """图像管线数据集配置（检测输入 / 显示底图分离）。"""
+    registry = _load_image_dataset_registry()
+    return {
+        "default_id": registry.get("default_id"),
+        "datasets": _image_dataset_profiles(),
+    }
+
+
 @app.get("/api/map/config")
 async def api_map_config(path: str = DEFAULT_MAP_PATH):
     """Image Pipeline 底图配置。"""
@@ -861,6 +1042,217 @@ async def api_image_mission_generate(req: ImageGenerateRequest):
     )
     status = 200 if result.get("ok") else 500
     return JSONResponse(result, status_code=status)
+
+
+@app.get("/debug/ping")
+async def debug_ping():
+    return {"ok": True, "app": "current app.py"}
+
+
+@app.get("/debug/image-map")
+async def debug_image_map():
+    """调试页：仅显示 data/chengdu_real_point.png，不加载 mission，不画路径，不画点。"""
+    img_rel = "data/chengdu_real_point.png"
+    img_path = ROOT / img_rel
+    if not img_path.exists():
+        raise HTTPException(status_code=404, detail=f"Image not found: {img_rel}")
+    try:
+        from PIL import Image as PILImage
+        with PILImage.open(img_path) as im:
+            img_w, img_h = im.size
+    except Exception:
+        img_w, img_h = 1415, 1258  # fallback
+    img_url = f"/data/{img_rel.removeprefix('data/')}"
+    html = f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>Debug: chengdu_real_point.png</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    body {{ margin: 0; background: #111; color: #eee; font-family: sans-serif; }}
+    #info {{ padding: 8px 16px; background: #1a2332; font-size: 13px; }}
+    #plot {{ width: 100vw; height: calc(100vh - 36px); }}
+  </style>
+</head>
+<body>
+  <div id="info">
+    图片路径: <code>{img_rel}</code> &nbsp;|&nbsp;
+    实际尺寸: <strong>{img_w} × {img_h}</strong> px &nbsp;|&nbsp;
+    URL: <code>{img_url}</code>
+    <span id="imgStatus" style="margin-left:16px;color:#facc15"></span>
+  </div>
+  <div id="plot"></div>
+  <script>
+    const IMG_W = {img_w};
+    const IMG_H = {img_h};
+    const IMG_URL = "{img_url}";
+
+    // 预加载检测
+    const probe = new Image();
+    probe.onload = function() {{
+      document.getElementById("imgStatus").textContent = "✓ 图片加载成功";
+    }};
+    probe.onerror = function() {{
+      document.getElementById("imgStatus").textContent = "✗ 图片加载失败 — 检查 URL: " + IMG_URL;
+      console.error("[debug/image-map] 图片加载失败:", IMG_URL);
+    }};
+    probe.src = IMG_URL;
+
+    const layout = {{
+      paper_bgcolor: "#1a2332",
+      plot_bgcolor: "#1a2332",
+      margin: {{ l: 0, r: 0, t: 0, b: 0 }},
+      images: [{{
+        source: IMG_URL,
+        xref: "x",
+        yref: "y",
+        x: 0,
+        y: IMG_H,
+        sizex: IMG_W,
+        sizey: IMG_H,
+        sizing: "stretch",
+        opacity: 1,
+        layer: "below"
+      }}],
+      xaxis: {{
+        range: [0, IMG_W],
+        autorange: false,
+        showgrid: false,
+        zeroline: false,
+        constrain: "domain"
+      }},
+      yaxis: {{
+        range: [IMG_H, 0],
+        autorange: false,
+        showgrid: false,
+        zeroline: false,
+        scaleanchor: "x",
+        scaleratio: 1
+      }},
+      autosize: true
+    }};
+
+    Plotly.newPlot("plot", [], layout, {{
+      responsive: true,
+      displayModeBar: true,
+      scrollZoom: true
+    }}).then(function() {{
+      console.log("[debug/image-map] Plotly 渲染完成，layout.images:", layout.images);
+    }});
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+@app.get("/debug/image-plot")
+async def debug_image_plot():
+    """最小 Plotly：用 image trace 验证底图（不使用 layout.images）。
+
+    Plotly image trace 的 `source` 按 schema 为 data URI；先请求同一 /api 图再转 data URI 后绘图。
+    """
+    html = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>debug/image-plot (image trace)</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; }
+    #plot { width: 100vw; height: 100vh; }
+    #err { color: #f87171; padding: 12px; font-family: system-ui, sans-serif; font-size: 14px; display: none; }
+  </style>
+</head>
+<body>
+  <div id="err"></div>
+  <div id="plot"></div>
+  <script>
+    function showErr(msg) {
+      var el = document.getElementById("err");
+      el.style.display = "block";
+      el.textContent = msg;
+      console.error("[debug/image-plot]", msg);
+    }
+
+    function renderPlot() {
+      var IMG_URL = "/api/map/background?path=data%2Fchengdu_real_point.png";
+      var W = 1415;
+      var H = 1258;
+      var layout = {
+        margin: { l: 0, r: 0, t: 0, b: 0 },
+        xaxis: {
+          range: [0, W],
+          autorange: false,
+          showgrid: false,
+          zeroline: false
+        },
+        yaxis: {
+          range: [H, 0],
+          autorange: false,
+          scaleanchor: "x",
+          scaleratio: 1,
+          showgrid: false,
+          zeroline: false
+        },
+        autosize: true
+      };
+      var img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = function () {
+        try {
+          var nw = img.naturalWidth || W;
+          var nh = img.naturalHeight || H;
+          var canvas = document.createElement("canvas");
+          canvas.width = nw;
+          canvas.height = nh;
+          var ctx = canvas.getContext("2d");
+          ctx.drawImage(img, 0, 0);
+          var dataUri = canvas.toDataURL("image/png");
+          var trace = {
+            type: "image",
+            source: dataUri,
+            xref: "x",
+            yref: "y",
+            x0: 0,
+            y0: 0,
+            dx: nw,
+            dy: nh
+          };
+          Plotly.newPlot("plot", [trace], layout, {
+            responsive: true,
+            displayModeBar: true,
+            scrollZoom: true
+          }).then(function () {
+            var el = document.getElementById("plot");
+            requestAnimationFrame(function () {
+              Plotly.Plots.resize(el);
+            });
+            setTimeout(function () {
+              Plotly.Plots.resize(el);
+            }, 300);
+            setTimeout(function () {
+              Plotly.Plots.resize(el);
+            }, 1000);
+          });
+        } catch (e) {
+          showErr("Plotly image trace failed: " + (e && e.message ? e.message : String(e)));
+        }
+      };
+      img.onerror = function () {
+        showErr("Could not load image from " + IMG_URL);
+      };
+      img.src = IMG_URL;
+    }
+
+    window.addEventListener("load", () => {
+      setTimeout(renderPlot, 500);
+    });
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(html)
 
 
 @app.get("/legacy/html")
@@ -981,9 +1373,15 @@ def main():
 
     host = "127.0.0.1"
     port = find_free_port(host)
+    listen_url = f"http://{host}:{port}"
+    os.environ["_UAV_APP_LISTEN_URL"] = listen_url
 
     print("=" * 60)
     print("无人机巡检任务控制中心（双管线）")
+    print("=" * 60)
+    print(f"[DEBUG] 当前 app 文件: {Path(__file__).resolve()}")
+    print(f"[DEBUG] 实际监听端口: {port}  (若 8001 被占用会自动递增)")
+    print(f"[DEBUG] 健康检查: {listen_url}/debug/ping")
     print("=" * 60)
     print(f"URL: http://{host}:{port}")
     print(f"  图像管线: result/latest/mission_output.json + data/test.png")

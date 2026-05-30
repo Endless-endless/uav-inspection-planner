@@ -37,8 +37,9 @@ def get_background_map_config(
     layout.images 参数与 generate_interactive_main_view 对齐。
     """
     map_path = resolve_map_path(root, map_rel)
+    rel_norm = str(map_rel).replace("\\", "/")
     if image_url is None:
-        image_url = f"/api/map/background?path={map_rel}"
+        image_url = f"/{rel_norm}" if rel_norm.startswith("data/") else f"/api/map/background?path={map_rel}"
     if not map_path.exists():
         return {
             "available": False,

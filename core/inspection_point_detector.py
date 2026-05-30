@@ -49,12 +49,27 @@ class InspectionDetectorConfig:
     hough_threshold: float = 0.22
     ring_validate_ratio: float = 0.32
     snap_threshold: float = 30.0
+    real_map_snap_threshold: float = 120.0
     max_bbox_aspect: float = 1.75
     max_extent: float = 0.72
     clean_dilate_radius: int = 10
+    real_map_mode: bool = False
 
 
 DEFAULT_DETECTOR_CONFIG = InspectionDetectorConfig()
+
+# 真实地图：绿色圆点检测在 core.real_map_cv；此配置供 snap 等步骤使用
+REAL_MAP_DETECTOR_CONFIG = InspectionDetectorConfig(
+    min_radius=5.0,
+    max_radius=18.0,
+    min_circularity=0.6,
+    min_ring_score=0.0,
+    min_area=80.0,
+    max_area=900.0,
+    merge_distance=25.0,
+    ring_validate_ratio=0.0,
+    real_map_mode=True,
+)
 
 
 def _build_red_mask(hsv: np.ndarray) -> np.ndarray:
@@ -128,6 +143,7 @@ def _contour_candidates(
         return []
 
     out: List[Dict[str, Any]] = []
+    source_tag = "blob" if config.real_map_mode else "contour"
     for region in regionprops(label(ring_mask)):
         area = float(region.area)
         if area < config.min_area or area > config.max_area:
@@ -150,7 +166,10 @@ def _contour_candidates(
         perimeter = float(region.perimeter or 0.0)
         circularity = 4.0 * np.pi * area / (perimeter ** 2 + 1e-6)
         ring_score = perimeter / (np.sqrt(area) + 1e-6)
-        if ring_score < config.min_ring_score and circularity < config.min_circularity:
+        if config.real_map_mode:
+            if circularity < config.min_circularity:
+                continue
+        elif ring_score < config.min_ring_score and circularity < config.min_circularity:
             continue
 
         cy, cx = region.centroid
@@ -158,13 +177,25 @@ def _contour_candidates(
         if radius < config.min_radius or radius > config.max_radius:
             continue
 
-        validate_ratio = _ring_validate_ratio(
-            cx, cy, radius, gray=gray, red=red, dark=dark, config=config
-        )
-        if validate_ratio < config.ring_validate_ratio:
-            continue
+        if config.real_map_mode:
+            iy, ix = int(round(cy)), int(round(cx))
+            if 0 <= iy < gray.shape[0] and 0 <= ix < gray.shape[1]:
+                if float(gray[iy, ix]) >= float(config.black_threshold):
+                    continue
+                if red[iy, ix]:
+                    continue
+            validate_ratio = 1.0
+        else:
+            validate_ratio = _ring_validate_ratio(
+                cx, cy, radius, gray=gray, red=red, dark=dark, config=config
+            )
+            if validate_ratio < config.ring_validate_ratio:
+                continue
 
-        confidence = min(1.0, ring_score / 12.0) * 0.55 + min(1.0, circularity) * 0.25 + validate_ratio * 0.2
+        if config.real_map_mode:
+            confidence = min(1.0, circularity) * 0.7 + min(1.0, extent) * 0.3
+        else:
+            confidence = min(1.0, ring_score / 12.0) * 0.55 + min(1.0, circularity) * 0.25 + validate_ratio * 0.2
         out.append(
             {
                 "coord": [round(float(cx), 2), round(float(cy), 2)],
@@ -173,7 +204,7 @@ def _contour_candidates(
                 "circularity": round(float(circularity), 4),
                 "ring_score": round(float(ring_score), 3),
                 "confidence": round(float(confidence), 4),
-                "source": "contour",
+                "source": source_tag,
             }
         )
     return out
@@ -322,27 +353,61 @@ def detect_black_inspection_points(
     return detections
 
 
+def resolve_detector_config(
+    image_path: str,
+    config: Optional[InspectionDetectorConfig] = None,
+) -> InspectionDetectorConfig:
+    if config is not None:
+        return config
+    try:
+        from core.real_map_cv import is_real_map_detection_image
+
+        if is_real_map_detection_image(image_path):
+            return REAL_MAP_DETECTOR_CONFIG
+    except ImportError:
+        pass
+    return DEFAULT_DETECTOR_CONFIG
+
+
 def detect_black_inspection_points_with_stats(
     image_path: str,
     *,
     config: Optional[InspectionDetectorConfig] = None,
     red_mask: Optional[np.ndarray] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    cfg = config or DEFAULT_DETECTOR_CONFIG
+    try:
+        from core.real_map_cv import is_real_map_detection_image, detect_real_map_inspection_points_with_stats
+
+        if is_real_map_detection_image(image_path):
+            detections, stats = detect_real_map_inspection_points_with_stats(
+                image_path, red_mask=red_mask
+            )
+            stats["detector_config"] = REAL_MAP_DETECTOR_CONFIG.__dict__.copy()
+            return detections, stats
+    except ImportError:
+        pass
+
+    cfg = resolve_detector_config(image_path, config)
     rgb = np.array(Image.open(image_path).convert("RGB"))
     gray, red, dark, ring = _prepare_masks(rgb, cfg, red_mask=red_mask)
 
-    contour_raw = _contour_candidates(ring, gray=gray, red=red, dark=dark, config=cfg)
-    hough_raw = _hough_candidates_skimage(ring, gray=gray, red=red, dark=dark, config=cfg)
-    hough_raw.extend(
-        _hough_candidates_cv2(
-            gray.astype(np.uint8),
-            gray=gray,
-            red=red,
-            dark=dark,
-            config=cfg,
-        )
+    contour_input = ring
+
+    contour_raw = _contour_candidates(
+        contour_input, gray=gray, red=red, dark=dark, config=cfg
     )
+    hough_raw: List[Dict[str, Any]] = []
+    if not cfg.real_map_mode:
+        hough_raw = _hough_candidates_skimage(ring, gray=gray, red=red, dark=dark, config=cfg)
+        hough_raw.extend(
+            _hough_candidates_cv2(
+                gray.astype(np.uint8),
+                gray=gray,
+                red=red,
+                dark=dark,
+                config=cfg,
+            )
+        )
 
     merged = _merge_candidates(contour_raw + hough_raw, merge_distance=cfg.merge_distance)
     detections = [

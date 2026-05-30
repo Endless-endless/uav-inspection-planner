@@ -115,6 +115,15 @@ async function runReplan() {
     }
 
     const dashboard = normalizeMissionResult(data.dashboard || data);
+    if (isImagePipeline?.() || getPipeline?.() === "image") {
+      const displayPath =
+        typeof resolveCleanMapImagePath === "function"
+          ? resolveCleanMapImagePath(dashboard)
+          : null;
+      if (displayPath && typeof loadMapConfig === "function") {
+        await loadMapConfig(displayPath);
+      }
+    }
     if (window.MissionStore) {
       MissionStore.applyServerReplan(dashboard, {
         mission_json_path: dashboard.output_files?.mission_snapshot || "latest_replan_mission.json",

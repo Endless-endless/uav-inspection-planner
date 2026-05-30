@@ -12,6 +12,12 @@ const MAP_STYLES = {
 };
 
 const IMAGE_DEFAULT_SIZE = { width: 916, height: 960 };
+
+/** Plotly 底图等：统一走后端 /api/map/background，避免直连 /data 静态路径不一致 */
+function toStaticDataUrl(relPath) {
+  const p = String(relPath || "").replace(/\\/g, "/");
+  return `/api/map/background?path=${encodeURIComponent(p)}`;
+}
 const KEY_POINT_TYPES = new Set([
   "endpoint",
   "end",
@@ -75,8 +81,19 @@ const state = {
   },
   pickPhase: null,
   plotReady: { mapPlot: false, mapPlotFs: false },
+  imageDatasetRegistry: null,
+  imageDatasetProfile: null,
 };
 window.state = state;
+
+const IMAGE_DATASET_FALLBACK = {
+  id: "chengdu_real",
+  dataset: "data/chengdu_real_point.png",
+  clean_map_image: "data/chengdu_real_point.png",
+  line_image: "data/chengdu_real_line.png",
+  point_image: "data/chengdu_real_point.png",
+  dataset_type: "real_satellite",
+};
 
 if (window.MissionStore) {
   // state.lastResult 仅为 MissionStore.getMission() 的兼容别名（deprecated）
@@ -129,14 +146,35 @@ function getMapMode() {
   return sel.value;
 }
 
+function logBackgroundImageLoadError(url, reason) {
+  console.error("[map background] image load failed:", url, reason || "");
+}
+
+/** 预加载底图；失败时在 console.error 输出 URL */
+function preloadBackgroundImage(url) {
+  if (!url) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(true);
+    img.onerror = () => {
+      logBackgroundImageLoadError(url, "Image onerror");
+      resolve(false);
+    };
+    img.src = url;
+  });
+}
+
 async function loadMapConfig(imagePath) {
   try {
     const path = imagePath || "data/test.png";
     const res = await fetch(`/api/map/config?path=${encodeURIComponent(path)}`);
     if (!res.ok) throw new Error(res.statusText);
     state.mapConfig = await res.json();
+    const bgUrl = toStaticDataUrl(path);
+    await preloadBackgroundImage(bgUrl);
   } catch (e) {
     state.mapConfig = { available: false };
+    logBackgroundImageLoadError(toStaticDataUrl(imagePath || "data/test.png"), e?.message || e);
   }
 }
 
@@ -155,8 +193,163 @@ async function loadDatasets() {
   state.datasets = data.datasets || [];
 }
 
+async function loadImageDatasetProfiles() {
+  try {
+    const res = await fetch("/api/image-datasets");
+    if (!res.ok) throw new Error(res.statusText);
+    const data = await res.json();
+    state.imageDatasetRegistry = data;
+    const profiles = data.datasets || [];
+    const defaultId = data.default_id || IMAGE_DATASET_FALLBACK.id;
+    state.imageDatasetProfile =
+      profiles.find((p) => p.id === defaultId) || profiles[0] || IMAGE_DATASET_FALLBACK;
+  } catch (e) {
+    console.warn("image-datasets load failed, using fallback", e);
+    state.imageDatasetRegistry = { default_id: IMAGE_DATASET_FALLBACK.id, datasets: [IMAGE_DATASET_FALLBACK] };
+    state.imageDatasetProfile = IMAGE_DATASET_FALLBACK;
+  }
+}
+
+function getActiveImageProfile() {
+  return state.imageDatasetProfile || IMAGE_DATASET_FALLBACK;
+}
+
+function isRealSatelliteDataset(profile = getActiveImageProfile()) {
+  return profile?.dataset_type === "real_satellite";
+}
+
+function usesImagePixelCoords(result) {
+  const m = result?.metadata || {};
+  return (
+    m.pixel_coordinate_mode === true ||
+    m.coordinate_mode === "image_pixel_fixed" ||
+    m.dataset_type === "real_satellite" ||
+    isRealSatelliteDataset()
+  );
+}
+
+/** 图像管线 Plotly 底图路径（真实地图 = 带点标注图，与 CV 输入一致） */
+function getImagePipelineMapPath() {
+  const profile = getActiveImageProfile();
+  if (isRealSatelliteDataset(profile)) {
+    return profile.point_image || profile.dataset || "data/chengdu_real_point.png";
+  }
+  const clean = profile.clean_map_image;
+  if (clean && clean !== "auto") return clean;
+  return profile.line_image || profile.dataset || "data/test.png";
+}
+
+function getDisplayMapPath() {
+  return getImagePipelineMapPath();
+}
+
+function getDetectionImagePath(source) {
+  const profile = getActiveImageProfile();
+  const norm = window.normalizeInspectionPointSource
+    ? normalizeInspectionPointSource(source)
+    : source;
+  if (norm === "image") {
+    return profile.point_image || profile.dataset || "data/test_point.png";
+  }
+  return profile.line_image || profile.dataset || "data/test.png";
+}
+
 function getImagePathForSource(source) {
-  return source === "image" ? "data/test_point.png" : "data/test.png";
+  return getDetectionImagePath(source);
+}
+
+/** 显示底图路径：与识别输入同源（真实地图用 chengdu_real_point.png） */
+function resolveCleanMapImagePath(result) {
+  const meta = result?.metadata || {};
+  let path =
+    meta.display_map_image ||
+    meta.clean_map_image ||
+    meta.point_image ||
+    meta.map_image ||
+    result?.map_background?.path ||
+    null;
+  if (path && /chengdu_real_satellite/i.test(String(path))) {
+    path = meta.point_image || getImagePipelineMapPath();
+  }
+  if (!path && (meta.dataset_type === "real_satellite" || /chengdu_real/i.test(String(meta.dataset_type || meta.dataset || "")))) {
+    path = getImagePipelineMapPath();
+  }
+  if (!path && isImagePipeline()) {
+    path = getImagePipelineMapPath();
+  }
+  return path;
+}
+
+function getPipelineBackgroundSpec(result) {
+  const relPath = resolveCleanMapImagePath(result) || getImagePipelineMapPath();
+  const cfg =
+    state.mapConfig?.path === relPath || String(state.mapConfig?.path || "").endsWith(relPath)
+      ? state.mapConfig
+      : null;
+  const bg = result?.map_background || {};
+  const bounds = result?.bounds || {};
+  const width = bounds.width || bg.width || cfg?.width || IMAGE_DEFAULT_SIZE.width;
+  const height = bounds.height || bg.height || cfg?.height || IMAGE_DEFAULT_SIZE.height;
+  const source = toStaticDataUrl(relPath);
+  if (isImagePipeline() && relPath && !getPipelineBackgroundSpec._preloadDone?.[source]) {
+    getPipelineBackgroundSpec._preloadDone = getPipelineBackgroundSpec._preloadDone || {};
+    getPipelineBackgroundSpec._preloadDone[source] = true;
+    preloadBackgroundImage(source);
+  }
+  return { relPath, width, height, source };
+}
+
+/** 为 image 管线合成 map_background（尺寸与 URL 元数据；主图底图由 HTML img 叠层，不用 layout.images） */
+function buildMapBackgroundForResult(result) {
+  const pipeline = result?.metadata?.pipeline || (isImagePipeline() ? "image" : "unified");
+  if (pipeline !== "image") return result?.map_background || null;
+
+  const displayPath = resolveCleanMapImagePath(result);
+  if (!displayPath) return result?.map_background || state.mapConfig || null;
+
+  const existing = result?.map_background;
+  const url = `/api/map/background?path=${encodeURIComponent(displayPath)}`;
+  const cfg =
+    state.mapConfig?.path === displayPath || state.mapConfig?.path?.endsWith(displayPath)
+      ? state.mapConfig
+      : null;
+  const width =
+    cfg?.width || existing?.width || result?.bounds?.width || IMAGE_DEFAULT_SIZE.width;
+  const height =
+    cfg?.height || existing?.height || result?.bounds?.height || IMAGE_DEFAULT_SIZE.height;
+
+  if (
+    existing?.layout_image?.source &&
+    (existing.path === displayPath || String(existing.url || "").includes(encodeURIComponent(displayPath)))
+  ) {
+    return { ...existing, available: true, path: displayPath, url: existing.url || url, width, height };
+  }
+
+  const layoutImage = {
+    source: toStaticDataUrl(displayPath),
+    xref: "x",
+    yref: "y",
+    x: 0,
+    y: 0,
+    xanchor: "left",
+    yanchor: "bottom",
+    sizex: width,
+    sizey: height,
+    sizing: "stretch",
+    layer: "below",
+    opacity: 1,
+  };
+
+  return {
+    available: true,
+    path: displayPath,
+    url,
+    width,
+    height,
+    layout_image: layoutImage,
+    axis: { x_range: [0, width], y_range: [height, 0] },
+    coordinate_system: "image_upper_left_y_down",
+  };
 }
 
 function getInspectionPointSource() {
@@ -167,7 +360,8 @@ function getInspectionPointSource() {
 }
 
 function updateSpacingControlsVisibility() {
-  const imageMode = isImagePipeline() && getInspectionPointSource() === "image";
+  const src = getInspectionPointSource();
+  const imageMode = isImagePipeline() && src === "image";
   const storeImage = window.MissionStore?.isImageSource?.() === true;
   const hideSpacing = imageMode || storeImage;
 
@@ -177,7 +371,17 @@ function updateSpacingControlsVisibility() {
   if (planningField) planningField.classList.toggle("hidden", hideSpacing);
 }
 
+function stripManualInspectionSourceOption() {
+  const sel = $("inspectionPointSourceSelect");
+  if (!sel) return;
+  [...sel.options].forEach((opt) => {
+    if (opt.value === "manual") opt.remove();
+  });
+  if (sel.value === "manual") sel.value = "image";
+}
+
 function applyPipelineUi() {
+  stripManualInspectionSourceOption();
   const image = isImagePipeline();
   const pointSource = getInspectionPointSource();
   if ($("pipelineBadge")) {
@@ -192,9 +396,15 @@ function applyPipelineUi() {
   const pointSourceSel = $("inspectionPointSourceSelect");
 
   if (image) {
-    const imagePath = getImagePathForSource(pointSource);
+    const profile = getActiveImageProfile();
+    const detectPath = getDetectionImagePath(pointSource);
+    const displayPath = getDisplayMapPath();
     if (ds) {
-      ds.innerHTML = `<option value="${imagePath}">${imagePath}</option>`;
+      const label =
+        profile.dataset_type === "real_satellite"
+          ? `真实地图: ${profile.point_image || detectPath}`
+          : detectPath;
+      ds.innerHTML = `<option value="${detectPath}">${label}</option>`;
       ds.disabled = true;
     }
     if (pointSourceSel) pointSourceSel.disabled = false;
@@ -325,11 +535,84 @@ function applyLayerDefaultsForPipeline() {
   syncStateToUi();
 }
 
+function syncHtmlBasemapImages(mission) {
+  const norm = normalizeMissionResult(mission || buildIdleImageMapPayload());
+  const pairs = [
+    { stack: "mapPlotStack", img: "mapBasemapImg" },
+    { stack: "mapPlotStackFs", img: "mapBasemapImgFs" },
+  ];
+  if (!isImagePipeline()) {
+    pairs.forEach(({ stack: sid, img: iid }) => {
+      const s = $(sid);
+      const im = $(iid);
+      if (s) s.style.aspectRatio = "";
+      im?.classList.add("hidden");
+    });
+    return;
+  }
+  const rel = resolveCleanMapImagePath(norm) || getImagePipelineMapPath();
+  const src = toStaticDataUrl(rel);
+  const show = state.showBackground !== false && Boolean(rel);
+  const spec = getPipelineBackgroundSpec(norm);
+  const w = spec.width || 1415;
+  const h = spec.height || 1258;
+  pairs.forEach(({ stack: sid, img: iid }) => {
+    const stack = $(sid);
+    const img = $(iid);
+    if (stack && usesImagePixelCoords(norm)) {
+      stack.style.aspectRatio = `${w} / ${h}`;
+    } else if (stack) {
+      stack.style.aspectRatio = "";
+    }
+    if (!img) return;
+    if (show) {
+      img.classList.remove("hidden");
+      if (img.dataset.loadedSrc !== src) {
+        img.src = src;
+        img.dataset.loadedSrc = src;
+      }
+    } else {
+      img.classList.add("hidden");
+    }
+  });
+}
+
 function getImageSize(result) {
-  const bg = result?.map_background || state.mapConfig || {};
+  const spec = getPipelineBackgroundSpec(result || (typeof getCurrentMission === "function" ? getCurrentMission() : null));
+  return { width: spec.width, height: spec.height };
+}
+
+/** 底图改为 HTML img 叠层，Plotly 不再使用 layout.images */
+function getFixedSatelliteLayoutImages(_result) {
+  return [];
+}
+
+/** 透明 Plotly + 空 images；底图由 #mapBasemapImg / #mapBasemapImgFs 提供 */
+function applyFixedSatelliteToLayout(layout, result) {
+  const { width, height } = getPipelineBackgroundSpec(
+    result || (typeof getCurrentMission === "function" ? getCurrentMission() : null)
+  );
+  const base = layout && typeof layout === "object" ? layout : {};
+  const transparent =
+    isImagePipeline() && usesImagePixelCoords(result || (typeof getCurrentMission === "function" ? getCurrentMission() : null));
   return {
-    width: bg.width || IMAGE_DEFAULT_SIZE.width,
-    height: bg.height || IMAGE_DEFAULT_SIZE.height,
+    ...base,
+    paper_bgcolor: transparent ? "rgba(0,0,0,0)" : base.paper_bgcolor || "#1a2332",
+    plot_bgcolor: transparent ? "rgba(0,0,0,0)" : base.plot_bgcolor || "rgba(255,255,255,0.06)",
+    images: [],
+    xaxis: {
+      ...(base.xaxis || {}),
+      range: [0, width],
+      autorange: false,
+    },
+    yaxis: {
+      ...(base.yaxis || {}),
+      range: [height, 0],
+      autorange: false,
+      scaleanchor: "x",
+      scaleratio: 1,
+      constrain: "domain",
+    },
   };
 }
 
@@ -348,26 +631,23 @@ function normalizeMissionResult(result) {
     out.statistics.weather_mode = out.metadata.weather_mode;
   }
 
-  if (pipeline === "image") {
-    const mapBg =
-      result.map_background?.available !== false
-        ? result.map_background || state.mapConfig
-        : state.mapConfig;
-    out.map_background = mapBg;
-    if (out.metadata?.clean_map_image && mapBg?.path !== out.metadata.clean_map_image) {
-      out.map_background = {
-        ...mapBg,
-        path: out.metadata.clean_map_image,
-        url: `/api/map/background?path=${encodeURIComponent(out.metadata.clean_map_image)}`,
-        layout_image: mapBg.layout_image
-          ? {
-              ...mapBg.layout_image,
-              source: `/api/map/background?path=${encodeURIComponent(out.metadata.clean_map_image)}`,
-            }
-          : null,
-      };
+  if (pipeline === "image" || isImagePipeline()) {
+    if (!out.metadata.pipeline) out.metadata.pipeline = "image";
+    const displayRel = resolveCleanMapImagePath(out);
+    if (displayRel) {
+      out.metadata.display_map_image = displayRel;
+      out.metadata.clean_map_image = displayRel;
     }
-    const { width, height } = getImageSize(out);
+    out.map_background = buildMapBackgroundForResult(out);
+    const spec = getPipelineBackgroundSpec(out);
+    const width = spec.width;
+    const height = spec.height;
+    if (usesImagePixelCoords(out)) {
+      out.metadata.coordinate_mode = "image_pixel_fixed";
+      out.metadata.pixel_coordinate_mode = true;
+      out.metadata.image_width = width;
+      out.metadata.image_height = height;
+    }
     out.bounds = {
       x_range: [0, width],
       y_range: [height, 0],
@@ -415,13 +695,55 @@ function selectInspectionPoints(points, mode) {
   return samplePointsEvenly(keyPts, KEY_POINT_MAX);
 }
 
+function buildIdleImageMapPayload() {
+  return {
+    segments: [],
+    inspection_points: [],
+    visit_order: [],
+    metadata: { pipeline: "image" },
+  };
+}
+
+function renderInitialMapPreview(targetId = "mapPlot") {
+  if (!isImagePipeline()) return;
+  const plot = buildPlotFromMission(buildIdleImageMapPayload());
+  const el = document.getElementById(targetId);
+  if (!el) return;
+  const layout = applyFixedSatelliteToLayout(plot.layout, buildIdleImageMapPayload());
+  const draw = () => {
+    bindMapClick(targetId);
+    syncHtmlBasemapImages(getCurrentMission() || buildIdleImageMapPayload());
+  };
+  if (state.plotReady[targetId] && el.data) {
+    Plotly.react(targetId, plot.traces, layout, plot.config).then(draw);
+  } else {
+    Plotly.newPlot(targetId, plot.traces, layout, plot.config).then(() => {
+      state.plotReady[targetId] = true;
+      draw();
+    });
+  }
+}
+
+function refreshMissionMap(targetId = "mapPlot", options = {}) {
+  const mission = getCurrentMission();
+  if (!mission) {
+    if (isImagePipeline()) renderInitialMapPreview(targetId);
+    return;
+  }
+  renderMission(mission, targetId, options);
+}
+
 function refreshMapView() {
-  if (!state.lastResult) return;
-  renderMission(state.lastResult, "mapPlot");
+  const mission = getCurrentMission();
+  if (!mission) {
+    if (isImagePipeline()) renderInitialMapPreview("mapPlot");
+    return;
+  }
+  refreshMissionMap("mapPlot");
   const fullscreenOpen =
     $("mapFullscreenModal") && !$("mapFullscreenModal").classList.contains("hidden");
   if (fullscreenOpen) {
-    renderMission(state.lastResult, "mapPlotFs", { fullscreen: true });
+    refreshMissionMap("mapPlotFs", { fullscreen: true });
   }
 }
 
@@ -437,13 +759,15 @@ function updateMapModeHint() {
   if (!hint) return;
   if (isImagePipeline()) {
     hint.textContent = state.imageMissionAvailable ? "任务已就绪" : "请先加载任务";
-    $("mapPlot")?.classList.add("overlay-mode");
+    $("mapPlotStack")?.classList.add("overlay-mode");
+    $("mapPlotStackFs")?.classList.add("overlay-mode");
   } else {
     hint.textContent =
       getMapMode() === "topology_only"
         ? "深色拓扑视图"
         : "实验视图";
-    $("mapPlot")?.classList.remove("overlay-mode");
+    $("mapPlotStack")?.classList.remove("overlay-mode");
+    $("mapPlotStackFs")?.classList.remove("overlay-mode");
   }
 }
 
@@ -1025,53 +1349,31 @@ function getFullscreenPlotSize() {
 }
 
 function buildBackgroundImages(result) {
-  const pipeline = result.metadata?.pipeline || getPipeline();
-  if (pipeline !== "image") return [];
-  if (getMapMode() === "topology_only") return [];
-
-  const mapBg = result.map_background || state.mapConfig;
-  if (!mapBg?.available) return [];
-
-  const { width, height } = getImageSize(result);
-  const baseImg = mapBg.layout_image || {
-    source: mapBg.url || "/api/map/background",
-    xref: "x",
-    yref: "y",
-    x: 0,
-    y: height,
-    sizex: width,
-    sizey: height,
-    sizing: "stretch",
-    layer: "below",
-    opacity: 0.92,
-  };
-  return [{ ...baseImg, opacity: baseImg.opacity ?? 0.92 }];
+  return getFixedSatelliteLayoutImages(result);
 }
 
 function buildMissionLayout(result, options = {}) {
   const { fullscreen = false } = options;
-  const pipeline = result.metadata?.pipeline || getPipeline();
-  const isImage = pipeline === "image";
+  const mission = result || buildIdleImageMapPayload();
+  const { width, height } = getPipelineBackgroundSpec(mission);
+  const transparent = isImagePipeline() && usesImagePixelCoords(mission);
+  const margin = transparent
+    ? { l: 0, r: 0, t: 0, b: 0 }
+    : fullscreen
+      ? { l: 6, r: 6, t: 2, b: 4 }
+      : { l: 14, r: 8, t: 4, b: 6 };
 
   const layout = {
-    paper_bgcolor: "#1a2332",
-    plot_bgcolor: isImage ? "rgba(255,255,255,0.06)" : "#243044",
+    paper_bgcolor: transparent ? "rgba(0,0,0,0)" : "#1a2332",
+    plot_bgcolor: transparent ? "rgba(0,0,0,0)" : "rgba(255,255,255,0.06)",
     font: { color: "#e6edf3", size: 11 },
-    margin: fullscreen
-      ? { l: 6, r: 6, t: 2, b: 4 }
-      : { l: 14, r: 8, t: 4, b: 6 },
+    margin,
     legend: buildLegendLayout(fullscreen),
     hovermode: "closest",
-    images: buildBackgroundImages(result),
+    images: [],
     uirevision: "mission-map-v3",
     autosize: true,
-  };
-
-  if (isImage) {
-    const darkTopology = getMapMode() === "topology_only";
-    const { width, height } = getImageSize(result);
-    layout.plot_bgcolor = darkTopology ? "#243044" : "rgba(255,255,255,0.06)";
-    layout.xaxis = {
+    xaxis: {
       title: "",
       range: [0, width],
       domain: [0.0, 1.0],
@@ -1082,8 +1384,8 @@ function buildMissionLayout(result, options = {}) {
       gridcolor: "rgba(255,255,255,0.10)",
       tickfont: { size: 9, color: "#5a7a94" },
       zeroline: false,
-    };
-    layout.yaxis = {
+    },
+    yaxis: {
       title: "",
       range: [height, 0],
       domain: [0.0, 1.0],
@@ -1091,33 +1393,13 @@ function buildMissionLayout(result, options = {}) {
       fixedrange: true,
       scaleanchor: "x",
       scaleratio: 1,
+      constrain: "domain",
       showgrid: true,
       gridcolor: "rgba(255,255,255,0.10)",
       tickfont: { size: 9, color: "#5a7a94" },
       zeroline: false,
-    };
-  } else {
-    const b = result.bounds || { x_range: [0, 1000], y_range: [1000, 0] };
-    layout.xaxis = {
-      title: "",
-      range: b.x_range,
-      domain: [0.0, 1.0],
-      autorange: false,
-      gridcolor: "#2d3a4f",
-      tickfont: { size: 9, color: "#5a7a94" },
-      zeroline: false,
-    };
-    layout.yaxis = {
-      title: "",
-      range: b.y_range,
-      domain: [0.0, 1.0],
-      scaleanchor: "x",
-      scaleratio: 1,
-      gridcolor: "#2d3a4f",
-      tickfont: { size: 9, color: "#5a7a94" },
-      zeroline: false,
-    };
-  }
+    },
+  };
 
   if (fullscreen) {
     const sz = getFullscreenPlotSize();
@@ -1126,15 +1408,39 @@ function buildMissionLayout(result, options = {}) {
     layout.height = sz.height;
   }
 
-  return layout;
+  return applyFixedSatelliteToLayout(layout, mission);
+}
+
+function getMissionMapPlotLayout(mission, plotId = "mapPlot") {
+  const payload = mission || buildIdleImageMapPayload() || { metadata: { pipeline: "image" } };
+  return buildMissionLayout(payload, { fullscreen: plotId === "mapPlotFs" });
+}
+
+function plotlyUpdateMissionPlot(plotId, traces, mission, options = {}) {
+  const normalized = normalizeMissionResult(mission || getCurrentMission() || {});
+  const layout = applyFixedSatelliteToLayout(buildMissionLayout(normalized, options), normalized);
+  const config = {
+    responsive: !options.fullscreen,
+    displayModeBar: true,
+    scrollZoom: true,
+  };
+  const el = document.getElementById(plotId);
+  if (!el) return Promise.resolve();
+  if (state.plotReady[plotId] && el.data) {
+    return Plotly.react(plotId, traces, layout, config);
+  }
+  return Plotly.newPlot(plotId, traces, layout, config).then(() => {
+    state.plotReady[plotId] = true;
+  });
 }
 
 function buildPlotFromMission(result, options = {}) {
-  let traces = buildMissionTraces(result);
+  const normalized = normalizeMissionResult(result || {});
+  let traces = buildMissionTraces(normalized);
   if (typeof window.appendPlaybackTraces === "function") {
-    traces = window.appendPlaybackTraces(traces, result);
+    traces = window.appendPlaybackTraces(traces, normalized);
   }
-  const layout = buildMissionLayout(result, options);
+  const layout = buildMissionLayout(normalized, options);
   return {
     traces,
     layout,
@@ -1146,8 +1452,20 @@ function buildPlotFromMission(result, options = {}) {
   };
 }
 
+window.resolveCleanMapImagePath = resolveCleanMapImagePath;
+window.buildMapBackgroundForResult = buildMapBackgroundForResult;
+window.buildBackgroundImages = buildBackgroundImages;
+window.getImagePipelineMapPath = getImagePipelineMapPath;
+window.getPipelineBackgroundSpec = getPipelineBackgroundSpec;
+window.toStaticDataUrl = toStaticDataUrl;
+window.getFixedSatelliteLayoutImages = getFixedSatelliteLayoutImages;
+window.applyFixedSatelliteToLayout = applyFixedSatelliteToLayout;
+window.getMissionMapPlotLayout = getMissionMapPlotLayout;
+window.plotlyUpdateMissionPlot = plotlyUpdateMissionPlot;
+window.refreshMissionMap = refreshMissionMap;
+
 function onMissionLoaded(result, options = {}) {
-  const normalized = normalizeMissionResult(result);
+  const normalized = normalizeMissionResult(result || {});
   if (window.MissionStore) {
     if (!options.skipStoreLoad) {
       MissionStore.loadFromDashboard(normalized, { kind: options.kind || "initial" });
@@ -1220,20 +1538,24 @@ function renderMission(result, targetId = "mapPlot", options = {}) {
 
   const draw = () => {
     bindMapClick(targetId);
+    syncHtmlBasemapImages(getCurrentMission() || normalized);
     if (options.fullscreen) Plotly.Plots.resize(targetId);
   };
 
   const afterDraw = () => {
     draw();
-    if (typeof window.resetPlayback === "function" && state.lastResult && targetId === "mapPlot") {
-      window.resetPlayback(state.lastResult);
+    const mission = getCurrentMission() || normalized;
+    if (typeof window.resetPlayback === "function" && mission && targetId === "mapPlot") {
+      window.resetPlayback(mission);
     }
   };
 
+  const layout = applyFixedSatelliteToLayout(plot.layout, normalized);
+
   if (state.plotReady[targetId] && el.data) {
-    Plotly.react(targetId, plot.traces, plot.layout, plot.config).then(afterDraw);
+    Plotly.react(targetId, plot.traces, layout, plot.config).then(afterDraw);
   } else {
-    Plotly.newPlot(targetId, plot.traces, plot.layout, plot.config).then(() => {
+    Plotly.newPlot(targetId, plot.traces, layout, plot.config).then(() => {
       state.plotReady[targetId] = true;
       afterDraw();
     });
@@ -1330,12 +1652,14 @@ async function runPlanning() {
       const st = await checkImageMission();
       state.imageMissionAvailable = st.available;
       updateReplanInputLimits();
+      const displayPath = resolveCleanMapImagePath(normalized);
+      if (displayPath) await loadMapConfig(displayPath);
     }
 
     const mission = getCurrentMission();
     renderStats(mission?.statistics);
     renderVisitOrder(mission?.visit_order);
-    renderMission(mission);
+    renderMission(mission || normalized);
     renderMeta(mission?.metadata || data.metadata || {});
     updateDownloadLinks(data.output_files || {}, pipeline);
 
@@ -1385,11 +1709,13 @@ async function forceRegenerateImage() {
 
 document.addEventListener("DOMContentLoaded", async () => {
   try {
-    await Promise.all([loadDatasets(), loadMapConfig()]);
+    await Promise.all([loadDatasets(), loadImageDatasetProfiles()]);
+    await loadMapConfig(getDisplayMapPath());
     const st = await checkImageMission();
     state.imageMissionAvailable = st.available;
     applyLayerDefaultsForPipeline();
     applyPipelineUi();
+    if (isImagePipeline()) renderInitialMapPreview("mapPlot");
     updateReplanInputLimits();
     renderExperimentResult();
     renderAdaptiveEvents();
@@ -1418,15 +1744,19 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderExperimentResult();
     state.plotReady.mapPlot = false;
     if (typeof window.resetInspectionPlayback === "function") window.resetInspectionPlayback();
+    if (isImagePipeline()) {
+      loadMapConfig(getDisplayMapPath()).then(() => renderInitialMapPreview("mapPlot"));
+    }
     setStatus("就绪", "");
   });
 
   $("inspectionPointSourceSelect")?.addEventListener("change", async () => {
     applyPipelineUi();
     updateSpacingControlsVisibility();
-    const imagePath = getImagePathForSource(getInspectionPointSource());
-    await loadMapConfig(imagePath);
+    applyPipelineUi();
+    await loadMapConfig(getDisplayMapPath());
     if (getCurrentMission()) refreshMapView();
+    else if (isImagePipeline()) renderInitialMapPreview("mapPlot");
   });
 
   $("runBtn").addEventListener("click", runPlanning);
@@ -1558,6 +1888,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       cancelAnimationFrame(_resizeRaf);
       _resizeRaf = requestAnimationFrame(() => {
         try { Plotly.Plots.resize("mapPlot"); } catch (_) {}
+        if (typeof syncHtmlBasemapImages === "function") {
+          syncHtmlBasemapImages(
+            typeof getCurrentMission === "function" ? getCurrentMission() : null
+          );
+        }
       });
     }).observe(plotStageEl);
   }

@@ -21,7 +21,7 @@ def normalize_inspection_point_source(source: Optional[str]) -> str:
     raw = str(source or "spacing").strip().lower()
     if raw in IMAGE_INSPECTION_SOURCES:
         return "image"
-    if raw in {"spacing", "manual"}:
+    if raw == "spacing":
         return raw
     return "spacing"
 
@@ -373,12 +373,25 @@ def _inspection_points_from_json(
 ) -> List[Dict[str, Any]]:
     segments = segments or _segments_from_json(data)
     raw_points: List[Dict[str, Any]] = []
+    meta = data.get("metadata") or {}
+    pixel_mode = bool(
+        meta.get("pixel_coordinate_mode")
+        or str(meta.get("coordinate_mode") or "").startswith("image_pixel")
+        or meta.get("dataset_type") == "real_satellite"
+    )
     for pt in data.get("inspection_points", []):
-        pos = (
-            pt.get("pixel_position")
-            or pt.get("position_2d")
-            or pt.get("position")
-        )
+        pos = None
+        if pixel_mode:
+            det = pt.get("detection_result") or {}
+            raw = det.get("raw_coord")
+            if raw and len(raw) >= 2:
+                pos = raw
+        if not pos:
+            pos = (
+                pt.get("pixel_position")
+                or pt.get("position_2d")
+                or pt.get("position")
+            )
         if not pos and pt.get("x") is not None and pt.get("y") is not None:
             pos = [pt["x"], pt["y"]]
         if not pos or len(pos) < 2:
@@ -501,7 +514,34 @@ def build_dashboard_from_mission_json(
         ),
     }
 
-    if coordinate_mode == "auto_fit":
+    pixel_fixed = bool(
+        metadata.get("pixel_coordinate_mode")
+        or metadata.get("coordinate_mode") == "image_pixel_fixed"
+        or str(metadata.get("coordinate_mode") or "").startswith("image_pixel")
+    )
+    if pixel_fixed:
+        coordinate_mode = "image_fixed"
+        metadata["coordinate_mode"] = "image_pixel_fixed"
+        iw = metadata.get("image_width")
+        ih = metadata.get("image_height")
+        if (not iw or not ih) and map_background:
+            iw = map_background.get("width")
+            ih = map_background.get("height")
+        if iw and ih:
+            payload["bounds"] = {
+                "x_range": [0, float(iw)],
+                "y_range": [float(ih), 0],
+                "width": float(iw),
+                "height": float(ih),
+            }
+        elif map_background and map_background.get("axis"):
+            payload["bounds"] = {
+                "x_range": map_background["axis"]["x_range"],
+                "y_range": map_background["axis"]["y_range"],
+                "width": map_background.get("width"),
+                "height": map_background.get("height"),
+            }
+    elif coordinate_mode == "auto_fit":
         payload["bounds"] = compute_geometry_bounds(segments, inspection_points)
     elif map_background and map_background.get("axis"):
         payload["bounds"] = {
@@ -537,7 +577,12 @@ def build_image_pipeline_dashboard(
         data = json.load(f)
 
     meta = data.get("metadata") or {}
-    map_rel = str(meta.get("clean_map_image") or meta.get("map_image") or map_rel)
+    map_rel = str(
+        meta.get("display_map_image")
+        or meta.get("clean_map_image")
+        or meta.get("map_image")
+        or map_rel
+    )
     map_bg = get_background_map_config(root, map_rel)
     rel_source = mission_json_path.relative_to(root).as_posix() if mission_json_path.is_relative_to(root) else str(mission_json_path)
 

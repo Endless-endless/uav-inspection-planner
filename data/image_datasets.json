@@ -1,0 +1,42 @@
+{
+
+  "default_id": "chengdu_real",
+
+  "datasets": [
+
+    {
+
+      "id": "chengdu_real",
+
+      "dataset": "data/chengdu_real_point.png",
+
+      "clean_map_image": "data/chengdu_real_point.png",
+
+      "line_image": "data/chengdu_real_line.png",
+
+      "point_image": "data/chengdu_real_point.png",
+
+      "dataset_type": "real_satellite"
+
+    },
+
+    {
+
+      "id": "legacy_test",
+
+      "dataset": "data/test_point.png",
+
+      "clean_map_image": "auto",
+
+      "line_image": "data/test.png",
+
+      "point_image": "data/test_point.png",
+
+      "dataset_type": "legacy"
+
+    }
+
+  ]
+
+}
+

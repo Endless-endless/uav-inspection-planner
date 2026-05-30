@@ -50,6 +50,9 @@ class EdgeTask:
     line_id: str                          # 所属线路ID
     polyline: List[Tuple[float, float]]   # 2D几何
     len2d: float                          # 长度
+    pixel_polyline: List[Tuple[float, float]] = field(default_factory=list)
+    original_polyline: List[Tuple[float, float]] = field(default_factory=list)
+    image_polyline: List[Tuple[float, float]] = field(default_factory=list)
     inspection_points: List[Dict] = field(default_factory=list)  # 巡检点列表
     num_points: int = 0                    # 巡检点数量
     is_straight: bool = True              # 是否近似直线
@@ -183,7 +186,10 @@ def map_points_to_edges(topo_graph, line_inspection_points_by_line: Dict[str, Li
             if pt_pos is None:
                 continue
 
-            snap_threshold = 80.0 if point_type == "image_detected" else 10.0
+            if point_type == "image_detected":
+                snap_threshold = 80.0
+            else:
+                snap_threshold = 10.0
             best_edge_id = None
             best_dist = float("inf")
 
@@ -238,12 +244,18 @@ def build_edge_tasks(topo_graph, line_inspection_points_by_line: Dict[str, List]
     for edge_id, edge in topo_graph.edges.items():
         points = edge_points.get(edge_id, [])
 
+        from core.image_pixel_coords import edge_pixel_polyline, freeze_pixel_polyline
+
+        px = edge_pixel_polyline(edge) or freeze_pixel_polyline(edge.polyline)
         task = EdgeTask(
             edge_id=edge_id,
             u=edge.u,
             v=edge.v,
             line_id=edge.line_id,
-            polyline=edge.polyline,
+            polyline=px,
+            pixel_polyline=list(px),
+            original_polyline=list(px),
+            image_polyline=list(px),
             len2d=edge.len2d,
             inspection_points=points,
             num_points=len(points),

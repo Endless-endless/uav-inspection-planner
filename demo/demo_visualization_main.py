@@ -30,6 +30,8 @@ UAV 电网巡检 - 主展示页入口（交互式版本）
 
 import sys
 import os
+from typing import Optional
+
 import numpy as np
 
 # 添加项目路径
@@ -96,6 +98,11 @@ def main(
 
     # 设置天气场景（可选：calm, crosswind, headwind_strong, tailwind_efficient, gusty_high_risk）
     weather_scene = "calm"  # 默认：微风
+
+    display_map = os.environ.get("UAV_DISPLAY_MAP", "").strip()
+    dataset_type = os.environ.get("UAV_DATASET_TYPE", "").strip()
+    if dataset_type == "real_satellite" or "chengdu_real_point" in image_path.replace("\\", "/"):
+        os.environ["UAV_IMAGE_PIXEL_COORDS"] = "1"
 
     planner = PowerlinePlannerV3(
         image_path=image_path,
@@ -199,6 +206,33 @@ def main(
     else:
         weather_info_for_export = weather_info
 
+    dataset_type = os.environ.get("UAV_DATASET_TYPE", "").strip() or None
+    is_real_map = dataset_type == "real_satellite" or "chengdu_real" in image_path.replace("\\", "/")
+    if is_real_map:
+        from core.real_map_cv import REAL_MAP_CANONICAL_IMAGE
+
+        image_path = REAL_MAP_CANONICAL_IMAGE
+        clean_map = REAL_MAP_CANONICAL_IMAGE
+        display_map = REAL_MAP_CANONICAL_IMAGE
+    else:
+        display_map = os.environ.get("UAV_DISPLAY_MAP", "").strip() or None
+        clean_map = display_map or getattr(planner, "clean_map_path", None) or image_path
+        display_map = display_map or clean_map
+    extra_meta = {
+        "inspection_point_source": planner.inspection_point_source,
+        "map_image": image_path,
+        "point_image": image_path,
+        "clean_map_image": clean_map,
+        "display_map_image": display_map,
+        "coordinate_mode": "image_pixel_fixed",
+        "pixel_coordinate_mode": True,
+        "image_width": getattr(planner, "width", None),
+        "image_height": getattr(planner, "height", None),
+        "image_inspection_overlay": planner.image_inspection_overlay,
+        "image_detection_stats": getattr(planner, "image_detection_stats", {}),
+    }
+    if dataset_type:
+        extra_meta["dataset_type"] = dataset_type
     json_path = export_grouped_mission_to_json(
         mission=mission,
         edge_tasks=edge_tasks,
@@ -206,13 +240,7 @@ def main(
         output_path="result/latest/mission_output.json",
         terrain_3d=planner.terrain_3d,
         weather_info=weather_info_for_export,
-        extra_metadata={
-            "inspection_point_source": planner.inspection_point_source,
-            "map_image": image_path,
-            "clean_map_image": getattr(planner, "clean_map_path", None),
-            "image_inspection_overlay": planner.image_inspection_overlay,
-            "image_detection_stats": getattr(planner, "image_detection_stats", {}),
-        },
+        extra_metadata=extra_meta,
     )
 
     print(f"[完成] JSON 已导出: {json_path}")

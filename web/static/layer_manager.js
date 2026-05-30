@@ -90,10 +90,22 @@
       if (!el?.data) return;
       const predicate = LayerManager.tracePredicate(layerId);
       const keep = el.data.filter((t) => !predicate(t));
+      const mission =
+        typeof getCurrentMission === "function" ? getCurrentMission() : null;
+      const layout =
+        typeof applyFixedSatelliteToLayout === "function"
+          ? applyFixedSatelliteToLayout(el.layout, mission)
+          : {
+              ...(el.layout || {}),
+              images:
+                typeof getFixedSatelliteLayoutImages === "function"
+                  ? getFixedSatelliteLayoutImages(mission)
+                  : el.layout?.images || [],
+            };
       Plotly.react(
         plotId,
         keep.concat(traces || []),
-        el.layout,
+        layout,
         { responsive: plotId !== "mapPlotFs", displayModeBar: true, scrollZoom: true }
       );
     },
