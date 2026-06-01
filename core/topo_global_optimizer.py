@@ -16,19 +16,23 @@
 - 顺序优化：模拟退火算法
 """
 
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Set
 import numpy as np
 from dataclasses import dataclass
 import random
+from collections import defaultdict
 
 from core.topo import TopoGraph, TopoNode
-from core.topo_task import EdgeTask
+from core.topo_task import EdgeTask, LineTask, build_line_tasks_from_edge_tasks, project_point_to_polyline
+from core.image_pixel_coords import edge_pixel_polyline
 from core.topo_plan import (
     EdgeGroup, GroupedContinuousMission, MissionSegment,
     build_edge_adjacency_simple, compute_transition_cost_simple,
     get_edge_geometry_with_direction, interpolate_geometry,
     get_edge_inspection_geometry_with_direction,
-    generate_connection_segment_along_topo
+    generate_connection_segment_along_topo,
+    _slice_polyline_by_distance,
+    _polyline_length,
 )
 
 
@@ -46,6 +50,252 @@ class ConnectionCost:
     total_cost: float           # 综合总代价
 
 
+def _merged_pixel_polyline_same_line_follow_visit(
+    edge_order: List[str],
+    edge_task_map: Dict[str, EdgeTask],
+    line_id: str,
+    tol_join: float = 6.0,
+) -> List[Tuple[float, float]]:
+    """
+    按 visit_order 中该 line_id 出现顺序，将各 EdgeTask 的像素折线缝合成一条参考折线。
+    若相邻任务无法在端点衔接，返回空列表（由调用方 fallback）。
+    """
+    merged: List[Tuple[float, float]] = []
+    for eid in edge_order:
+        t = edge_task_map.get(eid)
+        if not t or (getattr(t, "line_id", "") or "") != line_id:
+            continue
+        pl = edge_pixel_polyline(t)
+        if len(pl) < 2:
+            continue
+        if not merged:
+            merged.extend(pl)
+            continue
+        last = np.array(merged[-1], dtype=np.float64)
+        head = np.array(pl[0], dtype=np.float64)
+        tail = np.array(pl[-1], dtype=np.float64)
+        if float(np.linalg.norm(last - head)) <= tol_join:
+            merged.extend(pl[1:])
+        elif float(np.linalg.norm(last - tail)) <= tol_join:
+            rpl = list(reversed(pl))
+            merged.extend(rpl[1:])
+        else:
+            return []
+    return merged if len(merged) >= 2 else []
+
+
+def _try_same_line_connect_geometry(
+    edge_order: List[str],
+    edge_task_map: Dict[str, EdgeTask],
+    line_id: str,
+    p_from: Tuple[float, float],
+    p_to: Tuple[float, float],
+    max_snap: float = 45.0,
+) -> Optional[List[Tuple[float, float]]]:
+    """
+    在参考折线上截取从上一条 inspect 终点到下一条 inspect 起点的子路径。
+    失败返回 None（调用方使用原有 topo connect）。
+    """
+    merged = _merged_pixel_polyline_same_line_follow_visit(
+        edge_order, edge_task_map, line_id
+    )
+    if len(merged) < 2:
+        return None
+
+    pa = project_point_to_polyline(p_from, merged)
+    pb = project_point_to_polyline(p_to, merged)
+    if (
+        pa is None
+        or pb is None
+        or float(pa["distance"]) > max_snap
+        or float(pb["distance"]) > max_snap
+    ):
+        return None
+
+    sa = float(pa["distance_along_edge"])
+    sb = float(pb["distance_along_edge"])
+    if sa <= sb:
+        raw = _slice_polyline_by_distance(merged, sa, sb)
+    else:
+        raw = list(reversed(_slice_polyline_by_distance(merged, sb, sa)))
+
+    if len(raw) < 2:
+        raw = [tuple(p_from), tuple(p_to)]
+    else:
+        raw = [tuple(p_from)] + raw[1:-1] + [tuple(p_to)]
+
+    if len(raw) < 2:
+        return None
+    ln = _polyline_length(raw)
+    if ln < 1e-3:
+        return None
+    return raw
+
+
+def _line_point_totals(edge_tasks: List[EdgeTask]) -> Dict[str, int]:
+    """每条物理线路 line_id 上巡检点总数（跨多个 EdgeTask）。"""
+    out: Dict[str, int] = {}
+    for t in edge_tasks:
+        lid = getattr(t, "line_id", None) or ""
+        if not lid:
+            continue
+        n = int(getattr(t, "num_points", 0) or 0)
+        if n <= 0 and getattr(t, "inspection_points", None):
+            n = len(t.inspection_points)
+        out[lid] = out.get(lid, 0) + max(0, n)
+    return out
+
+
+def _apply_edge_visit_line_counts(line_visited: Dict[str, int], edge: EdgeTask) -> None:
+    lid = getattr(edge, "line_id", None) or ""
+    if not lid:
+        return
+    n = int(getattr(edge, "num_points", 0) or 0)
+    if n <= 0 and getattr(edge, "inspection_points", None):
+        n = len(edge.inspection_points)
+    line_visited[lid] = line_visited.get(lid, 0) + max(0, n)
+
+
+def _newly_completed_lines(
+    line_visited: Dict[str, int],
+    line_totals: Dict[str, int],
+    already: Set[str],
+) -> List[str]:
+    done: List[str] = []
+    for lid, tot in line_totals.items():
+        if tot <= 0 or lid in already:
+            continue
+        if line_visited.get(lid, 0) >= tot:
+            done.append(lid)
+    return done
+
+
+def _find_topo_edge_by_uv(topo_graph: TopoGraph, u: str, v: str):
+    for e in topo_graph.edges.values():
+        if (e.u == u and e.v == v) or (e.u == v and e.v == u):
+            return e
+    return None
+
+
+def _edge_mean_inspection_arc_s(edge_task: EdgeTask) -> Optional[float]:
+    """同 line_id 内边序惩罚用：巡检点在边上的平均弧长坐标。"""
+    try:
+        from core.image_pixel_coords import edge_pixel_polyline
+        from core.topo_plan import _point_xy_from_inspection_point, _project_point_to_polyline_distance
+    except Exception:
+        return None
+    pts = list(getattr(edge_task, "inspection_points", None) or [])
+    if not pts:
+        return None
+    poly = edge_pixel_polyline(edge_task)
+    if len(poly) < 2:
+        return None
+    ss: List[float] = []
+    for p in pts:
+        pos = _point_xy_from_inspection_point(p)
+        if pos is None:
+            continue
+        s = _project_point_to_polyline_distance(pos, poly)
+        if s is not None:
+            ss.append(float(s))
+    if not ss:
+        return None
+    return float(sum(ss) / len(ss))
+
+
+def _edge_mean_arc_map(edge_task_map: Dict[str, EdgeTask]) -> Dict[str, Optional[float]]:
+    return {eid: _edge_mean_inspection_arc_s(t) for eid, t in edge_task_map.items()}
+
+
+def _print_route_line_bootstrap(edge_tasks: List[EdgeTask], line_totals: Dict[str, int]) -> None:
+    edges_per: Dict[str, int] = defaultdict(int)
+    for t in edge_tasks:
+        lid = getattr(t, "line_id", None) or ""
+        if lid:
+            edges_per[lid] += 1
+    for lid in sorted(line_totals.keys()):
+        print(
+            f"[route-line] line_id={lid} total_points={line_totals[lid]} "
+            f"edges_in_plan={edges_per.get(lid, 0)}"
+        )
+
+
+def _default_order_weights() -> Dict[str, float]:
+    """与 evaluate_order_cost 默认权重对齐（供 line 连续性统计复用）。"""
+    return {
+        "geometric": 1.0,
+        "topo": 0.5,
+        "direction": 0.3,
+        "group_switch": 50.0,
+        "completed_line_edge_px": 380.0,
+        "completed_line_cross_weight": 1.0,
+        "same_line_transition_factor": 0.91,
+        "line_reverse_jump": 0.35,
+        "line_revisit_penalty": 12000.0,
+        "same_line_streak_reward": 40.0,
+    }
+
+
+def _line_continuity_metrics(
+    edge_order: List[str],
+    edge_task_map: Dict[str, EdgeTask],
+    weights: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """
+    按 edge_order 中 EdgeTask.line_id 序列：
+    - 统计每条 line_id 的连续块数 blocks
+    - 离开某 line_id 后再次进入时计 revisit，并累加 line_revisit_penalty
+    """
+    w = dict(_default_order_weights())
+    if weights:
+        w.update(weights)
+
+    lines: List[str] = []
+    for eid in edge_order:
+        t = edge_task_map.get(eid)
+        if not t:
+            continue
+        lines.append(getattr(t, "line_id", "") or "")
+
+    unit = float(w.get("line_revisit_penalty", 12000.0))
+    left: Set[str] = set()
+    revisit_count = 0
+    total_penalty = 0.0
+    per_line_revisit_pen: Dict[str, float] = defaultdict(float)
+
+    for i in range(1, len(lines)):
+        prev, cur = lines[i - 1], lines[i]
+        if prev != cur:
+            if cur and cur in left:
+                revisit_count += 1
+                total_penalty += unit
+                per_line_revisit_pen[cur] += unit
+            if prev:
+                left.add(prev)
+
+    blocks_per_line: Dict[str, int] = defaultdict(int)
+    if lines:
+        run_lid = lines[0]
+        run_len = 1
+        for j in range(1, len(lines)):
+            if lines[j] == run_lid:
+                run_len += 1
+            else:
+                if run_lid:
+                    blocks_per_line[run_lid] += 1
+                run_lid = lines[j]
+                run_len = 1
+        if run_lid:
+            blocks_per_line[run_lid] += 1
+
+    return {
+        "total_penalty": float(total_penalty),
+        "revisit_count": int(revisit_count),
+        "blocks_per_line": dict(blocks_per_line),
+        "per_line_revisit_pen": dict(per_line_revisit_pen),
+    }
+
+
 def compute_connection_cost_enhanced(
     from_edge_id: str,
     to_edge_id: str,
@@ -56,7 +306,9 @@ def compute_connection_cost_enhanced(
     topo_graph: TopoGraph,
     edge_task_map: Dict[str, EdgeTask],
     groups: Dict[str, EdgeGroup],
-    weights: Dict[str, float] = None
+    weights: Dict[str, float] = None,
+    completed_lines: Optional[Set[str]] = None,
+    target_line_id: Optional[str] = None,
 ) -> ConnectionCost:
     """
     计算增强的连接代价
@@ -81,7 +333,9 @@ def compute_connection_cost_enhanced(
             'geometric': 1.0,      # 几何距离权重
             'topo': 0.1,           # 拓扑路径权重（降低，从0.5改为0.1）
             'direction': 0.1,      # 方向变化权重（降低，从0.3改为0.1）
-            'group_switch': 10.0   # group切换惩罚（降低，从50改为10）
+            'group_switch': 10.0,  # group切换惩罚（降低，从50改为10）
+            'completed_line_edge_px': 380.0,
+            'completed_line_cross_weight': 1.0,
         }
 
     # 1. 几何距离
@@ -92,6 +346,7 @@ def compute_connection_cost_enhanced(
     to_edge = edge_task_map.get(to_edge_id)
 
     topo_path_len = 0.0
+    path_nodes: List[str] = []
     if from_edge and to_edge:
         # 计算从 from_edge 的终点到 to_edge 的起点的拓扑路径长度
         from_end_node = from_edge.v if from_direction == 'forward' else from_edge.u
@@ -99,13 +354,31 @@ def compute_connection_cost_enhanced(
 
         if from_end_node != to_start_node:
             # 使用 BFS 找最短路径
-            path = find_topo_path(topo_graph, from_end_node, to_start_node)
-            if path:
+            path_nodes = find_topo_path(topo_graph, from_end_node, to_start_node)
+            if path_nodes:
                 # 计算路径上所有边的长度之和
-                topo_path_len = compute_topo_path_length(topo_graph, path, edge_task_map)
+                topo_path_len = compute_topo_path_length(topo_graph, path_nodes, edge_task_map)
             else:
                 # 不连通，使用几何距离
                 topo_path_len = geo_dist
+        else:
+            path_nodes = [from_end_node]
+
+    # 2b. 已完成线路穿越惩罚（沿 BFS 节点路径上的 TopoEdge.line_id）
+    cross_penalty_px = 0.0
+    if completed_lines and path_nodes and len(path_nodes) >= 2 and to_edge:
+        eff_target = target_line_id if target_line_id else (getattr(to_edge, "line_id", "") or "")
+        if eff_target:
+            w_edge = float(weights.get("completed_line_edge_px", 380.0))
+            w_cross = float(weights.get("completed_line_cross_weight", 1.0))
+            for ii in range(len(path_nodes) - 1):
+                te = _find_topo_edge_by_uv(topo_graph, path_nodes[ii], path_nodes[ii + 1])
+                if te is None:
+                    continue
+                lid = getattr(te, "line_id", "") or ""
+                if lid and lid in completed_lines and lid != eff_target:
+                    cross_penalty_px += w_edge
+            cross_penalty_px *= w_cross
 
     # 3. 方向变化（0-1，1表示反向）
     direction_change = compute_direction_change_penalty(
@@ -125,7 +398,8 @@ def compute_connection_cost_enhanced(
         weights['geometric'] * geo_dist +
         weights['topo'] * topo_path_len +
         weights['direction'] * direction_change * 100 +  # 方向变化放大
-        group_switch_penalty
+        group_switch_penalty +
+        cross_penalty_px
     )
 
     return ConnectionCost(
@@ -354,22 +628,27 @@ def evaluate_order_cost(
     评估边访问顺序的总代价
 
     包括：
-    - 所有 connect 段的代价
-    - group 切换惩罚
-    - 方向变化惩罚
+    - 所有 connect 段的代价（含已完成线路穿越惩罚）
+    - group 切换惩罚、方向变化
+    - 同 line_id 连续奖励（乘因子）、同线弧长反向跳跃惩罚
     """
     if weights is None:
-        weights = {
-            'geometric': 1.0,
-            'topo': 0.5,
-            'direction': 0.3,
-            'group_switch': 50.0
-        }
+        weights = _default_order_weights()
+    else:
+        merged = _default_order_weights()
+        merged.update(weights)
+        weights = merged
+
+    line_totals = _line_point_totals(list(edge_task_map.values()))
+    edge_mean = _edge_mean_arc_map(edge_task_map)
+    line_visited: Dict[str, int] = defaultdict(int)
+    completed_lines: Set[str] = set()
 
     total_cost = 0.0
-    current_edge_id = None
-    current_direction = None
-    current_point = None
+    prev_edge_id: Optional[str] = None
+    prev_direction: Optional[str] = None
+    prev_point_end: Optional[Tuple[float, float]] = None
+    first_edge_placed = False
 
     for i, edge_id in enumerate(edge_order):
         direction = edge_directions.get(edge_id, 'forward')
@@ -378,32 +657,75 @@ def evaluate_order_cost(
         if not edge:
             continue
 
-        # 获取当前边的几何
         geo = get_edge_inspection_geometry_with_direction(edge, direction)
         if len(geo) < 2:
             continue
 
-        if i == 0:
-            # 第一个边，设置起点
-            current_point = geo[0]
-            current_edge_id = edge_id
-            current_direction = direction
+        if not first_edge_placed:
+            prev_edge_id = edge_id
+            prev_direction = direction
+            prev_point_end = geo[-1]
+            _apply_edge_visit_line_counts(line_visited, edge)
+            for lid in _newly_completed_lines(line_visited, line_totals, completed_lines):
+                completed_lines.add(lid)
+            first_edge_placed = True
             continue
 
-        # 计算从上一个边到当前边的连接代价
+        if prev_edge_id is None or prev_direction is None or prev_point_end is None:
+            continue
+
+        to_line = getattr(edge, "line_id", "") or None
         cost = compute_connection_cost_enhanced(
-            current_edge_id, edge_id,
-            current_direction, direction,
-            current_point, geo[0],
-            topo_graph, edge_task_map, groups, weights
+            prev_edge_id,
+            edge_id,
+            prev_direction,
+            direction,
+            prev_point_end,
+            geo[0],
+            topo_graph,
+            edge_task_map,
+            groups,
+            weights,
+            completed_lines=set(completed_lines) if completed_lines else None,
+            target_line_id=to_line,
         )
+        transition = float(cost.total_cost)
 
-        total_cost += cost.total_cost
+        prev_edge = edge_task_map.get(prev_edge_id)
+        if (
+            prev_edge
+            and to_line
+            and getattr(prev_edge, "line_id", "") == to_line
+        ):
+            factor = float(weights.get("same_line_transition_factor", 0.91))
+            transition *= factor
+            streak = float(weights.get("same_line_streak_reward", 40.0))
+            transition = max(0.0, transition - streak)
 
-        # 更新当前状态
-        current_edge_id = edge_id
-        current_direction = direction
-        current_point = geo[-1]
+        pm = edge_mean.get(prev_edge_id) if prev_edge_id else None
+        cm = edge_mean.get(edge_id)
+        if (
+            prev_edge
+            and to_line
+            and getattr(prev_edge, "line_id", "") == to_line
+            and pm is not None
+            and cm is not None
+            and cm < pm - 15.0
+        ):
+            transition += float(weights.get("line_reverse_jump", 0.35)) * float(pm - cm)
+
+        total_cost += transition
+
+        _apply_edge_visit_line_counts(line_visited, edge)
+        for lid in _newly_completed_lines(line_visited, line_totals, completed_lines):
+            completed_lines.add(lid)
+
+        prev_edge_id = edge_id
+        prev_direction = direction
+        prev_point_end = geo[-1]
+
+    lm = _line_continuity_metrics(edge_order, edge_task_map, weights)
+    total_cost += float(lm["total_penalty"])
 
     return total_cost
 
@@ -545,7 +867,496 @@ def optimize_edge_order_simulated_annealing(
     print(f"  [完成] 最终代价: {best_cost:.1f} (迭代 {iteration} 次)")
     print(f"  [最优顺序] {' -> '.join(best_order[:5])}... (共{len(best_order)}条边)")
 
+    lm_sa = _line_continuity_metrics(best_order, edge_task_map, None)
+    line_keys_sa = sorted(
+        set(lm_sa["blocks_per_line"].keys()) | set(lm_sa["per_line_revisit_pen"].keys())
+    )
+    for lid in line_keys_sa:
+        b = int(lm_sa["blocks_per_line"].get(lid, 0))
+        rp = float(lm_sa["per_line_revisit_pen"].get(lid, 0.0))
+        print(f"[line-continuity] line_id={lid} blocks={b} revisit_penalty={rp:.1f}")
+
     return best_order, best_directions, best_cost
+
+
+def line_inspect_geometry(lt: LineTask, direction: str) -> List[Tuple[float, float]]:
+    """沿 LineTask 折线在 [s_min,s_max] 上的巡检几何；forward 为弧长递增，reverse 为递减。"""
+    raw = _slice_polyline_by_distance(list(lt.polyline), lt.s_min, lt.s_max)
+    if len(raw) < 2:
+        return []
+    if direction == "reverse":
+        return list(reversed(raw))
+    return raw
+
+
+def evaluate_line_order_cost(
+    line_order: List[str],
+    line_directions: Dict[str, str],
+    line_task_map: Dict[str, LineTask],
+    edge_task_map: Dict[str, EdgeTask],
+    topo_graph: TopoGraph,
+    groups: Dict[str, EdgeGroup],
+    weights: Optional[Dict[str, float]] = None,
+) -> float:
+    """线路级顺序代价：仅相邻物理线路之间计 connect，无同线 connect。"""
+    if weights is None:
+        weights = _default_order_weights()
+    else:
+        merged = _default_order_weights()
+        merged.update(weights)
+        weights = merged
+
+    line_totals_local = {lid: lt.num_points for lid, lt in line_task_map.items()}
+    line_visited: Dict[str, int] = defaultdict(int)
+    completed_lines: Set[str] = set()
+
+    total_cost = 0.0
+    prev_line_id: Optional[str] = None
+    prev_point_end: Optional[Tuple[float, float]] = None
+    first_placed = False
+
+    for line_id in line_order:
+        lt = line_task_map.get(line_id)
+        if not lt or lt.num_points <= 0:
+            continue
+        direction = line_directions.get(line_id, "forward")
+        geo = line_inspect_geometry(lt, direction)
+        if len(geo) < 2:
+            continue
+
+        if not first_placed:
+            line_visited[lt.line_id] += lt.num_points
+            if line_visited[lt.line_id] >= line_totals_local.get(lt.line_id, 0):
+                completed_lines.add(lt.line_id)
+            prev_line_id = line_id
+            prev_point_end = geo[-1]
+            first_placed = True
+            continue
+
+        prev_lt = line_task_map.get(prev_line_id) if prev_line_id else None
+        if prev_lt is None or prev_point_end is None:
+            continue
+
+        from_e = prev_lt.rep_end_edge_id or prev_lt.rep_start_edge_id
+        to_e = lt.rep_start_edge_id or lt.rep_end_edge_id
+        if not from_e or not to_e:
+            continue
+
+        to_line = lt.line_id
+        cost = compute_connection_cost_enhanced(
+            from_e,
+            to_e,
+            "forward",
+            "forward",
+            prev_point_end,
+            geo[0],
+            topo_graph,
+            edge_task_map,
+            groups,
+            weights,
+            completed_lines=set(completed_lines) if completed_lines else None,
+            target_line_id=to_line,
+        )
+        total_cost += float(cost.total_cost)
+
+        line_visited[lt.line_id] += lt.num_points
+        if line_visited[lt.line_id] >= line_totals_local.get(lt.line_id, 0):
+            completed_lines.add(lt.line_id)
+
+        prev_line_id = line_id
+        prev_point_end = geo[-1]
+
+    return total_cost
+
+
+def generate_start_line_candidates(
+    line_tasks: List[LineTask],
+    topo_graph: TopoGraph,
+    groups: Dict[str, EdgeGroup],
+    edge_task_map: Dict[str, EdgeTask],
+    adjacency: dict,
+    max_candidates: int = 10,
+) -> List[Tuple[str, float]]:
+    edge_list = list(edge_task_map.values())
+    candidates: List[Tuple[str, float]] = []
+    for lt in line_tasks:
+        eid = lt.rep_start_edge_id or (lt.edge_ids[0] if lt.edge_ids else "")
+        if not eid:
+            continue
+        score = evaluate_start_edge_candidate(
+            eid, edge_list, topo_graph, groups, edge_task_map, adjacency
+        )
+        candidates.append((lt.line_id, score))
+    candidates.sort(key=lambda x: x[1])
+    return candidates[:max_candidates]
+
+
+def optimize_line_order_simulated_annealing(
+    line_tasks: List[LineTask],
+    topo_graph: TopoGraph,
+    line_task_map: Dict[str, LineTask],
+    edge_task_map: Dict[str, EdgeTask],
+    groups: Dict[str, EdgeGroup],
+    adjacency: dict,
+    start_line_id: Optional[str] = None,
+    initial_temp: float = 1000.0,
+    cooling_rate: float = 0.95,
+    iterations_per_temp: int = 50,
+    min_temp: float = 1.0,
+) -> Tuple[List[str], Dict[str, str], float]:
+    print("\n" + "=" * 60)
+    print("[Global Optimizer] 模拟退火优化物理线路访问顺序...")
+    print("=" * 60)
+
+    line_ids = [lt.line_id for lt in line_tasks]
+
+    if start_line_id is None or start_line_id not in line_task_map:
+        candidates = generate_start_line_candidates(
+            line_tasks, topo_graph, groups, edge_task_map, adjacency
+        )
+        start_line_id = candidates[0][0]
+        print(f"  [起始线路] 自动选择: {start_line_id} (score={candidates[0][1]:.1f})")
+
+    current_order = [start_line_id]
+    remaining = [lid for lid in line_ids if lid != start_line_id]
+    random.shuffle(remaining)
+    current_order.extend(remaining)
+
+    current_directions: Dict[str, str] = {lid: "forward" for lid in line_ids}
+
+    current_cost = evaluate_line_order_cost(
+        current_order,
+        current_directions,
+        line_task_map,
+        edge_task_map,
+        topo_graph,
+        groups,
+    )
+
+    best_order = current_order.copy()
+    best_directions = current_directions.copy()
+    best_cost = current_cost
+
+    temp = initial_temp
+    iteration = 0
+
+    print(f"  [初始] 代价: {current_cost:.1f}")
+    print(f"  [参数] T0={initial_temp}, 降温率={cooling_rate}, 每T迭代={iterations_per_temp}")
+
+    while temp > min_temp:
+        for _ in range(iterations_per_temp):
+            iteration += 1
+
+            new_order = current_order.copy()
+            new_directions = current_directions.copy()
+            operation = random.choice(["swap", "reverse", "direction"])
+
+            if operation == "swap" and len(new_order) > 2:
+                idx1, idx2 = random.sample(range(1, len(new_order)), 2)
+                new_order[idx1], new_order[idx2] = new_order[idx2], new_order[idx1]
+            elif operation == "reverse" and len(new_order) > 3:
+                start = random.randint(1, len(new_order) - 2)
+                end = random.randint(start + 1, len(new_order) - 1)
+                new_order[start : end + 1] = new_order[start : end + 1][::-1]
+            elif operation == "direction":
+                idx = random.randint(0, len(new_order) - 1)
+                lid = new_order[idx]
+                new_directions[lid] = (
+                    "reverse" if new_directions[lid] == "forward" else "forward"
+                )
+
+            new_cost = evaluate_line_order_cost(
+                new_order,
+                new_directions,
+                line_task_map,
+                edge_task_map,
+                topo_graph,
+                groups,
+            )
+
+            delta = new_cost - current_cost
+            if delta < 0 or random.random() < np.exp(-delta / temp):
+                current_order = new_order
+                current_directions = new_directions
+                current_cost = new_cost
+                if current_cost < best_cost:
+                    best_order = current_order.copy()
+                    best_directions = current_directions.copy()
+                    best_cost = current_cost
+
+        temp *= cooling_rate
+        if iteration % 500 == 0:
+            print(f"  [进度] iter={iteration}, T={temp:.1f}, 当前最优={best_cost:.1f}")
+
+    print(f"  [完成] 最终代价: {best_cost:.1f} (迭代 {iteration} 次)")
+    order_disp = "/".join(
+        f"{lid}{'+' if best_directions.get(lid, 'forward') == 'forward' else '-'}"
+        for lid in best_order
+    )
+    print(f"[line-order] order=[{order_disp}]")
+
+    return best_order, best_directions, best_cost
+
+
+def build_optimized_mission_from_line_tasks(
+    line_order: List[str],
+    line_directions: Dict[str, str],
+    line_tasks: List[LineTask],
+    line_task_map: Dict[str, LineTask],
+    edge_tasks: List[EdgeTask],
+    topo_graph: TopoGraph,
+    edge_task_map: Dict[str, EdgeTask],
+    groups: Dict[str, EdgeGroup],
+    adjacency: dict,
+    connect_planner: str = "bfs",
+    cost_config: Optional[Dict[str, Any]] = None,
+) -> GroupedContinuousMission:
+    print("\n" + "=" * 60)
+    print("[Global Optimizer] 构建线路级连续任务...")
+    print("=" * 60)
+
+    mission = GroupedContinuousMission()
+    line_totals_lt = {lt.line_id: lt.num_points for lt in line_tasks}
+    line_visited: Dict[str, int] = defaultdict(int)
+    completed_lines: Set[str] = set()
+    route_stats: Dict[str, Any] = {
+        "completed_line_cross_count": 0,
+        "cross_details": [],
+        "same_line_connect_count": 0,
+        "same_line_connect_fallback_count": 0,
+    }
+
+    visited_groups: List[str] = []
+    current_group: Optional[str] = None
+    current_end_point: Optional[Tuple[float, float]] = None
+    current_line_id: Optional[str] = None
+    first_inspect_placed = False
+
+    line_visit_export: List[Tuple[str, str, List[Any]]] = []
+
+    for line_id in line_order:
+        lt = line_task_map.get(line_id)
+        if not lt or lt.num_points <= 0:
+            continue
+
+        direction = line_directions.get(line_id, "forward")
+        geo = line_inspect_geometry(lt, direction)
+        if len(geo) < 2:
+            print(
+                f"[DEBUG] dead-end branch skipped line_id={line_id} reason=empty_line_inspect_geometry"
+            )
+            continue
+
+        group_id = find_edge_group(lt.line_id, groups)
+        if group_id and group_id != current_group:
+            if current_group is not None:
+                visited_groups.append(group_id)
+            current_group = group_id
+
+        if not first_inspect_placed:
+            mission.segments.append(
+                MissionSegment(
+                    type="inspect",
+                    from_edge_id=None,
+                    to_edge_id=lt.line_id,
+                    geometry=geo,
+                    length=float(
+                        np.sum(np.linalg.norm(np.diff(np.array(geo), axis=0), axis=1))
+                    ),
+                    edge_id=lt.line_id,
+                    direction=direction,
+                )
+            )
+            mission.visit_order.append(
+                f"{lt.line_id}{'+' if direction == 'forward' else '-'}"
+            )
+            current_end_point = geo[-1]
+            current_line_id = lt.line_id
+            first_inspect_placed = True
+
+            if group_id and group_id in groups:
+                if group_id not in mission.groups:
+                    mission.add_group(groups[group_id])
+
+            pts_exp = (
+                list(lt.inspection_points)
+                if direction == "forward"
+                else list(reversed(lt.inspection_points))
+            )
+            line_visit_export.append((lt.line_id, direction, pts_exp))
+
+            line_visited[lt.line_id] += lt.num_points
+            if line_visited[lt.line_id] >= line_totals_lt.get(lt.line_id, 0):
+                completed_lines.add(lt.line_id)
+            continue
+
+        completed_for_connect = set(completed_lines) if completed_lines else None
+        prev_lt = line_task_map.get(current_line_id) if current_line_id else None
+        if prev_lt is None or current_end_point is None:
+            continue
+
+        from_e = prev_lt.rep_end_edge_id or prev_lt.rep_start_edge_id
+        to_e = lt.rep_start_edge_id or lt.rep_end_edge_id
+        if not from_e or not to_e:
+            continue
+
+        to_line = lt.line_id
+        if connect_planner and connect_planner.lower() == "dijkstra":
+            from planner.topo_dijkstra import generate_connection_segment_with_planner
+
+            connect_geo, connect_len = generate_connection_segment_with_planner(
+                current_end_point,
+                geo[0],
+                topo_graph,
+                edge_task_map,
+                connect_planner="dijkstra",
+                cost_config=cost_config,
+                from_edge_id=from_e,
+                to_edge_id=to_e,
+            )
+        else:
+            connect_geo, connect_len = generate_connection_segment_along_topo(
+                current_end_point,
+                geo[0],
+                topo_graph,
+                edge_task_map,
+                from_edge_id=from_e,
+                to_edge_id=to_e,
+                completed_lines=completed_for_connect,
+                target_line_id=to_line,
+                completed_line_edge_penalty=450.0,
+                route_connect_stats=route_stats,
+            )
+
+        print(
+            f"[line-connect] from_line={current_line_id} to_line={lt.line_id} length={connect_len:.1f}"
+        )
+
+        connect_geo_dense = interpolate_geometry(
+            connect_geo, step_size=10.0, min_points=20
+        )
+        is_inter_group = find_edge_group(current_line_id, groups) != find_edge_group(
+            lt.line_id, groups
+        )
+
+        mission.segments.append(
+            MissionSegment(
+                type="connect",
+                from_edge_id=from_e,
+                to_edge_id=to_e,
+                geometry=connect_geo_dense,
+                length=connect_len,
+            )
+        )
+        if is_inter_group:
+            mission.inter_group_connect_length += connect_len
+        else:
+            mission.intra_group_connect_length += connect_len
+
+        mission.segments.append(
+            MissionSegment(
+                type="inspect",
+                from_edge_id=from_e,
+                to_edge_id=lt.line_id,
+                geometry=geo,
+                length=float(
+                    np.sum(np.linalg.norm(np.diff(np.array(geo), axis=0), axis=1))
+                ),
+                edge_id=lt.line_id,
+                direction=direction,
+            )
+        )
+        mission.visit_order.append(
+            f"{lt.line_id}{'+' if direction == 'forward' else '-'}"
+        )
+
+        if group_id and group_id in groups:
+            if group_id not in mission.groups:
+                mission.add_group(groups[group_id])
+
+        pts_exp = (
+            list(lt.inspection_points)
+            if direction == "forward"
+            else list(reversed(lt.inspection_points))
+        )
+        line_visit_export.append((lt.line_id, direction, pts_exp))
+
+        line_visited[lt.line_id] += lt.num_points
+        if line_visited[lt.line_id] >= line_totals_lt.get(lt.line_id, 0):
+            completed_lines.add(lt.line_id)
+
+        current_end_point = geo[-1]
+        current_line_id = lt.line_id
+
+    mission.group_visit_order = visited_groups
+    mission.line_visit_export = line_visit_export
+
+    lids_raw: List[str] = []
+    for vo in mission.visit_order:
+        if len(vo) > 1 and vo[-1] in "+-":
+            lids_raw.append(vo[:-1])
+        else:
+            lids_raw.append(vo)
+    dup = len(lids_raw) - len(set(lids_raw))
+    total_pts = sum(lt.num_points for lt in line_tasks)
+    print(
+        f"[line-verify] duplicate_line_count={dup} same_line_connect_count="
+        f"{int(route_stats.get('same_line_connect_count', 0))} "
+        f"total_lines={len(mission.visit_order)} total_points={total_pts}"
+    )
+
+    inspect_len = sum(s.length for s in mission.segments if s.type == "inspect")
+    connect_len = sum(s.length for s in mission.segments if s.type == "connect")
+    mission.total_length = inspect_len + connect_len
+    mission.inspect_length = inspect_len
+    mission.connect_length = connect_len
+
+    inter_group_count = 0
+    for seg in mission.segments:
+        if seg.type == "connect":
+            fg = find_edge_group(seg.from_edge_id, groups)
+            tg = find_edge_group(seg.to_edge_id, groups)
+            if fg and tg and fg != tg:
+                inter_group_count += 1
+
+    connect_segments = sum(1 for s in mission.segments if s.type == "connect")
+    route_stats["lines_completed"] = len(completed_lines)
+    route_stats["connect_count"] = connect_segments
+    setattr(mission, "route_plan_stats", route_stats)
+
+    mission.edge_to_group = {}
+    for gid, grp in groups.items():
+        for eid in grp.edge_ids:
+            mission.edge_to_group[eid] = gid
+
+    if mission.visit_order:
+        first_vo = mission.visit_order[0]
+        mission.start_edge_id = (
+            first_vo[:-1] if len(first_vo) > 1 and first_vo[-1] in "+-" else first_vo
+        )
+
+    cc = int(route_stats.get("completed_line_cross_count", 0))
+    slc = int(route_stats.get("same_line_connect_count", 0))
+    slf = int(route_stats.get("same_line_connect_fallback_count", 0))
+    print(
+        f"[route-summary] edge_tasks={len(edge_tasks)} lines={len(line_tasks)} "
+        f"lines_completed={len(completed_lines)} connect_count={connect_segments} "
+        f"completed_line_cross_count={cc} line_revisit_count=0 total_line_penalty=0.0 "
+        f"same_line_connect_count={slc} same_line_connect_fallback_count={slf}"
+    )
+
+    print(
+        f"\n  [统计] 总长度={mission.total_length:.1f}px, "
+        f"inspect={mission.inspect_length:.1f}px, "
+        f"connect={mission.connect_length:.1f}px"
+    )
+    print(
+        f"  [统计] Group切换={inter_group_count}次, "
+        f"内组连接={mission.intra_group_connect_length:.1f}px, "
+        f"跨组连接={mission.inter_group_connect_length:.1f}px"
+    )
+
+    return mission
 
 
 # =====================================================
@@ -562,6 +1373,7 @@ def build_optimized_mission(
     adjacency: dict,
     connect_planner: str = "bfs",
     cost_config: Optional[Dict[str, Any]] = None,
+    line_totals: Optional[Dict[str, int]] = None,
 ) -> GroupedContinuousMission:
     """
     根据优化后的顺序构建任务
@@ -572,6 +1384,17 @@ def build_optimized_mission(
 
     mission = GroupedContinuousMission()
 
+    if line_totals is None:
+        line_totals = _line_point_totals(edge_tasks)
+    line_visited: Dict[str, int] = defaultdict(int)
+    completed_lines: Set[str] = set()
+    route_stats: Dict[str, Any] = {
+        "completed_line_cross_count": 0,
+        "cross_details": [],
+        "same_line_connect_count": 0,
+        "same_line_connect_fallback_count": 0,
+    }
+
     # 记录 group 访问顺序
     visited_groups = []
     current_group = None
@@ -579,6 +1402,7 @@ def build_optimized_mission(
     current_end_point = None
     current_edge_id = None
     current_direction = None
+    first_inspect_placed = False
 
     for i, edge_id in enumerate(edge_order):
         direction = edge_directions.get(edge_id, 'forward')
@@ -601,7 +1425,7 @@ def build_optimized_mission(
             print(f"[DEBUG] dead-end branch skipped/truncated edge={edge_id} reason=empty_trimmed_inspect_geometry")
             continue
 
-        if i == 0:
+        if not first_inspect_placed:
             # 第一个边：直接添加 inspect 段
             mission.segments.append(MissionSegment(
                 type='inspect',
@@ -630,11 +1454,81 @@ def build_optimized_mission(
                 if group_id not in mission.groups:
                     mission.add_group(groups[group_id])
 
-            print(f"  [{i+1}] {edge_id} ({direction}) - 起点")
+            print(f"  [{len(mission.visit_order)}] {edge_id} ({direction}) - 起点")
+
+            _apply_edge_visit_line_counts(line_visited, edge)
+            for lid in _newly_completed_lines(line_visited, line_totals, completed_lines):
+                completed_lines.add(lid)
+                print(
+                    f"[route-line] completed line_id={lid} at order={len(mission.visit_order)}"
+                )
+
+            first_inspect_placed = True
             continue
 
-        # 生成 connect 段（默认 BFS；可选 dijkstra）
-        if connect_planner and connect_planner.lower() == "dijkstra":
+        to_line = getattr(edge, "line_id", "") or None
+        completed_for_connect = set(completed_lines) if completed_lines else None
+
+        prev_edge_task = edge_task_map.get(current_edge_id) if current_edge_id else None
+        same_line_adjacent = bool(
+            to_line
+            and prev_edge_task is not None
+            and (getattr(prev_edge_task, "line_id", "") or "") == to_line
+        )
+
+        connect_geo: List[Tuple[float, float]]
+        connect_len: float
+
+        if same_line_adjacent:
+            sl_raw = _try_same_line_connect_geometry(
+                edge_order,
+                edge_task_map,
+                to_line,
+                (float(current_end_point[0]), float(current_end_point[1])),
+                (float(geo[0][0]), float(geo[0][1])),
+            )
+            if sl_raw and len(sl_raw) >= 2:
+                connect_geo = sl_raw
+                connect_len = float(_polyline_length(sl_raw))
+                route_stats["same_line_connect_count"] = (
+                    int(route_stats.get("same_line_connect_count", 0)) + 1
+                )
+                print(
+                    f"[same-line-connect] from={current_edge_id} to={edge_id} "
+                    f"line_id={to_line} length={connect_len:.1f} fallback=False"
+                )
+            else:
+                route_stats["same_line_connect_fallback_count"] = (
+                    int(route_stats.get("same_line_connect_fallback_count", 0)) + 1
+                )
+                if connect_planner and connect_planner.lower() == "dijkstra":
+                    from planner.topo_dijkstra import generate_connection_segment_with_planner
+
+                    connect_geo, connect_len = generate_connection_segment_with_planner(
+                        current_end_point, geo[0], topo_graph, edge_task_map,
+                        connect_planner="dijkstra",
+                        cost_config=cost_config,
+                        from_edge_id=current_edge_id,
+                        to_edge_id=edge_id,
+                    )
+                else:
+                    connect_geo, connect_len = generate_connection_segment_along_topo(
+                        current_end_point,
+                        geo[0],
+                        topo_graph,
+                        edge_task_map,
+                        from_edge_id=current_edge_id,
+                        to_edge_id=edge_id,
+                        completed_lines=completed_for_connect,
+                        target_line_id=to_line,
+                        completed_line_edge_penalty=450.0,
+                        route_connect_stats=route_stats,
+                    )
+                print(
+                    f"[same-line-connect] from={current_edge_id} to={edge_id} "
+                    f"line_id={to_line} length={connect_len:.1f} fallback=True"
+                )
+        elif connect_planner and connect_planner.lower() == "dijkstra":
             from planner.topo_dijkstra import generate_connection_segment_with_planner
 
             connect_geo, connect_len = generate_connection_segment_with_planner(
@@ -652,6 +1546,10 @@ def build_optimized_mission(
                 edge_task_map,
                 from_edge_id=current_edge_id,
                 to_edge_id=edge_id,
+                completed_lines=completed_for_connect,
+                target_line_id=to_line,
+                completed_line_edge_penalty=450.0,
+                route_connect_stats=route_stats,
             )
 
         # 插值密集路径点
@@ -705,6 +1603,13 @@ def build_optimized_mission(
             if group_id not in mission.groups:
                 mission.add_group(groups[group_id])
 
+        _apply_edge_visit_line_counts(line_visited, edge)
+        for lid in _newly_completed_lines(line_visited, line_totals, completed_lines):
+            completed_lines.add(lid)
+            print(
+                f"[route-line] completed line_id={lid} at order={len(mission.visit_order)}"
+            )
+
         # 更新状态
         current_end_point = geo[-1]
         current_edge_id = edge_id
@@ -713,7 +1618,7 @@ def build_optimized_mission(
         from_group = find_edge_group(current_edge_id, groups)
         to_group = find_edge_group(edge_id, groups)
         group_info = f" [{from_group}->{to_group}]" if from_group != to_group else ""
-        print(f"  [{i+1}] {edge_id} ({direction}) - connect={connect_len:.1f}px{group_info}")
+        print(f"  [{len(mission.visit_order)}] {edge_id} ({direction}) - connect={connect_len:.1f}px{group_info}")
 
     # 设置 group 访问顺序
     mission.group_visit_order = visited_groups
@@ -734,6 +1639,41 @@ def build_optimized_mission(
             to_group = find_edge_group(seg.to_edge_id, groups)
             if from_group and to_group and from_group != to_group:
                 inter_group_count += 1
+
+    connect_segments = sum(1 for s in mission.segments if s.type == "connect")
+    route_stats["lines_completed"] = len(completed_lines)
+    route_stats["connect_count"] = connect_segments
+
+    ow: Optional[Dict[str, float]] = None
+    if cost_config and isinstance(cost_config.get("order_weights"), dict):
+        raw = cost_config["order_weights"]
+        ow = {
+            str(k): float(v)
+            for k, v in raw.items()
+            if isinstance(v, (int, float))
+        }
+    lm_route = _line_continuity_metrics(edge_order, edge_task_map, ow)
+    route_stats["line_revisit_count"] = int(lm_route["revisit_count"])
+    route_stats["total_line_penalty"] = float(lm_route["total_penalty"])
+
+    setattr(mission, "route_plan_stats", route_stats)
+
+    cc = int(route_stats.get("completed_line_cross_count", 0))
+    lrc = int(route_stats.get("line_revisit_count", 0))
+    tlp = float(route_stats.get("total_line_penalty", 0.0))
+    slc = int(route_stats.get("same_line_connect_count", 0))
+    slf = int(route_stats.get("same_line_connect_fallback_count", 0))
+    print(
+        f"[route-summary] edge_tasks={len(edge_tasks)} lines={len(line_totals)} "
+        f"lines_completed={len(completed_lines)} connect_count={connect_segments} "
+        f"completed_line_cross_count={cc} line_revisit_count={lrc} "
+        f"total_line_penalty={tlp:.1f} same_line_connect_count={slc} "
+        f"same_line_connect_fallback_count={slf}"
+    )
+    if cc > 5:
+        print(f"[route-summary] listing cross_details (max 20)")
+        for row in route_stats.get("cross_details", [])[:20]:
+            print(f"[route-summary] cross_detail {row}")
 
     print(f"\n  [统计] 总长度={mission.total_length:.1f}px, "
           f"inspect={mission.inspect_length:.1f}px, "
@@ -773,121 +1713,122 @@ def plan_global_topology_optimized_mission(
     print("[全局拓扑优化] 开始规划...")
     print("="*70)
 
-    # 1. 仅保留有巡检任务的边，避免无任务端点往返
-    required_edge_tasks = [t for t in edge_tasks if (t.num_points or 0) > 0]
-    skipped_edges = [t for t in edge_tasks if (t.num_points or 0) <= 0]
+    edge_tasks_input = list(edge_tasks)
+    required_edge_tasks = [t for t in edge_tasks_input if (t.num_points or 0) > 0]
+    skipped_edges = [t for t in edge_tasks_input if (t.num_points or 0) <= 0]
     for t in skipped_edges:
         print(
             f"[DEBUG] dead-end branch skipped/truncated edge={t.edge_id} "
             "reason=no_required_inspection_points"
         )
-    edge_tasks = required_edge_tasks
-    if not edge_tasks:
+    if not required_edge_tasks:
         print("[WARN] 无可巡检边任务（全部 edge 均无 inspection_points）")
         return GroupedContinuousMission()
 
-    edge_task_map = {task.edge_id: task for task in edge_tasks}
+    edge_task_map = {task.edge_id: task for task in required_edge_tasks}
     adjacency = build_edge_adjacency_simple(topo_graph)
 
-    # 2. 空间分组
-    print("\n[Step 1] 空间分组...")
-    centroids = {
-        task.edge_id: (
-            (task.polyline[0][0] + task.polyline[-1][0]) / 2,
-            (task.polyline[0][1] + task.polyline[-1][1]) / 2
+    print("\n[Step 1] 物理线路任务 LineTask（由 EdgeTask 聚合）...")
+    line_tasks_all = build_line_tasks_from_edge_tasks(edge_tasks_input)
+    required_lines = [lt for lt in line_tasks_all if lt.num_points > 0]
+    if not required_lines:
+        print("[WARN] 无有效 LineTask（各 line 均无投影成功的巡检点）")
+        return GroupedContinuousMission()
+
+    line_task_map = {lt.line_id: lt for lt in required_lines}
+
+    print("\n[Step 2] 线路空间分组（每线路一组）...")
+    groups: Dict[str, EdgeGroup] = {}
+    for i, lt in enumerate(required_lines):
+        poly = np.array(lt.polyline, dtype=np.float64)
+        centroid = tuple(np.mean(poly, axis=0))
+        groups[f"Group_{i}"] = EdgeGroup(
+            group_id=f"Group_{i}",
+            edge_ids=[lt.line_id],
+            centroid=centroid,
+            bbox=(
+                float(np.min(poly[:, 0])),
+                float(np.min(poly[:, 1])),
+                float(np.max(poly[:, 0])),
+                float(np.max(poly[:, 1])),
+            ),
+            total_inspect_length=float(lt.len2d),
         )
-        for task in edge_tasks
-    }
 
-    # 检查 sklearn
-    try:
-        from sklearn.cluster import DBSCAN
-        _has_sklearn = True
-    except ImportError:
-        _has_sklearn = False
+    line_totals = {lt.line_id: lt.num_points for lt in required_lines}
+    _print_route_line_bootstrap(required_edge_tasks, line_totals)
 
-    if _has_sklearn:
-        from core.topo_plan import group_edges_spatially
-        groups = group_edges_spatially(edge_tasks, centroids, eps=eps)
-    else:
-        # 不分组，每条边一个 group
-        groups = {}
-        for i, task in enumerate(edge_tasks):
-            groups[f"Group_{i}"] = EdgeGroup(
-                group_id=f"Group_{i}",
-                edge_ids=[task.edge_id],
-                centroid=centroids[task.edge_id],
-                bbox=(
-                    min(p[0] for p in task.polyline),
-                    min(p[1] for p in task.polyline),
-                    max(p[0] for p in task.polyline),
-                    max(p[1] for p in task.polyline)
-                ),
-                total_inspect_length=task.len2d
-            )
+    start_line_id: Optional[str] = None
+    if start_edge_id:
+        st = edge_task_map.get(start_edge_id)
+        if st and (getattr(st, "line_id", "") or ""):
+            start_line_id = st.line_id
 
-    # 3. 起始边优化（如果未指定）
-    if start_edge_id is None:
-        print("\n[Step 2] 起始边优化...")
-        candidates = generate_start_edge_candidates(
-            edge_tasks, topo_graph, groups, edge_task_map, adjacency, max_candidates=10
-        )
-        print(f"  [候选起始边] Top 5:")
-        for eid, score in candidates[:5]:
-            print(f"    {eid}: {score:.1f}")
-        start_edge_id = candidates[0][0]
-
-    # 4. 全局顺序优化
     if enable_sa:
-        print("\n[Step 3] 全局顺序优化（模拟退火）...")
-        edge_order, edge_directions, cost = optimize_edge_order_simulated_annealing(
-            edge_tasks, topo_graph, edge_task_map, groups, adjacency,
-            start_edge_id=start_edge_id,
+        print("\n[Step 3] 全局顺序优化（线路级模拟退火）...")
+        line_order, line_directions, _cost = optimize_line_order_simulated_annealing(
+            required_lines,
+            topo_graph,
+            line_task_map,
+            edge_task_map,
+            groups,
+            adjacency,
+            start_line_id=start_line_id,
             initial_temp=1000.0,
             cooling_rate=0.95,
-            iterations_per_temp=50,  # 减少迭代次数加快速度
-            min_temp=1.0
+            iterations_per_temp=50,
+            min_temp=1.0,
         )
     else:
-        print("\n[Step 3] 使用贪心策略...")
-        # 简单贪心：最近邻
-        edge_order = [start_edge_id]
-        edge_directions = {start_edge_id: 'forward'}
-        unvisited = set(e.edge_id for e in edge_tasks) - {start_edge_id}
-
-        while unvisited:
-            current_edge_id = edge_order[-1]
-            current_edge = edge_task_map[current_edge_id]
-            current_geo = get_edge_geometry_with_direction(
-                current_edge, edge_directions[current_edge_id]
+        print("\n[Step 3] 线路级贪心（最近邻）...")
+        if start_line_id is None or start_line_id not in line_task_map:
+            lc = generate_start_line_candidates(
+                required_lines, topo_graph, groups, edge_task_map, adjacency
             )
-            current_point = current_geo[-1]
-
-            # 找最近的未访问边
-            best_next = None
-            best_dist = float('inf')
-
-            for eid in unvisited:
-                edge = edge_task_map[eid]
-                # 尝试两个方向
-                for direction in ['forward', 'reverse']:
-                    geo = get_edge_geometry_with_direction(edge, direction)
-                    dist = np.linalg.norm(np.array(geo[0]) - np.array(current_point))
+            start_line_id = lc[0][0]
+        line_order = [start_line_id]
+        line_directions: Dict[str, str] = {
+            lt.line_id: "forward" for lt in required_lines
+        }
+        unvisited = set(line_task_map.keys()) - {start_line_id}
+        while unvisited:
+            cur_lid = line_order[-1]
+            cur_lt = line_task_map[cur_lid]
+            cur_geo = line_inspect_geometry(cur_lt, line_directions[cur_lid])
+            if len(cur_geo) < 2:
+                break
+            cur_end = np.array(cur_geo[-1], dtype=np.float64)
+            best_l: Optional[str] = None
+            best_dist = float("inf")
+            best_dir = "forward"
+            for lid in unvisited:
+                olt = line_task_map[lid]
+                for d in ("forward", "reverse"):
+                    g = line_inspect_geometry(olt, d)
+                    if len(g) < 2:
+                        continue
+                    dist = float(np.linalg.norm(np.array(g[0], dtype=np.float64) - cur_end))
                     if dist < best_dist:
                         best_dist = dist
-                        best_next = eid
-                        best_direction = direction
+                        best_l = lid
+                        best_dir = d
+            if best_l is None:
+                break
+            line_order.append(best_l)
+            line_directions[best_l] = best_dir
+            unvisited.remove(best_l)
 
-            if best_next:
-                edge_order.append(best_next)
-                edge_directions[best_next] = best_direction
-                unvisited.remove(best_next)
-
-    # 5. 构建任务
-    print("\n[Step 4] 构建优化任务...")
-    mission = build_optimized_mission(
-        edge_order, edge_directions,
-        edge_tasks, topo_graph, edge_task_map, groups, adjacency
+    print("\n[Step 4] 构建线路级连续任务...")
+    mission = build_optimized_mission_from_line_tasks(
+        line_order,
+        line_directions,
+        required_lines,
+        line_task_map,
+        required_edge_tasks,
+        topo_graph,
+        edge_task_map,
+        groups,
+        adjacency,
     )
 
     print("\n" + "="*70)

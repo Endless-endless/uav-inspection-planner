@@ -21,6 +21,7 @@ EdgeTask：
 
 from dataclasses import dataclass, field
 from typing import Any, List, Tuple, Dict, Optional, Sequence
+import re
 import numpy as np
 
 
@@ -268,6 +269,160 @@ def build_edge_tasks(topo_graph, line_inspection_points_by_line: Dict[str, List]
     print(f"  [边任务构建] 完成: {len(edge_tasks)} 个任务")
 
     return edge_tasks
+
+
+@dataclass
+class LineTask:
+    """
+    物理线路任务：同一 line_id 下若干 EdgeTask 聚合成一条可巡检折线。
+    """
+
+    line_id: str
+    edge_ids: List[str]
+    polyline: List[Tuple[float, float]]
+    inspection_points: List[Any]
+    num_points: int
+    s_min: float
+    s_max: float
+    len2d: float = 0.0
+    rep_start_edge_id: str = ""
+    rep_end_edge_id: str = ""
+
+
+def _edge_task_topo_index(task: EdgeTask) -> Tuple[int, str]:
+    m = re.search(r"_edge_(\d+)$", task.edge_id or "")
+    if m:
+        return (int(m.group(1)), task.edge_id)
+    return (10**9, task.edge_id)
+
+
+def _inspection_point_xy(point: Any) -> Optional[Tuple[float, float]]:
+    if hasattr(point, "pixel_position"):
+        pos = point.pixel_position
+    elif isinstance(point, dict):
+        pos = point.get("pixel_position") or point.get("pos2d") or point.get("position")
+    else:
+        pos = None
+    if not pos or len(pos) < 2:
+        return None
+    return float(pos[0]), float(pos[1])
+
+
+def _stitch_edge_task_polylines(tasks_sorted: List[EdgeTask], tol_join: float = 6.0) -> List[Tuple[float, float]]:
+    from core.image_pixel_coords import edge_pixel_polyline
+
+    merged: List[Tuple[float, float]] = []
+    for t in tasks_sorted:
+        pl = edge_pixel_polyline(t)
+        if len(pl) < 2:
+            continue
+        if not merged:
+            merged.extend(pl)
+            continue
+        last = np.array(merged[-1], dtype=np.float64)
+        head = np.array(pl[0], dtype=np.float64)
+        tail = np.array(pl[-1], dtype=np.float64)
+        if float(np.linalg.norm(last - head)) <= tol_join:
+            merged.extend(pl[1:])
+        elif float(np.linalg.norm(last - tail)) <= tol_join:
+            rpl = list(reversed(pl))
+            merged.extend(rpl[1:])
+        else:
+            return []
+    return merged
+
+
+def build_line_tasks_from_edge_tasks(edge_tasks: List[EdgeTask]) -> List[LineTask]:
+    """
+    将 EdgeTask 按 line_id 聚合成 LineTask（含完整像素折线与按弧长排序的巡检点）。
+    """
+    by_line: Dict[str, List[EdgeTask]] = {}
+    for t in edge_tasks:
+        lid = getattr(t, "line_id", None) or ""
+        if not lid:
+            continue
+        by_line.setdefault(lid, []).append(t)
+
+    out: List[LineTask] = []
+    from core.image_pixel_coords import edge_pixel_polyline
+    from core.topo_plan import _polyline_length, _slice_polyline_by_distance
+
+    for lid in sorted(by_line.keys()):
+        tasks = by_line[lid]
+        tasks_sorted = sorted(tasks, key=_edge_task_topo_index)
+        edge_ids = [x.edge_id for x in tasks_sorted]
+
+        merged = _stitch_edge_task_polylines(tasks_sorted)
+        if len(merged) < 2:
+            pl0 = edge_pixel_polyline(tasks_sorted[0]) if tasks_sorted else []
+            merged = list(pl0) if len(pl0) >= 2 else []
+
+        if len(merged) < 2:
+            continue
+
+        all_pts: List[Any] = []
+        for t in tasks_sorted:
+            pts = getattr(t, "inspection_points", None) or []
+            all_pts.extend(pts)
+
+        decorated: List[Tuple[float, Any]] = []
+        for p in all_pts:
+            xy = _inspection_point_xy(p)
+            if xy is None:
+                continue
+            meta = project_point_to_polyline(xy, merged)
+            if meta is None:
+                continue
+            if float(meta["distance"]) > 80.0:
+                continue
+            decorated.append((float(meta["distance_along_edge"]), p))
+
+        decorated.sort(key=lambda x: x[0])
+        if not decorated:
+            out.append(
+                LineTask(
+                    line_id=lid,
+                    edge_ids=edge_ids,
+                    polyline=[tuple(x) for x in merged],
+                    inspection_points=[],
+                    num_points=0,
+                    s_min=0.0,
+                    s_max=0.0,
+                    len2d=float(_polyline_length(merged)),
+                    rep_start_edge_id=edge_ids[0] if edge_ids else "",
+                    rep_end_edge_id=edge_ids[-1] if edge_ids else "",
+                )
+            )
+            continue
+
+        s_vals = [d[0] for d in decorated]
+        s_min, s_max = min(s_vals), max(s_vals)
+        ordered_pts = [d[1] for d in decorated]
+        total_len = float(_polyline_length(merged))
+        seg = _slice_polyline_by_distance(merged, s_min, s_max)
+        seg_len = float(_polyline_length(seg)) if len(seg) >= 2 else 0.0
+
+        print(
+            f"[line-task] line_id={lid} edge_count={len(edge_ids)} point_count={len(ordered_pts)} "
+            f"s_min={s_min:.1f} s_max={s_max:.1f} length={seg_len:.1f}"
+        )
+
+        out.append(
+            LineTask(
+                line_id=lid,
+                edge_ids=edge_ids,
+                polyline=[tuple(x) for x in merged],
+                inspection_points=ordered_pts,
+                num_points=len(ordered_pts),
+                s_min=float(s_min),
+                s_max=float(s_max),
+                len2d=total_len,
+                rep_start_edge_id=edge_ids[0] if edge_ids else "",
+                rep_end_edge_id=edge_ids[-1] if edge_ids else "",
+            )
+        )
+
+    return out
 
 
 def summarize_edge_tasks(edge_tasks: List[EdgeTask]) -> Dict:

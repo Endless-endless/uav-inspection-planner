@@ -667,6 +667,250 @@ def _rotate_order_nearest_start(
     return rotated, best_forward, best_entry
 
 
+def _pick_start_edge_id_for_replan(
+    tasks: Dict[str, Dict[str, Any]],
+    start_xy: Point,
+    weather_context: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """与 step9_4 一致：选离用户起点最近的边作为全局规划 start_edge_id。"""
+    best_eid: Optional[str] = None
+    best_d = float("inf")
+    for eid, row in tasks.items():
+        poly = row.get("polyline") or []
+        if len(poly) < 2:
+            continue
+        for entry in (poly[0], poly[-1]):
+            d = _dist(start_xy, entry) + _weather_penalty_for_line(
+                start_xy, entry, weather_context
+            )
+            if d < best_d:
+                best_d = d
+                best_eid = eid
+    return best_eid
+
+
+def _expand_line_visit_tokens_to_edge_ids(
+    visit_tokens: List[str],
+    edge_tasks_list: List[EdgeTask],
+) -> List[str]:
+    """
+    plan_global_topology_optimized_mission 当前输出为线路级 visit_order（L_xxx±）；
+    展开为拓扑边 edge_id 序列（与首次 JSON 中 edge 粒度一致）。
+    """
+    from core.topo_task import build_line_tasks_from_edge_tasks
+
+    line_tasks = build_line_tasks_from_edge_tasks(edge_tasks_list)
+    lt_map = {lt.line_id: lt for lt in line_tasks}
+    out: List[str] = []
+    seen: set[str] = set()
+    for tok in visit_tokens:
+        s = str(tok or "").strip()
+        if not s:
+            continue
+        forward = True
+        lid = s
+        if len(s) >= 2 and s[-1] in "+-":
+            lid = s[:-1]
+            forward = s[-1] == "+"
+        lt = lt_map.get(lid)
+        if lt is not None:
+            edges = list(lt.edge_ids) if forward else list(reversed(lt.edge_ids))
+            for eid in edges:
+                if eid not in seen:
+                    seen.add(eid)
+                    out.append(eid)
+        else:
+            # 兼容旧版边级 token（L_xxx_edge_k±）
+            if lid not in seen:
+                seen.add(lid)
+                out.append(lid)
+    return out
+
+
+def _connect_metric_length(
+    point_a: Point,
+    point_b: Point,
+    *,
+    from_edge_id: Optional[str],
+    to_edge_id: str,
+    topo_graph: Optional[TopoGraph],
+    edge_task_map: Dict[str, EdgeTask],
+    cost_config: Optional[Dict[str, Any]],
+) -> float:
+    """沿 topo 的 connect 几何长度（与现有 connect 段一致），用于边序 fallback。"""
+    try:
+        geom = _connect_geometry_topo(
+            point_a,
+            point_b,
+            role="between_edges",
+            from_edge_id=from_edge_id,
+            to_edge_id=to_edge_id,
+            topo_graph=topo_graph,
+            edge_task_map=edge_task_map,
+            cost_config=cost_config,
+        )
+        return _path_length(geom)
+    except Exception:
+        return float("inf")
+
+
+def _fallback_edge_order_connect_greedy(
+    tasks: Dict[str, Dict[str, Any]],
+    *,
+    topo_graph: Optional[TopoGraph],
+    edge_task_map: Dict[str, EdgeTask],
+    cost_config: Optional[Dict[str, Any]],
+    start: Point,
+) -> List[str]:
+    """
+    非 baseline：按当前 connect 代价（与 _connect_geometry_topo 一致）贪心串联所有边。
+    """
+    eids = [e for e, t in tasks.items() if len(t.get("polyline") or []) >= 2]
+    if not eids:
+        return []
+    if len(eids) == 1:
+        return eids
+    remaining = set(eids)
+    best_first: Optional[Tuple[float, str, Point, Point]] = None
+    for eid in remaining:
+        poly = tasks[eid]["polyline"]
+        c0 = _connect_metric_length(
+            start,
+            poly[0],
+            None,
+            eid,
+            topo_graph=topo_graph,
+            edge_task_map=edge_task_map,
+            cost_config=cost_config,
+        )
+        c1 = _connect_metric_length(
+            start,
+            poly[-1],
+            None,
+            eid,
+            topo_graph=topo_graph,
+            edge_task_map=edge_task_map,
+            cost_config=cost_config,
+        )
+        if c0 <= c1:
+            cand = (c0, eid, poly[0], poly[-1])
+        else:
+            cand = (c1, eid, poly[-1], poly[0])
+        if best_first is None or cand[0] < best_first[0]:
+            best_first = cand
+    assert best_first is not None
+    _, first_e, _, current_exit = best_first
+    ordered: List[str] = [first_e]
+    remaining.remove(first_e)
+    prev_edge: Optional[str] = first_e
+    while remaining:
+        best_c = float("inf")
+        best_pick: Optional[Tuple[str, Point, Point]] = None
+        for eid in remaining:
+            poly = tasks[eid]["polyline"]
+            c0 = _connect_metric_length(
+                current_exit,
+                poly[0],
+                prev_edge,
+                eid,
+                topo_graph=topo_graph,
+                edge_task_map=edge_task_map,
+                cost_config=cost_config,
+            )
+            c1 = _connect_metric_length(
+                current_exit,
+                poly[-1],
+                prev_edge,
+                eid,
+                topo_graph=topo_graph,
+                edge_task_map=edge_task_map,
+                cost_config=cost_config,
+            )
+            if c0 <= c1:
+                cand_c, entry_pt, exit_pt = c0, poly[0], poly[-1]
+            else:
+                cand_c, entry_pt, exit_pt = c1, poly[-1], poly[0]
+            if cand_c < best_c:
+                best_c = cand_c
+                best_pick = (eid, entry_pt, exit_pt)
+        if best_pick is None:
+            break
+        eid, _, exit_pt = best_pick
+        ordered.append(eid)
+        remaining.remove(eid)
+        current_exit = exit_pt
+        prev_edge = eid
+    for eid in eids:
+        if eid not in ordered:
+            ordered.append(eid)
+    return ordered
+
+
+def _compute_replan_edge_visit_order(
+    base_mission: Dict[str, Any],
+    tasks: Dict[str, Dict[str, Any]],
+    *,
+    topo_graph: Optional[TopoGraph],
+    edge_task_map: Dict[str, EdgeTask],
+    start: Point,
+    weather_context: Optional[Dict[str, Any]],
+    cost_config: Optional[Dict[str, Any]],
+) -> Tuple[List[str], str]:
+    """
+    优先与首次生成一致：plan_global_topology_optimized_mission + 线路序展开为边序。
+    失败则用 connect 代价贪心（非 baseline 旋转）。
+    最后手段：baseline visit_order（仍会在外层做 _rotate_order_nearest_start）。
+    """
+    baseline_order = _edge_visit_order(base_mission, tasks)
+    baseline_order = [e for e in baseline_order if e in tasks]
+
+    if not topo_graph or not edge_task_map:
+        return baseline_order, "baseline_rotated_fallback"
+
+    edge_tasks_list = list(edge_task_map.values())
+    start_edge_id = _pick_start_edge_id_for_replan(tasks, start, weather_context)
+
+    try:
+        from core.topo_global_optimizer import plan_global_topology_optimized_mission
+
+        gmission = plan_global_topology_optimized_mission(
+            topo_graph=topo_graph,
+            edge_tasks=edge_tasks_list,
+            start_edge_id=start_edge_id,
+            enable_sa=False,
+            eps=150.0,
+        )
+        tokens = list(getattr(gmission, "visit_order", None) or [])
+        expanded = _expand_line_visit_tokens_to_edge_ids(tokens, edge_tasks_list)
+        expanded = [e for e in expanded if e in tasks]
+        seen_exp = set(expanded)
+        for e in baseline_order:
+            if e in tasks and e not in seen_exp:
+                expanded.append(e)
+                seen_exp.add(e)
+        if len(expanded) >= len(tasks) and expanded:
+            return expanded, "global_recomputed"
+    except Exception as exc:
+        print(f"[WARN] replan global edge order failed, using topo greedy: {exc}")
+
+    greedy = _fallback_edge_order_connect_greedy(
+        tasks,
+        topo_graph=topo_graph,
+        edge_task_map=edge_task_map,
+        cost_config=cost_config,
+        start=start,
+    )
+    greedy = [e for e in greedy if e in tasks]
+    seen_g = set(greedy)
+    for e in baseline_order:
+        if e in tasks and e not in seen_g:
+            greedy.append(e)
+            seen_g.add(e)
+    if greedy:
+        return greedy, "baseline_rotated_fallback"
+    return baseline_order, "baseline_rotated_fallback"
+
+
 def _collect_baseline_inspection_points(
     base_mission: Dict[str, Any],
     visit_order: List[str],
@@ -1056,7 +1300,17 @@ def build_start_end_replan_mission(
     if not tasks:
         raise ReplanValidationError("No inspect segments in baseline mission")
 
-    visit_order = _edge_visit_order(base_mission, tasks)
+    cost_cfg = _weather_cost_config_for_dijkstra(weather_context)
+
+    visit_order, order_source = _compute_replan_edge_visit_order(
+        base_mission,
+        tasks,
+        topo_graph=topo_graph,
+        edge_task_map=edge_task_map or {},
+        start=start,
+        weather_context=weather_context,
+        cost_config=cost_cfg,
+    )
     visit_order = [e for e in visit_order if e in tasks]
     if not visit_order:
         raise ReplanValidationError(
@@ -1067,14 +1321,16 @@ def build_start_end_replan_mission(
         visit_order, tasks, start, weather_context=weather_context
     )
 
-    _log_replan_point_projections(base_mission, tasks, visit_order)
+    print(f"[replan-order] source={order_source}")
+    print(f"[replan-order] edge_count={len(visit_order)}")
+    print(f"[replan-order] first_10={visit_order[:10]!r}")
 
-    cost_cfg = _weather_cost_config_for_dijkstra(weather_context)
+    _log_replan_point_projections(base_mission, tasks, visit_order)
     topo_reload_ok = topo_graph is not None and bool(edge_task_map)
     missing_topo_edges = [eid for eid in visit_order if eid not in edge_task_map]
     if topo_reload_ok and missing_topo_edges:
         print(
-            f"[WARN] replan: baseline visit_order has edges not in rebuilt topo "
+            f"[WARN] replan: visit_order has edges not in rebuilt topo "
             f"(count={len(missing_topo_edges)}): {missing_topo_edges[:8]}"
         )
 

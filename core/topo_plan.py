@@ -1541,6 +1541,7 @@ def generate_connection_segment_along_topo(
     from_edge_id: Optional[str] = None,
     to_edge_id: Optional[str] = None,
     pixel_coord_mode: Optional[bool] = None,
+    **_,
 ) -> Tuple[List[Tuple[float, float]], float]:
     """
     沿拓扑图生成连接段（替代简单的直线连接）
@@ -1550,6 +1551,8 @@ def generate_connection_segment_along_topo(
         point_b: 终点
         topo_graph: 拓扑图
         edge_task_map: 边任务映射
+        kwargs: 兼容 core/topo_global_optimizer 传入的路由提示参数
+            （如 completed_lines、target_line_id 等）；当前实现中忽略。
 
     Returns:
         Tuple[List[Tuple[float, float]], float]: (几何路径, 长度)
@@ -4302,6 +4305,7 @@ def export_grouped_mission_to_json(
 
     # 根据 visit_order 为每个点分配访问顺序
     visit_order_counter = 0
+    from core.topo_task import _edge_task_topo_index
 
     for edge_id_with_dir in mission.visit_order:
         # 去除方向标记（+/-）
@@ -4316,6 +4320,16 @@ def export_grouped_mission_to_json(
             direction = direction_map.get(edge_id_with_dir, 'forward')
 
         points = edge_to_inspection_points.get(edge_id, [])
+        # 线路级规划：visit_order 为 line_id，需聚合该 line 下各 EdgeTask 的巡检点
+        if not points:
+            line_edge_tasks = sorted(
+                [et for et in edge_tasks if getattr(et, "line_id", "") == edge_id],
+                key=_edge_task_topo_index,
+            )
+            for et in line_edge_tasks:
+                pts = edge_to_inspection_points.get(et.edge_id, [])
+                if pts:
+                    points.extend(pts)
 
         # 如果 direction_map 中有相反的方向，则反转
         if direction == 'reverse':
@@ -4337,6 +4351,7 @@ def export_grouped_mission_to_json(
                 detection_result = point.detection_result
                 status = point.status
                 source_reason = point.source_reason
+                point_edge_id = getattr(point, "edge_id", None) or edge_id
             elif isinstance(point, dict):
                 # 字典格式
                 point_type = point.get('type', point.get('point_type', 'unknown'))
@@ -4348,6 +4363,7 @@ def export_grouped_mission_to_json(
                 detection_result = point.get('detection_result')
                 status = point.get('status', 'uninspected')
                 source_reason = point.get('source_reason', '')
+                point_edge_id = point.get("edge_id") or edge_id
             else:
                 # 未知格式，跳过
                 continue
@@ -4364,12 +4380,16 @@ def export_grouped_mission_to_json(
                     z = terrain_3d[h_idx, w_idx, 2]
                     pos_3d = [round(x, 2), round(y, 2), round(z, 2)]
 
-            # 获取 group_id
-            group_id = mission.edge_to_group.get(edge_id) if hasattr(mission, 'edge_to_group') else None
+            # 获取 group_id（优先按拓扑边，其次线路级 token）
+            group_id = None
+            if hasattr(mission, 'edge_to_group') and mission.edge_to_group:
+                group_id = mission.edge_to_group.get(str(point_edge_id))
+                if group_id is None:
+                    group_id = mission.edge_to_group.get(edge_id)
 
             point_data = {
                 "point_id": f"IP_{point_id_counter:05d}",
-                "edge_id": edge_id,
+                "edge_id": str(point_edge_id),
                 "group_id": group_id,
                 "line_id": line_id,
                 "point_type": point_type,
