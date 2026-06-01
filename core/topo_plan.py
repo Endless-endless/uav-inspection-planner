@@ -1461,20 +1461,29 @@ def get_edge_inspection_geometry_with_direction(
     projected: List[float] = []
     target_debug: List[str] = []
     for p in points:
+        s_pre = None
+        if isinstance(p, dict) and p.get("distance_along_edge") is not None:
+            try:
+                s_pre = float(p["distance_along_edge"])
+            except (TypeError, ValueError):
+                s_pre = None
         pos = _point_xy_from_inspection_point(p)
-        if pos is None:
-            continue
-        s = _project_point_to_polyline_distance(pos, polyline)
+        s = None
+        if pos is not None:
+            s = _project_point_to_polyline_distance(pos, polyline)
+        if s is None and s_pre is not None:
+            s = s_pre
         if s is not None:
-            projected.append(s)
+            projected.append(float(s))
             if isinstance(p, dict):
                 pid = p.get("id") or p.get("point_id") or "unknown"
                 ptype = p.get("point_type", "unknown")
             else:
                 pid = getattr(p, "id", None) or getattr(p, "point_id", None) or "unknown"
                 ptype = getattr(p, "point_type", "unknown")
+            coord = pos if pos is not None else (0.0, 0.0)
             target_debug.append(
-                f"id={pid}/type={ptype}/coord=({pos[0]:.1f},{pos[1]:.1f})/s={s:.2f}"
+                f"id={pid}/type={ptype}/coord=({coord[0]:.1f},{coord[1]:.1f})/s={s:.2f}"
             )
 
     if not projected:
@@ -1485,8 +1494,14 @@ def get_edge_inspection_geometry_with_direction(
             )
         return []
 
+    total = _polyline_length(polyline)
     s_min = min(projected)
     s_max = max(projected)
+    if len(projected) == 1:
+        pad = min(35.0, max(8.0, total * 0.04))
+        s_min = max(0.0, s_min - pad)
+        s_max = min(total, s_max + pad)
+
     geom = _slice_polyline_by_distance(polyline, s_min, s_max)
     if direction == "reverse":
         geom = list(reversed(geom))
@@ -4320,8 +4335,8 @@ def export_grouped_mission_to_json(
             direction = direction_map.get(edge_id_with_dir, 'forward')
 
         points = edge_to_inspection_points.get(edge_id, [])
-        # 线路级规划：visit_order 为 line_id，需聚合该 line 下各 EdgeTask 的巡检点
-        if not points:
+        # 旧版线路级 visit_order（line_id）：无直接边键时聚合该 line 下各 EdgeTask；合并链 *_chain_* 不走此分支
+        if not points and "_chain_" not in edge_id:
             line_edge_tasks = sorted(
                 [et for et in edge_tasks if getattr(et, "line_id", "") == edge_id],
                 key=_edge_task_topo_index,

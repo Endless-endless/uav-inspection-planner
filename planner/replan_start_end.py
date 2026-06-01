@@ -865,7 +865,7 @@ def _compute_replan_edge_visit_order(
     baseline_order = [e for e in baseline_order if e in tasks]
 
     if not topo_graph or not edge_task_map:
-        return baseline_order, "baseline_rotated_fallback"
+        return baseline_order, "baseline"
 
     edge_tasks_list = list(edge_task_map.values())
     start_edge_id = _pick_start_edge_id_for_replan(tasks, start, weather_context)
@@ -881,7 +881,7 @@ def _compute_replan_edge_visit_order(
             eps=150.0,
         )
         tokens = list(getattr(gmission, "visit_order", None) or [])
-        expanded = _expand_line_visit_tokens_to_edge_ids(tokens, edge_tasks_list)
+        expanded = [_strip_visit_direction_suffix(str(t)) for t in tokens]
         expanded = [e for e in expanded if e in tasks]
         seen_exp = set(expanded)
         for e in baseline_order:
@@ -907,8 +907,8 @@ def _compute_replan_edge_visit_order(
             greedy.append(e)
             seen_g.add(e)
     if greedy:
-        return greedy, "baseline_rotated_fallback"
-    return baseline_order, "baseline_rotated_fallback"
+        return greedy, "fallback"
+    return baseline_order, "baseline"
 
 
 def _collect_baseline_inspection_points(
@@ -1260,6 +1260,31 @@ def _log_replan_point_projections(
     print("[replan-projection] === end\n")
 
 
+def _remap_inspect_tasks_for_merged_chains(
+    tasks: Dict[str, Dict[str, Any]],
+    edge_task_map: Dict[str, EdgeTask],
+) -> Dict[str, Dict[str, Any]]:
+    """将 baseline 中碎片 topo edge_id 的 inspect 任务映射到合并链 EdgeTask。"""
+    from core.image_pixel_coords import edge_pixel_polyline
+    from core.topo_task import legacy_topo_edge_id_to_chain_map
+
+    if not tasks or not edge_task_map:
+        return tasks
+    tmap = legacy_topo_edge_id_to_chain_map(edge_task_map)
+    out: Dict[str, Dict[str, Any]] = {}
+    for old_eid, _row in tasks.items():
+        nid = tmap.get(str(old_eid), str(old_eid))
+        et = edge_task_map.get(nid) or edge_task_map.get(str(old_eid))
+        if et is None:
+            continue
+        poly = [(float(p[0]), float(p[1])) for p in edge_pixel_polyline(et)]
+        if len(poly) < 2:
+            continue
+        ln = round(_path_length(poly), 2)
+        out[str(nid)] = {"edge_id": str(nid), "polyline": poly, "length": ln}
+    return out if out else tasks
+
+
 def build_start_end_replan_mission(
     base_mission: Dict[str, Any],
     start_xy: List[float],
@@ -1297,6 +1322,9 @@ def build_start_end_replan_mission(
     )
 
     tasks = _extract_inspect_tasks(base_mission, edge_task_map=edge_task_map or {})
+    if edge_task_map:
+        tasks = _remap_inspect_tasks_for_merged_chains(tasks, edge_task_map)
+
     if not tasks:
         raise ReplanValidationError("No inspect segments in baseline mission")
 

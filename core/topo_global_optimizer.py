@@ -23,11 +23,13 @@ import random
 from collections import defaultdict
 
 from core.topo import TopoGraph, TopoNode
-from core.topo_task import EdgeTask, LineTask, build_line_tasks_from_edge_tasks, project_point_to_polyline
+from core.topo_task import EdgeTask, LineTask, project_point_to_polyline
 from core.image_pixel_coords import edge_pixel_polyline
 from core.topo_plan import (
     EdgeGroup, GroupedContinuousMission, MissionSegment,
     build_edge_adjacency_simple, compute_transition_cost_simple,
+    compute_edge_centroids,
+    group_edges_spatially,
     get_edge_geometry_with_direction, interpolate_geometry,
     get_edge_inspection_geometry_with_direction,
     generate_connection_segment_along_topo,
@@ -450,21 +452,26 @@ def compute_topo_path_length(topo_graph: TopoGraph, path: List[str],
 
         # 找到连接 u 和 v 的边
         found = False
-        for edge in edge_task_map.values():
-            if (edge.u == u and edge.v == v) or (edge.u == v and edge.v == u):
-                total_length += edge.len2d
-                found = True
-                break
+        te = _find_topo_edge_by_uv(topo_graph, u, v)
+        if te is not None:
+            total_length += float(te.len2d)
+            found = True
+
+        if not found:
+            for edge in edge_task_map.values():
+                if (edge.u == u and edge.v == v) or (edge.u == v and edge.v == u):
+                    total_length += float(edge.len2d)
+                    found = True
+                    break
 
         if not found:
             # 没有直接边，使用节点间直线距离
             u_node = topo_graph.get_node(u)
             v_node = topo_graph.get_node(v)
             if u_node and v_node:
-                total_length += np.linalg.norm(
-                    np.array([v_node.x, v_node.y]) -
-                    np.array([u_node.x, u_node.y])
-                )
+                pu = np.array(u_node.pos2d, dtype=np.float64)
+                pv = np.array(v_node.pos2d, dtype=np.float64)
+                total_length += float(np.linalg.norm(pv - pu))
 
     return total_length
 
@@ -1363,6 +1370,13 @@ def build_optimized_mission_from_line_tasks(
 # 构建优化后的任务
 # =====================================================
 
+def _strip_visit_order_token(tok: Any) -> str:
+    s = str(tok or "").strip()
+    if len(s) >= 2 and s[-1] in "+-":
+        return s[:-1]
+    return s
+
+
 def build_optimized_mission(
     edge_order: List[str],
     edge_directions: Dict[str, str],
@@ -1433,7 +1447,8 @@ def build_optimized_mission(
                 to_edge_id=edge_id,
                 geometry=geo,
                 length=float(np.sum(np.linalg.norm(np.diff(np.array(geo), axis=0), axis=1))),
-                edge_id=edge_id
+                edge_id=edge_id,
+                direction=direction,
             ))
             mission.visit_order.append(edge_id)
             print(
@@ -1586,7 +1601,8 @@ def build_optimized_mission(
             to_edge_id=edge_id,
             geometry=geo,
             length=float(np.sum(np.linalg.norm(np.diff(np.array(geo), axis=0), axis=1))),
-            edge_id=edge_id
+            edge_id=edge_id,
+            direction=direction,
         ))
         mission.visit_order.append(edge_id)
         print(
@@ -1682,7 +1698,94 @@ def build_optimized_mission(
           f"内组连接={mission.intra_group_connect_length:.1f}px, "
           f"跨组连接={mission.inter_group_connect_length:.1f}px")
 
+    insp_segs = [s for s in mission.segments if s.type == "inspect"]
+    conn_segs = [s for s in mission.segments if s.type == "connect"]
+    insp_eids = [s.edge_id for s in insp_segs if getattr(s, "edge_id", None)]
+    dup_insp = len(insp_eids) - len(set(insp_eids))
+    vo = list(getattr(mission, "visit_order", None) or [])
+    stale = sum(1 for x in vo if _strip_visit_order_token(x) not in edge_task_map)
+    print(
+        f"[mission-debug] inspect_segments_count={len(insp_segs)} "
+        f"connect_segments_count={len(conn_segs)} "
+        f"duplicate_inspect_edge_count={dup_insp} stale_edge_id_count={stale}"
+    )
+
     return mission
+
+
+def _merged_chain_node_set(task: EdgeTask, topo_graph: TopoGraph) -> Set[str]:
+    """合并链任务在拓扑图上的所有端点节点（用于链与链之间的邻接）。"""
+    ids = (getattr(task, "meta", None) or {}).get("chain_topo_edge_ids") or []
+    nodes: Set[str] = set()
+    for eid in ids:
+        e = topo_graph.edges.get(eid)
+        if e:
+            nodes.add(e.u)
+            nodes.add(e.v)
+    if not nodes and getattr(task, "u", None) and getattr(task, "v", None):
+        nodes.update([str(task.u), str(task.v)])
+    return nodes
+
+
+def build_merged_edge_task_adjacency(
+    edge_tasks: List[EdgeTask],
+    topo_graph: TopoGraph,
+) -> Dict[str, List[str]]:
+    """合并链 EdgeTask 邻接：两链在拓扑上共享至少一个节点则相邻。"""
+    tasks = [t for t in edge_tasks]
+    ids = [t.edge_id for t in tasks]
+    node_sets = {t.edge_id: _merged_chain_node_set(t, topo_graph) for t in tasks}
+    adj: Dict[str, List[str]] = {i: [] for i in ids}
+    for i, a in enumerate(tasks):
+        sa = node_sets[a.edge_id]
+        for b in tasks[i + 1 :]:
+            if sa & node_sets[b.edge_id]:
+                adj[a.edge_id].append(b.edge_id)
+                adj[b.edge_id].append(a.edge_id)
+    return adj
+
+
+def _greedy_merged_edge_visit_order(
+    required_edge_tasks: List[EdgeTask],
+    edge_task_map: Dict[str, EdgeTask],
+    adjacency: Dict[str, List[str]],
+    start_edge_id: str,
+) -> Tuple[List[str], Dict[str, str]]:
+    """无 SA 时：从起点链出发，按 inspect 出口到下一链入口的欧氏距离贪心。"""
+    ids = [e.edge_id for e in required_edge_tasks]
+    line_order = [start_edge_id]
+    edge_directions: Dict[str, str] = {eid: "forward" for eid in ids}
+    unvisited = set(ids) - {start_edge_id}
+    while unvisited:
+        cur_id = line_order[-1]
+        cur_t = edge_task_map[cur_id]
+        cur_geo = get_edge_inspection_geometry_with_direction(
+            cur_t, edge_directions[cur_id], debug=False
+        )
+        if len(cur_geo) < 2:
+            break
+        cur_end = np.array(cur_geo[-1], dtype=np.float64)
+        best_n: Optional[str] = None
+        best_d = float("inf")
+        best_dir = "forward"
+        for nid in unvisited:
+            ot = edge_task_map[nid]
+            for d in ("forward", "reverse"):
+                g = get_edge_inspection_geometry_with_direction(ot, d, debug=False)
+                if len(g) < 2:
+                    continue
+                dist = float(np.linalg.norm(np.array(g[0], dtype=np.float64) - cur_end))
+                if dist < best_d:
+                    best_d, best_n, best_dir = dist, nid, d
+        if best_n is None:
+            break
+        line_order.append(best_n)
+        edge_directions[best_n] = best_dir
+        unvisited.remove(best_n)
+    for eid in ids:
+        if eid not in line_order:
+            line_order.append(eid)
+    return line_order, edge_directions
 
 
 # =====================================================
@@ -1726,109 +1829,54 @@ def plan_global_topology_optimized_mission(
         return GroupedContinuousMission()
 
     edge_task_map = {task.edge_id: task for task in required_edge_tasks}
-    adjacency = build_edge_adjacency_simple(topo_graph)
+    adjacency = build_merged_edge_task_adjacency(required_edge_tasks, topo_graph)
 
-    print("\n[Step 1] 物理线路任务 LineTask（由 EdgeTask 聚合）...")
-    line_tasks_all = build_line_tasks_from_edge_tasks(edge_tasks_input)
-    required_lines = [lt for lt in line_tasks_all if lt.num_points > 0]
-    if not required_lines:
-        print("[WARN] 无有效 LineTask（各 line 均无投影成功的巡检点）")
-        return GroupedContinuousMission()
+    print("\n[Step 1] 合并链 EdgeTask 空间分组...")
+    centroids = compute_edge_centroids(required_edge_tasks)
+    groups = group_edges_spatially(required_edge_tasks, centroids, eps=eps)
 
-    line_task_map = {lt.line_id: lt for lt in required_lines}
-
-    print("\n[Step 2] 线路空间分组（每线路一组）...")
-    groups: Dict[str, EdgeGroup] = {}
-    for i, lt in enumerate(required_lines):
-        poly = np.array(lt.polyline, dtype=np.float64)
-        centroid = tuple(np.mean(poly, axis=0))
-        groups[f"Group_{i}"] = EdgeGroup(
-            group_id=f"Group_{i}",
-            edge_ids=[lt.line_id],
-            centroid=centroid,
-            bbox=(
-                float(np.min(poly[:, 0])),
-                float(np.min(poly[:, 1])),
-                float(np.max(poly[:, 0])),
-                float(np.max(poly[:, 1])),
-            ),
-            total_inspect_length=float(lt.len2d),
-        )
-
-    line_totals = {lt.line_id: lt.num_points for lt in required_lines}
-    _print_route_line_bootstrap(required_edge_tasks, line_totals)
-
-    start_line_id: Optional[str] = None
-    if start_edge_id:
-        st = edge_task_map.get(start_edge_id)
-        if st and (getattr(st, "line_id", "") or ""):
-            start_line_id = st.line_id
+    if start_edge_id and start_edge_id not in edge_task_map:
+        print(f"[WARN] start_edge_id={start_edge_id!r} 不在当前 EdgeTask 中，忽略")
+        start_edge_id = None
 
     if enable_sa:
-        print("\n[Step 3] 全局顺序优化（线路级模拟退火）...")
-        line_order, line_directions, _cost = optimize_line_order_simulated_annealing(
-            required_lines,
+        print("\n[Step 2] 全局顺序优化（合并链边级模拟退火）...")
+        edge_order, edge_directions, _cost = optimize_edge_order_simulated_annealing(
+            required_edge_tasks,
             topo_graph,
-            line_task_map,
             edge_task_map,
             groups,
             adjacency,
-            start_line_id=start_line_id,
+            start_edge_id=start_edge_id,
             initial_temp=1000.0,
             cooling_rate=0.95,
-            iterations_per_temp=50,
+            iterations_per_temp=100,
             min_temp=1.0,
         )
     else:
-        print("\n[Step 3] 线路级贪心（最近邻）...")
-        if start_line_id is None or start_line_id not in line_task_map:
-            lc = generate_start_line_candidates(
-                required_lines, topo_graph, groups, edge_task_map, adjacency
+        print("\n[Step 2] 合并链边级贪心（最近邻）...")
+        if start_edge_id is None:
+            cand = generate_start_edge_candidates(
+                required_edge_tasks, topo_graph, groups, edge_task_map, adjacency
             )
-            start_line_id = lc[0][0]
-        line_order = [start_line_id]
-        line_directions: Dict[str, str] = {
-            lt.line_id: "forward" for lt in required_lines
-        }
-        unvisited = set(line_task_map.keys()) - {start_line_id}
-        while unvisited:
-            cur_lid = line_order[-1]
-            cur_lt = line_task_map[cur_lid]
-            cur_geo = line_inspect_geometry(cur_lt, line_directions[cur_lid])
-            if len(cur_geo) < 2:
-                break
-            cur_end = np.array(cur_geo[-1], dtype=np.float64)
-            best_l: Optional[str] = None
-            best_dist = float("inf")
-            best_dir = "forward"
-            for lid in unvisited:
-                olt = line_task_map[lid]
-                for d in ("forward", "reverse"):
-                    g = line_inspect_geometry(olt, d)
-                    if len(g) < 2:
-                        continue
-                    dist = float(np.linalg.norm(np.array(g[0], dtype=np.float64) - cur_end))
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_l = lid
-                        best_dir = d
-            if best_l is None:
-                break
-            line_order.append(best_l)
-            line_directions[best_l] = best_dir
-            unvisited.remove(best_l)
+            start_edge_id = cand[0][0] if cand else required_edge_tasks[0].edge_id
+        edge_order, edge_directions = _greedy_merged_edge_visit_order(
+            required_edge_tasks, edge_task_map, adjacency, start_edge_id
+        )
 
-    print("\n[Step 4] 构建线路级连续任务...")
-    mission = build_optimized_mission_from_line_tasks(
-        line_order,
-        line_directions,
-        required_lines,
-        line_task_map,
+    print(f"[mission-order] visit_order={edge_order!r}")
+
+    print("\n[Step 3] 构建连续任务（inspect 沿链折线截取）...")
+    mission = build_optimized_mission(
+        edge_order,
+        edge_directions,
         required_edge_tasks,
         topo_graph,
         edge_task_map,
         groups,
         adjacency,
+        connect_planner="dijkstra",
+        cost_config=None,
     )
 
     print("\n" + "="*70)

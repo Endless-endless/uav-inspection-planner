@@ -3361,7 +3361,11 @@ class PowerlinePlannerV3:
 
         centroids = compute_edge_centroids(self.edge_tasks)
         groups_old = group_edges_spatially(self.edge_tasks, centroids, eps=eps)
-        adjacency_old = build_edge_adjacency_simple(self.topo_graph)
+        from core.topo_global_optimizer import build_merged_edge_task_adjacency
+
+        adjacency_merged = build_merged_edge_task_adjacency(
+            self.edge_tasks, self.topo_graph
+        )
 
         try:
             from sklearn.cluster import DBSCAN
@@ -3373,7 +3377,7 @@ class PowerlinePlannerV3:
             group_visit_order_old = order_groups_greedy(groups_old, {e.edge_id: e for e in self.edge_tasks})
             mission_old = build_grouped_continuous_mission(
                 self.topo_graph, self.edge_tasks, groups_old,
-                group_visit_order_old, adjacency_old
+                group_visit_order_old, adjacency_merged
             )
         else:
             print("  [SKIP] scikit-learn未安装，跳过旧算法")
