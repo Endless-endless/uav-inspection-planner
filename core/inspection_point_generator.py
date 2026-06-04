@@ -548,7 +548,9 @@ def build_image_detected_inspection_points(
         if not raw or len(raw) < 2:
             continue
         raw_xy = (float(raw[0]), float(raw[1]))
-        snap = snap_point_to_topo_graph(raw_xy, topo_graph, max_distance=max_snap_distance)
+        snap_strict = snap_point_to_topo_graph(raw_xy, topo_graph, max_distance=max_snap_distance)
+        snap_any = snap_point_to_topo_graph(raw_xy, topo_graph, max_distance=None)
+        snap = snap_strict or snap_any
         entry = {
             "id": det.get("id"),
             "raw_coord": [round(raw_xy[0], 2), round(raw_xy[1], 2)],
@@ -556,42 +558,49 @@ def build_image_detected_inspection_points(
             "confidence": det.get("confidence"),
             "source": det.get("source"),
         }
-        if snap:
-            snapped = snap["snapped_coord"]
-            pos_3d = _map_to_3d(snapped, terrain, flight_height)
-            point = LineInspectionPoint(
-                id=str(det.get("id") or f"IP_{len(all_points) + 1:04d}"),
-                line_id=str(snap["line_id"]),
-                point_type="image_detected",
-                pixel_position=(float(snapped[0]), float(snapped[1])),
-                position_3d=pos_3d,
-                line_index=int(snap.get("segment_index", 0)),
-                priority="high",
-                status="uninspected",
-                source_reason="image_black_dot",
-                detection_result={
-                    "raw_coord": [round(raw_xy[0], 2), round(raw_xy[1], 2)],
-                    "edge_id": snap["edge_id"],
-                    "distance_along_edge": round(float(snap["distance_along_edge"]), 2),
-                    "snap_distance": round(float(snap["distance"]), 2),
-                    "snapped_coord": [round(float(snapped[0]), 2), round(float(snapped[1]), 2)],
-                    "confidence": det.get("confidence"),
-                    "source": det.get("source"),
-                },
-            )
-            points_by_line.setdefault(point.line_id, []).append(point)
-            all_points.append(point)
-            entry.update(
-                {
-                    "edge_id": snap["edge_id"],
-                    "snapped_coord": [round(float(snapped[0]), 2), round(float(snapped[1]), 2)],
-                    "distance_along_edge": round(float(snap["distance_along_edge"]), 2),
-                    "snap_distance": round(float(snap["distance"]), 2),
-                }
-            )
-        else:
+        if snap is None:
             invalid_count += 1
             entry["snap_distance"] = None
+            overlay.append(entry)
+            continue
+
+        snap_fallback = snap_strict is None
+        dist_px = float(snap["distance"])
+        snapped = snap["snapped_coord"]
+        pos_3d = _map_to_3d(raw_xy, terrain, flight_height)
+        point = LineInspectionPoint(
+            id=str(det.get("id") or f"IP_{len(all_points) + 1:04d}"),
+            line_id=str(snap["line_id"]),
+            point_type="image_detected",
+            pixel_position=(float(raw_xy[0]), float(raw_xy[1])),
+            position_3d=pos_3d,
+            line_index=int(snap.get("segment_index", 0)),
+            priority="high",
+            status="uninspected",
+            source_reason="image_snap_fallback" if snap_fallback else "image_black_dot",
+            detection_result={
+                "raw_coord": [round(raw_xy[0], 2), round(raw_xy[1], 2)],
+                "edge_id": snap["edge_id"],
+                "distance_along_edge": round(float(snap["distance_along_edge"]), 2),
+                "snap_distance": round(dist_px, 2),
+                "snap_distance_px": round(dist_px, 2),
+                "snapped_coord": [round(float(snapped[0]), 2), round(float(snapped[1]), 2)],
+                "confidence": det.get("confidence"),
+                "source": det.get("source"),
+                "snap_fallback": snap_fallback,
+            },
+        )
+        points_by_line.setdefault(point.line_id, []).append(point)
+        all_points.append(point)
+        entry.update(
+            {
+                "edge_id": snap["edge_id"],
+                "snapped_coord": [round(float(snapped[0]), 2), round(float(snapped[1]), 2)],
+                "distance_along_edge": round(float(snap["distance_along_edge"]), 2),
+                "snap_distance": round(dist_px, 2),
+                "snap_fallback": snap_fallback,
+            }
+        )
         overlay.append(entry)
 
     for line_id in points_by_line:
@@ -604,9 +613,10 @@ def build_image_detected_inspection_points(
     print(f"  - valid snapped points: {len(all_points)}")
     print(f"  - invalid points: {invalid_count}")
     print(
-        f"[图像巡检点] 检测 {len(detections)} 个，有效吸附 {len(all_points)} 个，"
-        f"无效 {invalid_count} 个 (snap<={max_snap_distance}px)"
+        f"[图像巡检点] 检测 {len(detections)} 个，全部进入线路点表 {len(all_points)} 个，"
+        f"拓扑不可达 {invalid_count} 个 (strict_snap<={max_snap_distance}px 否则 nearest-fallback)"
     )
+    print(f"[point-flow] cv_after_merge={len(detections or [])} line_inspection_points={len(all_points)}")
     return all_points, points_by_line, overlay
 
 

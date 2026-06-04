@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -23,6 +24,7 @@ REAL_MAP_CANONICAL_IMAGE = "data/chengdu_real_point.png"
 REAL_MAP_MARKERS = ("chengdu_real_point", "chengdu_real_line")
 
 DEBUG_DIR = Path("result/debug")
+GREEN_POINTS_AUDIT_IMAGE = Path("result/debug_green_points.png")
 
 # OpenCV HSV: H 0–180, S/V 0–255
 RED_HSV_LOWER1 = (0, 120, 120)
@@ -38,7 +40,7 @@ GREEN_MIN_AREA = 80
 GREEN_MAX_AREA = 900
 GREEN_MIN_CIRCULARITY = 0.6
 GREEN_MERGE_DISTANCE = 25.0
-GREEN_MAX_DIST_TO_RED_PX = 20.0
+GREEN_MAX_DIST_TO_RED_PX = 60.0
 REAL_MAP_MIN_POLYLINE_LENGTH_PX = 80.0
 
 
@@ -122,11 +124,11 @@ def morph_close_dilate_red_mask(mask: np.ndarray) -> np.ndarray:
     return _filter_small_components_cv2(m, RED_MIN_COMPONENT_AREA)
 
 
-def extract_real_map_green_mask(
+def _compute_green_mask_before_component_filter(
     rgb: np.ndarray,
     red_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """绿色实心圆 mask（排除红线像素）。"""
+    """HSV 绿范围 + 形态学 + 去红线重叠；尚未按面积过滤连通域。"""
     if rgb.dtype != np.uint8:
         rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8)
     else:
@@ -159,7 +161,17 @@ def extract_real_map_green_mask(
         mask = mask.copy()
         mask[np.asarray(red_mask) > 0] = 0
 
-    return _filter_green_components(mask)
+    return mask
+
+
+def extract_real_map_green_mask(
+    rgb: np.ndarray,
+    red_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """绿色实心圆 mask（排除红线像素）。"""
+    return _filter_green_components(
+        _compute_green_mask_before_component_filter(rgb, red_mask=red_mask)
+    )
 
 
 def _filter_green_components(mask: np.ndarray) -> np.ndarray:
@@ -172,6 +184,71 @@ def _filter_green_components(mask: np.ndarray) -> np.ndarray:
         if GREEN_MIN_AREA <= area <= GREEN_MAX_AREA:
             out[labels == i] = 255
     return out
+
+
+def _opencv_cc_on_binary_mask(mask_u8: np.ndarray) -> Tuple[int, List[Dict[str, Any]]]:
+    """返回 (foreground 连通域个数, 每个域的元数据列表)。"""
+    if cv2 is None:
+        return 0, []
+    n, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (mask_u8 > 0).astype(np.uint8), connectivity=8
+    )
+    rows: List[Dict[str, Any]] = []
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        left = int(stats[i, cv2.CC_STAT_LEFT])
+        top = int(stats[i, cv2.CC_STAT_TOP])
+        bw = int(stats[i, cv2.CC_STAT_WIDTH])
+        bh = int(stats[i, cv2.CC_STAT_HEIGHT])
+        cx, cy = float(centroids[i][0]), float(centroids[i][1])
+        rows.append(
+            {
+                "id": i,
+                "center_x": cx,
+                "center_y": cy,
+                "area": area,
+                "bbox": (left, top, bw, bh),
+                "radius": 0.25 * (bh + bw),
+            }
+        )
+    return int(max(0, n - 1)), rows
+
+
+def _skimage_raw_cc_count(mask_u8: np.ndarray) -> int:
+    if label is None:
+        return 0
+    lbl = label(mask_u8 > 0)
+    return int(lbl.max())
+
+
+def _save_debug_green_points_image(
+    rgb: np.ndarray,
+    candidates: List[Dict[str, Any]],
+    merged: List[Dict[str, Any]],
+    out_path: Path,
+) -> str:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img = Image.fromarray(rgb).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    r_red = 9
+    for c in candidates:
+        x, y = float(c["coord"][0]), float(c["coord"][1])
+        draw.ellipse(
+            (x - r_red, y - r_red, x + r_red, y + r_red),
+            outline=(255, 40, 40),
+            width=2,
+        )
+    r_gr = 11
+    for i, c in enumerate(merged, start=1):
+        x, y = float(c["coord"][0]), float(c["coord"][1])
+        draw.ellipse(
+            (x - r_gr, y - r_gr, x + r_gr, y + r_gr),
+            outline=(0, 220, 60),
+            width=3,
+        )
+        draw.text((x + 14, y - 10), str(i), fill=(0, 255, 80))
+    img.save(out_path)
+    return str(out_path.resolve())
 
 
 def _red_distance_field(red_mask: np.ndarray) -> Optional[np.ndarray]:
@@ -211,29 +288,122 @@ def detect_green_inspection_points(
     """绿色实心圆 → 巡检点（原图像素坐标，须靠近红线）。"""
     if red_mask is None:
         red_mask = extract_real_map_red_mask(rgb)
-    green_mask = extract_real_map_green_mask(rgb, red_mask=red_mask)
     dist_field = _red_distance_field(red_mask)
-    candidates: List[Dict[str, Any]] = []
+
+    raw_mask = _compute_green_mask_before_component_filter(rgb, red_mask=red_mask)
+
+    # Step 1: HSV + 形态学 + 去红线后，面积过滤前的连通域数量
+    if cv2 is not None:
+        raw_connected_components, _ = _opencv_cc_on_binary_mask(raw_mask)
+        n0, _lbl0, stats0, cents0 = cv2.connectedComponentsWithStats(
+            (raw_mask > 0).astype(np.uint8), connectivity=8
+        )
+        for i in range(1, n0):
+            a = int(stats0[i, cv2.CC_STAT_AREA])
+            if GREEN_MIN_AREA <= a <= GREEN_MAX_AREA:
+                continue
+            cx, cy = float(cents0[i][0]), float(cents0[i][1])
+            why = f"area={a} not in [{GREEN_MIN_AREA},{GREEN_MAX_AREA}]"
+            print(f"[green-audit] step1->2 DROP (area filter) CC_id={i} center=({cx:.2f},{cy:.2f}) {why}")
+    else:
+        raw_connected_components = _skimage_raw_cc_count(raw_mask)
+    print(f"[green-audit] step1 raw_connected_components = {raw_connected_components}")
+
+    green_mask = _filter_green_components(np.asarray(raw_mask, dtype=np.uint8, copy=True))
+
+    # Step 2: 面积过滤后连通域及列表
+    kept_rows: List[Dict[str, Any]] = []
+    if cv2 is not None:
+        after_area_filter, kept_rows = _opencv_cc_on_binary_mask(green_mask)
+    elif label is not None:
+        lbl2 = label(green_mask > 0)
+        for rp in regionprops(lbl2):
+            cy, cx = rp.centroid
+            minr, minc, maxr, maxc = rp.bbox
+            bh = maxr - minr
+            bw = maxc - minc
+            kept_rows.append(
+                {
+                    "id": int(rp.label),
+                    "center_x": float(cx),
+                    "center_y": float(cy),
+                    "area": int(rp.area),
+                    "bbox": (int(minc), int(minr), int(bw), int(bh)),
+                    "radius": 0.25 * (bh + bw),
+                }
+            )
+        after_area_filter = len(kept_rows)
+    else:
+        after_area_filter = 0
+
+    print(f"[green-audit] step2 after_area_filter = {after_area_filter}")
+    for row in kept_rows:
+        print(
+            f"[green-audit] step2 kept id={row['id']} center_x={row['center_x']:.2f} "
+            f"center_y={row['center_y']:.2f} area={row['area']} bbox={row['bbox']} radius={row['radius']:.2f}"
+        )
 
     if label is None or regionprops is None:
-        return [], {"contour_candidates": 0, "green_point_count": 0}, green_mask
+        stats_empty: Dict[str, Any] = {
+            "contour_candidates": 0,
+            "green_point_count": 0,
+            "merged_points": 0,
+            "hough_candidates": 0,
+            "green_mask_pixels": int(np.sum(green_mask > 0)),
+            "detector": "green_hsv",
+            "raw_connected_components": raw_connected_components,
+            "after_area_filter": after_area_filter,
+            "region_count_skimage": 0,
+            "candidate_count": 0,
+            "before_merge": 0,
+            "after_merge": 0,
+            "debug_green_points_png": str(GREEN_POINTS_AUDIT_IMAGE.resolve()),
+        }
+        try:
+            out_png = _save_debug_green_points_image(rgb, [], [], GREEN_POINTS_AUDIT_IMAGE)
+            print(f"[green-audit] step9 saved {out_png}")
+        except Exception as exc:  # pragma: no cover
+            print(f"[green-audit] step9 debug image failed: {exc}")
+        return [], stats_empty, green_mask
 
-    for region in regionprops(label(green_mask > 0)):
+    labeled = label(green_mask > 0)
+    regions = list(regionprops(labeled))
+    region_count = len(regions)
+    print(f"[green-audit] step3 region_count = {region_count}")
+
+    candidates: List[Dict[str, Any]] = []
+    for ri, region in enumerate(regions):
         area = float(region.area)
-        if area < GREEN_MIN_AREA or area > GREEN_MAX_AREA:
-            continue
         min_row, min_col, max_row, max_col = region.bbox
         box_h = max_row - min_row
         box_w = max_col - min_col
-        if box_h < 4 or box_w < 4:
-            continue
         perimeter = float(region.perimeter or 0.0)
         circularity = 4.0 * np.pi * area / (perimeter ** 2 + 1e-6)
-        if circularity < GREEN_MIN_CIRCULARITY:
-            continue
         cy, cx = region.centroid
-        if _distance_to_red(float(cx), float(cy), dist_field) > GREEN_MAX_DIST_TO_RED_PX:
+        dist_r = _distance_to_red(float(cx), float(cy), dist_field)
+
+        drop_reason: Optional[str] = None
+        if area < GREEN_MIN_AREA or area > GREEN_MAX_AREA:
+            drop_reason = "area outside [GREEN_MIN_AREA, GREEN_MAX_AREA]"
+        elif box_h < 4 or box_w < 4:
+            drop_reason = "bbox min side < 4"
+        elif circularity < GREEN_MIN_CIRCULARITY:
+            drop_reason = "circularity < GREEN_MIN_CIRCULARITY"
+        elif dist_r > GREEN_MAX_DIST_TO_RED_PX:
+            drop_reason = "dist_to_red > GREEN_MAX_DIST_TO_RED_PX"
+
+        if drop_reason:
+            print(
+                f"[green-audit] step4 region[{ri}] DROP center=({cx:.2f},{cy:.2f}) area={area:.1f} "
+                f"bbox=({min_row},{min_col},{max_row},{max_col}) circularity={circularity:.4f} "
+                f"dist_to_red={dist_r:.2f} reason={drop_reason}"
+            )
             continue
+
+        print(
+            f"[green-audit] step4 region[{ri}] KEEP center=({cx:.2f},{cy:.2f}) area={area:.1f} "
+            f"bbox=({min_row},{min_col},{max_row},{max_col}) circularity={circularity:.4f} dist_to_red={dist_r:.2f}"
+        )
         radius = 0.25 * (box_h + box_w)
         candidates.append(
             {
@@ -246,7 +416,31 @@ def detect_green_inspection_points(
             }
         )
 
-    merged = _merge_point_candidates(candidates, merge_distance)
+    candidate_count = len(candidates)
+    before_merge = candidate_count
+    print(f"[green-audit] step5 candidate_count = {candidate_count}")
+    print(f"[green-audit] step6 before_merge = {before_merge}")
+
+    merge_audit_lines: List[str] = []
+    merged = _merge_point_candidates(
+        candidates, merge_distance, merge_audit_lines=merge_audit_lines
+    )
+    for line in merge_audit_lines:
+        print(f"[green-audit] step7 {line}")
+
+    after_merge = len(merged)
+    print(f"[green-audit] step8 after_merge = {after_merge}")
+    for idx, item in enumerate(merged, start=1):
+        print(
+            f"[green-audit] step8 final index={idx} x={item['coord'][0]} y={item['coord'][1]}"
+        )
+
+    try:
+        out_png = _save_debug_green_points_image(rgb, candidates, merged, GREEN_POINTS_AUDIT_IMAGE)
+        print(f"[green-audit] step9 saved {out_png}")
+    except Exception as exc:  # pragma: no cover
+        print(f"[green-audit] step9 debug image failed: {exc}")
+
     detections = [
         {
             "id": f"IP_{idx:04d}",
@@ -268,6 +462,13 @@ def detect_green_inspection_points(
         "green_point_count": len(detections),
         "green_mask_pixels": int(np.sum(green_mask > 0)),
         "detector": "green_hsv",
+        "raw_connected_components": raw_connected_components,
+        "after_area_filter": after_area_filter,
+        "region_count_skimage": region_count,
+        "candidate_count": candidate_count,
+        "before_merge": before_merge,
+        "after_merge": after_merge,
+        "debug_green_points_png": str(GREEN_POINTS_AUDIT_IMAGE.resolve()),
     }
     return detections, stats, green_mask
 
@@ -317,6 +518,8 @@ def filter_independent_lines_for_real_map(lines: List[Any]) -> List[Any]:
 def _merge_point_candidates(
     candidates: List[Dict[str, Any]],
     merge_distance: float,
+    *,
+    merge_audit_lines: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     ranked = sorted(candidates, key=lambda c: float(c.get("confidence", 0.0)), reverse=True)
     merged: List[Dict[str, Any]] = []
@@ -327,6 +530,14 @@ def _merge_point_candidates(
             ex, ey = existing["coord"]
             if (cx - ex) ** 2 + (cy - ey) ** 2 <= merge_distance ** 2:
                 keep = False
+                if merge_audit_lines is not None:
+                    dist = float(math.hypot(cx - ex, cy - ey))
+                    merge_audit_lines.append(
+                        "merge_drop: "
+                        f"pointA=({ex:.2f},{ey:.2f}) conf={float(existing.get('confidence', 0.0)):.4f} | "
+                        f"pointB=({cx:.2f},{cy:.2f}) conf={float(cand.get('confidence', 0.0)):.4f} | "
+                        f"distance={dist:.3f} (merge_distance={merge_distance})"
+                    )
                 break
         if keep:
             merged.append(cand)

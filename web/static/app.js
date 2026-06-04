@@ -7,7 +7,7 @@ const $ = (id) => document.getElementById(id);
 const MAP_STYLES = {
   inspectColor: "#1f77b4",
   connectColor: "#ff7f0e",
-  /** 拓扑参考：未巡检电网（与历史红线一致） */
+  /** 未巡检线路：仅当 payload 显式提供 unvisited_geometry_2d / explicit_unvisited_lines 时使用；默认无几何 */
   pendingTopoLine: {
     color: "red",
     width: 3,
@@ -743,13 +743,41 @@ function renderInitialMapPreview(targetId = "mapPlot") {
   }
 }
 
-/** 服务端重规划写入前：清掉可能残留的拓扑/实验图层（不碰天气层） */
-window.prepareMissionPlotForServerReplan = function prepareMissionPlotForServerReplan() {
+/** 清空地图 Plotly 与易失图层，避免旧红线 / 旧 trace 残留（生成、重规划、重置前调用） */
+function purgeDashboardMapPlots() {
+  if (!window.Plotly) return;
+  ["mapPlot", "mapPlotFs"].forEach((plotId) => {
+    const el = document.getElementById(plotId);
+    if (!el) return;
+    try {
+      Plotly.purge(plotId);
+    } catch (_) {}
+    state.plotReady[plotId] = false;
+  });
   if (window.LayerManager && window.LayerIds) {
-    window.LayerManager.clearLayer(window.LayerIds.L1_TOPOLOGY);
-    window.LayerManager.clearLayer(window.LayerIds.T3_AB_EXPERIMENT);
+    try {
+      LayerManager.clearLayer(LayerIds.L1_TOPOLOGY);
+      LayerManager.clearLayer(LayerIds.T3_AB_EXPERIMENT);
+      LayerManager.clearAllTransient();
+    } catch (_) {}
   }
+}
+window.purgeDashboardMapPlots = purgeDashboardMapPlots;
+
+/** 服务端重规划写入前：清掉可能残留的拓扑/实验图层与 Plotly trace */
+window.prepareMissionPlotForServerReplan = function prepareMissionPlotForServerReplan() {
+  purgeDashboardMapPlots();
 };
+
+function purgeSingleMissionPlot(plotId) {
+  if (!window.Plotly) return;
+  const el = document.getElementById(plotId);
+  if (!el) return;
+  try {
+    Plotly.purge(plotId);
+  } catch (_) {}
+  state.plotReady[plotId] = false;
+}
 
 function refreshMissionMap(targetId = "mapPlot", options = {}) {
   const mission = getCurrentMission();
@@ -992,6 +1020,12 @@ function formatRiskTier(riskVal) {
 
 function renderStats(statistics) {
   const s = statistics || {};
+  const mission = typeof getCurrentMission === "function" ? getCurrentMission() : null;
+  const dashLen = mission != null ? (mission.inspection_points ?? []).length : null;
+  const inspectionPointKpi =
+    mission != null
+      ? (mission.inspection_points ?? []).length
+      : s.dashboard_inspection_points ?? s.inspection_points_count ?? s.num_inspection_points;
   const phase = window.AppPhaseManager?.getPhase?.() || window.AppPhase?.IDLE || "idle";
   const phaseText = (PHASE_LABELS && PHASE_LABELS[phase]) || phase;
   const riskVal = Number(state.dynamicWeather.predictedRisk ?? 0);
@@ -1003,7 +1037,7 @@ function renderStats(statistics) {
   const secondary = $("statCardsSecondary");
   const itemsPrimary = [
     ["total_length", "总长度", s.total_length, " px"],
-    ["num_inspection_points", "巡检点数", s.num_inspection_points, ""],
+    ["num_inspection_points", "巡检点数", inspectionPointKpi, ""],
     ["phase", "任务状态", phaseText, ""],
     ["predicted_risk", "天气风险", weatherOn ? riskVal.toFixed(2) : "—", ""],
   ];
@@ -1046,6 +1080,16 @@ function renderStats(statistics) {
 
   renderAdvancedStats(s);
   renderSystemStatus();
+  const meta = mission?.metadata || {};
+  const idst = meta.image_detection_stats || {};
+  console.log(
+    "[point-flow] cv_after_merge=",
+    idst.after_merge ?? idst.merged_points ?? "—",
+    "dashboard_inspection_points=",
+    dashLen ?? "—",
+    "ui_kpi_inspection_points=",
+    inspectionPointKpi
+  );
 }
 
 function renderVisitOrder(visitOrder) {
@@ -1086,44 +1130,360 @@ function flattenMissionPathPoints(result) {
 
 
 
-/** 拓扑边像素折线（全量电网参考，非 Mission 路径段） */
-function getTopoEdgesPixelList(mission) {
-  const m = mission || {};
-  const meta = m.metadata || {};
-  const nested = meta.mission_metadata || {};
-  const list = meta.topo_edges_pixel || nested.topo_edges_pixel || m.topo_edges_pixel;
-  return Array.isArray(list) ? list : [];
+function collectInspectEdgeIdsFromSegments(mission) {
+  const segs = mission?.segments || [];
+  const out = [];
+  segs.forEach((seg) => {
+    if (!seg || typeof seg !== "object") return;
+    const typ = String(seg.type || "").toLowerCase();
+    const role = String(seg.role || "").toLowerCase();
+    const skipTypes = new Set([
+      "debug",
+      "overlay",
+      "redline",
+      "topo",
+      "raw",
+      "skeleton",
+      "hsv",
+      "legacy",
+      "image_trace",
+      "mask",
+    ]);
+    if (skipTypes.has(typ)) return;
+    if (/debug|overlay|redline|topo|raw|skeleton|hsv|legacy|mask|dummy|placeholder/.test(role)) return;
+    if (typ !== "inspect") return;
+    const eid = seg.edge_id != null ? String(seg.edge_id).replace(/[+-]$/, "") : "";
+    if (eid) out.push(eid);
+  });
+  return out;
+}
+
+/** Mission / 点上的 edge_id 与 segment 对齐（去掉 +/- 方向后缀） */
+function normalizeMissionEdgeId(raw) {
+  if (raw == null || raw === "") return "";
+  return String(raw).replace(/[+-]$/, "").trim();
+}
+
+/** 从 L_001 / L_001_edge_0 等串中提取 L_ 数字前缀，供与 segment / chain 上的 line 字段对齐 */
+function extractTopoLineKeyFromEdgeString(norm) {
+  if (!norm) return null;
+  const m = String(norm).match(/^(L_\d+)/);
+  return m ? m[1] : null;
+}
+
+/** 巡检点到折线的最短距离（像素），与后端 _point_segment_distance 一致 */
+function missionPointToPolylineDistancePx(x, y, geometry) {
+  if (!geometry || geometry.length < 2) return Infinity;
+  let best = Infinity;
+  for (let i = 0; i < geometry.length - 1; i += 1) {
+    const ax = Number(geometry[i][0]);
+    const ay = Number(geometry[i][1]);
+    const bx = Number(geometry[i + 1][0]);
+    const by = Number(geometry[i + 1][1]);
+    const dx = bx - ax;
+    const dy = by - ay;
+    const denom = dx * dx + dy * dy;
+    let d;
+    if (denom <= 1e-9) {
+      d = Math.hypot(x - ax, y - ay);
+    } else {
+      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / denom));
+      const px = ax + t * dx;
+      const py = ay + t * dy;
+      d = Math.hypot(x - px, y - py);
+    }
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+function collectSegmentInspectMatchTokens(seg) {
+  const tokens = new Set();
+  const add = (v) => {
+    if (v == null || v === "") return;
+    if (Array.isArray(v)) {
+      v.forEach((x) => add(x));
+      return;
+    }
+    const n = normalizeMissionEdgeId(String(v));
+    if (!n) return;
+    tokens.add(n);
+    const lk = extractTopoLineKeyFromEdgeString(n);
+    if (lk) tokens.add(lk);
+  };
+  if (!seg || typeof seg !== "object") return tokens;
+  add(seg.line_id);
+  add(seg.original_line_id);
+  add(seg.source_line_id);
+  add(seg.chain_id);
+  add(seg.physical_line_id);
+  add(seg.edge_id);
+  add(seg.member_chain_ids);
+  return tokens;
+}
+
+/** 仅 edge_id / line_id / original_line_id：用于「字段命中」判定，命中则不走几何兜底 */
+function collectPointTopoLineKeysPrimary(point) {
+  const keys = new Set();
+  [point?.edge_id, point?.line_id, point?.original_line_id].forEach((f) => {
+    if (f == null || f === "") return;
+    const n = normalizeMissionEdgeId(String(f));
+    if (!n) return;
+    const lk = extractTopoLineKeyFromEdgeString(n);
+    if (lk) keys.add(lk);
+    keys.add(n);
+  });
+  return keys;
+}
+
+function getPhysicalLineChainsArray(mission) {
+  return (
+    mission?.physical_line_chains ||
+    mission?.metadata?.physical_line_chains ||
+    mission?.metadata?.mission_metadata?.physical_line_chains ||
+    []
+  );
+}
+
+/** 从 L_001 得到 PL_001（数字与 PL 后缀对齐；用于 segment 未带 line_id 时的兜底） */
+function plEdgeIdFromTopoLineKey(lineKey) {
+  const m = lineKey && String(lineKey).match(/^L_(\d+)$/);
+  if (!m) return "";
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n < 0) return "";
+  return `PL_${String(n).padStart(3, "0")}`;
+}
+
+/** 按 edge_id → line_id → original_line_id 顺序收集 L_xxx，用于 L→PL 推断 */
+function collectOrderedTopoLineKeysFromPoint(point) {
+  const keys = [];
+  const seen = new Set();
+  const pushLk = (f) => {
+    const lk = extractTopoLineKeyFromEdgeString(normalizeMissionEdgeId(f));
+    if (lk && !seen.has(lk)) {
+      seen.add(lk);
+      keys.push(lk);
+    }
+  };
+  pushLk(point?.edge_id);
+  pushLk(point?.line_id);
+  pushLk(point?.original_line_id);
+  return keys;
+}
+
+function getMissionInspectPlEdgeIdSet(mission) {
+  return new Set(
+    collectInspectEdgeIdsFromSegments(mission).map((e) => normalizeMissionEdgeId(e))
+  );
+}
+
+/** 点到指定 PL inspect 段折线的最短距离（px），供日志与非几何路径展示 */
+function missionDistanceToInspectPlEdge(mission, plEdgeId, px, py) {
+  const pl = normalizeMissionEdgeId(plEdgeId);
+  if (!pl || !pl.startsWith("PL_")) return null;
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return null;
+  let best = Infinity;
+  (mission?.segments || []).forEach((seg) => {
+    if (!seg || String(seg.type || "").toLowerCase() !== "inspect") return;
+    if (normalizeMissionEdgeId(seg.edge_id) !== pl) return;
+    const d = missionPointToPolylineDistancePx(px, py, seg.geometry_2d || []);
+    if (d < best) best = d;
+  });
+  if (best === Infinity) return null;
+  return Math.round(best * 100) / 100;
 }
 
 /**
- * 单条 Plotly lines trace：所有拓扑边合并，置于巡检/连接路径之下绘制。
+ * 将巡检点上的 L_ 系 edge / line 标识解析为 Mission inspect 段上的 PL_ edge_id，
+ * 供与 collectInspectEdgeIdsFromSegments 得到的集合对齐（纯前端展示归属）。
+ * @returns {{ resolved_edge_id: string, nearest_dist: number|null, fallback_reason: string }}
  */
-function buildPendingTopoEdgesTrace(mission) {
-  const edges = getTopoEdgesPixelList(mission);
-  if (!edges.length) return null;
+function resolvePointInspectEdgeId(point, mission) {
+  const pack = (resolved_edge_id, nearest_dist, fallback_reason) => ({
+    resolved_edge_id: resolved_edge_id || "",
+    nearest_dist: nearest_dist == null || !Number.isFinite(nearest_dist) ? null : nearest_dist,
+    fallback_reason: fallback_reason || "",
+  });
+
+  const raw_edge_id = point?.edge_id;
+  const raw_line_id = point?.line_id != null ? point.line_id : point?.metadata?.line_id;
+  const ne = normalizeMissionEdgeId(raw_edge_id);
+  const px = Number(point?.x);
+  const py = Number(point?.y);
+
+  if (ne && ne.startsWith("PL_")) {
+    return pack(ne, missionDistanceToInspectPlEdge(mission, ne, px, py), "direct_pl_on_point");
+  }
+
+  const primaryKeys = collectPointTopoLineKeysPrimary(point);
+  const segs = mission?.segments || [];
+
+  for (let i = 0; i < segs.length; i += 1) {
+    const seg = segs[i];
+    if (!seg || String(seg.type || "").toLowerCase() !== "inspect") continue;
+    const segPl = normalizeMissionEdgeId(seg.edge_id);
+    if (!segPl || !segPl.startsWith("PL_")) continue;
+    const segTok = collectSegmentInspectMatchTokens(seg);
+    for (const pk of primaryKeys) {
+      if (pk && segTok.has(pk)) {
+        return pack(
+          segPl,
+          missionDistanceToInspectPlEdge(mission, segPl, px, py),
+          "primary_field_inspect_segment"
+        );
+      }
+    }
+    if (ne && segTok.has(ne)) {
+      return pack(
+        segPl,
+        missionDistanceToInspectPlEdge(mission, segPl, px, py),
+        "primary_field_inspect_segment"
+      );
+    }
+  }
+
+  const chains = getPhysicalLineChainsArray(mission);
+  if (Array.isArray(chains)) {
+    for (let c = 0; c < chains.length; c += 1) {
+      const ch = chains[c];
+      if (!ch || typeof ch !== "object") continue;
+      const pid = normalizeMissionEdgeId(ch.id != null ? ch.id : ch.edge_id);
+      if (!pid || !pid.startsWith("PL_")) continue;
+      const nested = ch.meta && typeof ch.meta === "object" ? ch.meta : {};
+      const parts = [
+        ...(Array.isArray(ch.line_ids) ? ch.line_ids : []),
+        ...(Array.isArray(ch.chain_ids) ? ch.chain_ids : []),
+        ...(Array.isArray(nested.member_chain_ids) ? nested.member_chain_ids : []),
+        ...(Array.isArray(nested.member_line_ids) ? nested.member_line_ids : []),
+      ];
+      const chTok = new Set();
+      parts.forEach((v) => {
+        const n = normalizeMissionEdgeId(v);
+        if (n) chTok.add(n);
+        const lk = extractTopoLineKeyFromEdgeString(n);
+        if (lk) chTok.add(lk);
+      });
+      for (const pk of primaryKeys) {
+        if (pk && chTok.has(pk)) {
+          return pack(
+            pid,
+            missionDistanceToInspectPlEdge(mission, pid, px, py),
+            "primary_field_physical_chain"
+          );
+        }
+      }
+      if (ne && chTok.has(ne)) {
+        return pack(
+          pid,
+          missionDistanceToInspectPlEdge(mission, pid, px, py),
+          "primary_field_physical_chain"
+        );
+      }
+    }
+  }
+
+  const inspectPlSet = getMissionInspectPlEdgeIdSet(mission);
+  const orderedLineKeys = collectOrderedTopoLineKeysFromPoint(point);
+  if (!orderedLineKeys.length) {
+    return pack("", null, "unresolved_no_l_key_in_point_fields");
+  }
+  for (let k = 0; k < orderedLineKeys.length; k += 1) {
+    const inferred = plEdgeIdFromTopoLineKey(orderedLineKeys[k]);
+    if (inferred && inspectPlSet.has(inferred)) {
+      return pack(
+        inferred,
+        missionDistanceToInspectPlEdge(mission, inferred, px, py),
+        "line_suffix_pl_inference"
+      );
+    }
+  }
+
+  return pack("", null, "unresolved_no_matching_pl");
+}
+
+/**
+ * 仅从显式字段读取红线几何：unvisited_geometry_2d 或 explicit_unvisited_lines。
+ * 不接受 topo_edges_pixel / metadata 拓扑参考自动推导。
+ */
+function readExplicitRedUnvisitedGeometry(mission) {
+  const keys = ["unvisited_geometry_2d", "explicit_unvisited_lines"];
+  const meta = mission?.metadata || {};
+  const nested = meta.mission_metadata || {};
+  for (const key of keys) {
+    for (const b of [mission, meta, nested]) {
+      const v = b?.[key];
+      if (Array.isArray(v) && v.length) return { key, value: v };
+    }
+  }
+  return null;
+}
+
+function appendPolylineToRedTrace(traceX, traceY, poly2d) {
+  if (!poly2d || poly2d.length < 2) return 0;
+  let n = 0;
+  poly2d.forEach((pt) => {
+    if (!pt || pt.length < 2) return;
+    traceX.push(Number(pt[0]));
+    traceY.push(Number(pt[1]));
+    n += 1;
+  });
+  if (n >= 2) {
+    traceX.push(null);
+    traceY.push(null);
+    return 1;
+  }
+  while (n > 0) {
+    traceX.pop();
+    traceY.pop();
+    n -= 1;
+  }
+  return 0;
+}
+
+function flattenExplicitRedGeometry(mission) {
+  const found = readExplicitRedUnvisitedGeometry(mission);
+  if (!found) {
+    return { x: [], y: [], polylineCount: 0, sourceKey: null };
+  }
   const xs = [];
   const ys = [];
-  const sty = MAP_STYLES.pendingTopoLine;
-  edges.forEach((edge) => {
-    const pl =
-      edge.pixel_polyline || edge.image_polyline || edge.original_polyline || [];
-    if (!Array.isArray(pl) || pl.length < 2) return;
-    pl.forEach((pt) => {
-      if (!pt || pt.length < 2) return;
-      xs.push(Number(pt[0]));
-      ys.push(Number(pt[1]));
+  let polylineCount = 0;
+  const { value, key } = found;
+  const first = value[0];
+  const firstIsPointPair =
+    Array.isArray(first) &&
+    first.length >= 2 &&
+    (Number.isFinite(Number(first[0])) || typeof first[0] === "string");
+
+  if (firstIsPointPair) {
+    polylineCount += appendPolylineToRedTrace(xs, ys, value);
+  } else {
+    value.forEach((block) => {
+      if (!block) return;
+      if (Array.isArray(block) && block.length >= 2 && Array.isArray(block[0])) {
+        polylineCount += appendPolylineToRedTrace(xs, ys, block);
+      } else if (typeof block === "object" && Array.isArray(block.geometry_2d)) {
+        polylineCount += appendPolylineToRedTrace(xs, ys, block.geometry_2d);
+      }
     });
-    xs.push(null);
-    ys.push(null);
-  });
-  while (xs.length && xs[xs.length - 1] === null) {
+  }
+  if (xs.length && xs[xs.length - 1] === null) {
     xs.pop();
     ys.pop();
   }
-  if (xs.length < 2) return null;
-  return {
-    x: xs,
-    y: ys,
+  return { x: xs, y: ys, polylineCount, sourceKey: key };
+}
+
+/**
+ * 红色「未巡检线路」：
+ * - 默认 x/y 为空；绝不读取 topo_edges_pixel / metadata.topo_edges_pixel / mission_metadata.topo_edges_pixel。
+ * - 仅当存在非空的 unvisited_geometry_2d 或 explicit_unvisited_lines 时写入折线几何。
+ */
+function buildUnvisitedRedLinesTrace(mission) {
+  const sty = MAP_STYLES.pendingTopoLine;
+  const trace = {
+    x: [],
+    y: [],
     mode: "lines",
     name: "未巡检线路",
     opacity: sty.opacity != null ? sty.opacity : 1,
@@ -1137,6 +1497,20 @@ function buildPendingTopoEdgesTrace(mission) {
     legendgroup: "pending_topo",
     legendrank: 3,
   };
+
+  const inspectEdges = collectInspectEdgeIdsFromSegments(mission);
+  const flat = flattenExplicitRedGeometry(mission);
+  trace.x = flat.x;
+  trace.y = flat.y;
+
+  const diag = {
+    inspectEdges,
+    explicitRedSource: flat.sourceKey,
+    redPolylineCount: flat.polylineCount,
+    redPointCount: flat.x.filter((v) => v != null && Number.isFinite(Number(v))).length,
+    topo_edges_pixel_used_as_reference: false,
+  };
+  return { trace, diag };
 }
 
 function isSkippableMissionDebugSegment(seg) {
@@ -1160,12 +1534,248 @@ function isSkippableMissionDebugSegment(seg) {
   return false;
 }
 
+function inspectionPointHoverTextFromCd(cd) {
+  const name = (cd && cd[3]) || "巡检点";
+  return `<b>${name}</b><br>区段: ${cd[0]}<br>图片: ${cd[1]}<br>进度: ${cd[2]}`;
+}
+
+/** 将 inspect 段列表展开为 Plotly 折线（段间 null 断开） */
+function flattenInspectSegsToPlotly(inspectSegs) {
+  const inspectX = [];
+  const inspectY = [];
+  const inspectCustom = [];
+  (inspectSegs || []).forEach((seg) => {
+    const g = seg.geom || [];
+    const hoverLine = seg.hoverLine || "";
+    g.forEach((pt) => {
+      inspectX.push(pt[0]);
+      inspectY.push(pt[1]);
+      inspectCustom.push(hoverLine);
+    });
+    inspectX.push(null);
+    inspectY.push(null);
+    inspectCustom.push(null);
+  });
+  while (inspectX.length && inspectX[inspectX.length - 1] === null) {
+    inspectX.pop();
+    inspectY.pop();
+    inspectCustom.pop();
+  }
+  return { xs: inspectX, ys: inspectY, customs: inspectCustom };
+}
+
+const _BLUE_ROUTE_MIN_SEG_LEN2 = 1e-18;
+/** 与后端 extract_cv_dashboard_xy_and_snapped 的 display 优先级一致（Dashboard 主图坐标） */
+function inspectionPointDisplayXY(p) {
+  if (!p || typeof p !== "object") return null;
+  const pair = (a, b) => {
+    const x = Number(a);
+    const y = Number(b);
+    return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+  };
+  let r = pair(p.original_pixel_x, p.original_pixel_y);
+  if (r) return r;
+  r = pair(p.raw_x, p.raw_y);
+  if (r) return r;
+  const dr = p.detection_result || {};
+  const rc = dr.raw_coord || p.raw_coord;
+  if (Array.isArray(rc) && rc.length >= 2) {
+    r = pair(rc[0], rc[1]);
+    if (r) return r;
+  }
+  const pos = p.pixel_position || p.position_2d || p.position || p.pos2d;
+  if (Array.isArray(pos) && pos.length >= 2) {
+    r = pair(pos[0], pos[1]);
+    if (r) return r;
+  }
+  r = pair(p.display_x, p.display_y);
+  if (r) return r;
+  if (p.metadata && typeof p.metadata === "object") {
+    r = pair(p.metadata.display_x, p.metadata.display_y);
+    if (r) return r;
+  }
+  return pair(p.x, p.y);
+}
+
+const _BLUE_ROUTE_INSERT_MAX_DIST_PX = 500;
+
+/**
+ * 用 mission.inspection_points 的 display x/y，在全部蓝色 inspect 段折线边上找最近投影；
+ * 距离 ≤500px 的点才插入到对应边两端之间，弧长 s 排序；不创建绿色连线 trace。
+ * @param {Array<{ geom: number[][], hoverLine: string }>} inspectSegs
+ * @param {object} mission
+ */
+function augmentInspectSegmentsWithInspectionPoints(inspectSegs, mission) {
+  const originalVertices = (inspectSegs || []).reduce((sum, s) => sum + (s.geom?.length || 0), 0);
+  const drawPts = Array.isArray(mission?.inspection_points) ? mission.inspection_points : [];
+  const m = drawPts.length;
+  const inspectionRows = [];
+  if (m) {
+    drawPts.forEach((p, idx) => {
+      const xy = inspectionPointDisplayXY(p);
+      if (!xy) return;
+      const totalPoints = m;
+      const pointLabel = `巡检点 ${String(p.point_id || p.id || idx + 1).replace(/^point_/, "")}`;
+      const segmentLabel = p.segment_id
+        ? `巡检区段 ${String(p.segment_id).replace(/^seg_/, "")}`
+        : "—";
+      const cd = [
+        segmentLabel,
+        p.image_available ? "真实图片" : "占位图",
+        `${p.progress_index || idx + 1}/${totalPoints}`,
+        pointLabel,
+      ];
+      inspectionRows.push({ x: xy.x, y: xy.y, cd, idx });
+    });
+  }
+  const mDraw = inspectionRows.length;
+
+  if (!inspectSegs?.length || !mDraw) {
+    const flat = flattenInspectSegsToPlotly(inspectSegs || []);
+    console.log(
+      `[blue-route-insert] original_vertices=${originalVertices} inspection_points=${m} inserted=0 final_vertices=${originalVertices}`
+    );
+    return { inspectX: flat.xs, inspectY: flat.ys, inspectCustom: flat.customs };
+  }
+
+  const edges = [];
+  let arcBase = 0;
+  inspectSegs.forEach((seg, segIdx) => {
+    const g = seg.geom;
+    for (let j = 0; j < g.length - 1; j += 1) {
+      const ax = g[j][0];
+      const ay = g[j][1];
+      const bx = g[j + 1][0];
+      const by = g[j + 1][1];
+      const dx = bx - ax;
+      const dy = by - ay;
+      const len = Math.hypot(dx, dy);
+      edges.push({ ax, ay, bx, by, dx, dy, len, arc0: arcBase, segIdx, localJ: j });
+      arcBase += len;
+    }
+  });
+
+  if (!edges.length) {
+    const flat = flattenInspectSegsToPlotly(inspectSegs);
+    console.log(
+      `[blue-route-insert] original_vertices=${originalVertices} inspection_points=${m} inserted=0 final_vertices=${originalVertices}`
+    );
+    return { inspectX: flat.xs, inspectY: flat.ys, inspectCustom: flat.customs };
+  }
+
+  const projections = [];
+  inspectionRows.forEach((row) => {
+    const px = row.x;
+    const py = row.y;
+    let best = null;
+    for (let ei = 0; ei < edges.length; ei += 1) {
+      const e = edges[ei];
+      const denom = e.dx * e.dx + e.dy * e.dy;
+      let t = 0;
+      let d = 0;
+      if (denom <= _BLUE_ROUTE_MIN_SEG_LEN2) {
+        d = Math.hypot(px - e.ax, py - e.ay);
+      } else {
+        t = Math.max(0, Math.min(1, ((px - e.ax) * e.dx + (py - e.ay) * e.dy) / denom));
+        const qx = e.ax + t * e.dx;
+        const qy = e.ay + t * e.dy;
+        d = Math.hypot(px - qx, py - qy);
+      }
+      const s = e.arc0 + t * e.len;
+      if (
+        !best ||
+        d < best.d - 1e-9 ||
+        (Math.abs(d - best.d) <= 1e-9 &&
+          (s < best.s - 1e-9 ||
+            (Math.abs(s - best.s) <= 1e-9 &&
+              (e.segIdx < best.segIdx ||
+                (e.segIdx === best.segIdx && (e.localJ < best.localJ || (e.localJ === best.localJ && ei < best.ei)))))))
+      ) {
+        best = { s, d, t, segIdx: e.segIdx, localJ: e.localJ, idx: row.idx, ei };
+      }
+    }
+    if (best && best.d <= _BLUE_ROUTE_INSERT_MAX_DIST_PX) {
+      projections.push({ row, s: best.s, t: best.t, segIdx: best.segIdx, localJ: best.localJ, idx: best.idx });
+    }
+  });
+
+  projections.sort((a, b) => {
+    if (a.s !== b.s) return a.s - b.s;
+    if (a.segIdx !== b.segIdx) return a.segIdx - b.segIdx;
+    if (a.localJ !== b.localJ) return a.localJ - b.localJ;
+    if (a.t !== b.t) return a.t - b.t;
+    return a.idx - b.idx;
+  });
+
+  const groupKey = (segIdx, localJ) => `${segIdx}\t${localJ}`;
+  const groups = new Map();
+  projections.forEach((p) => {
+    const k = groupKey(p.segIdx, p.localJ);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(p);
+  });
+  groups.forEach((arr) => {
+    arr.sort((a, b) => (a.t !== b.t ? a.t - b.t : a.idx - b.idx));
+  });
+
+  const inspectX = [];
+  const inspectY = [];
+  const inspectCustom = [];
+  inspectSegs.forEach((seg, segIdx) => {
+    const g = seg.geom;
+    const hoverLine = seg.hoverLine;
+    for (let j = 0; j < g.length - 1; j += 1) {
+      inspectX.push(g[j][0]);
+      inspectY.push(g[j][1]);
+      inspectCustom.push(hoverLine);
+      const inserts = groups.get(groupKey(segIdx, j)) || [];
+      inserts.forEach((ins) => {
+        inspectX.push(ins.row.x);
+        inspectY.push(ins.row.y);
+        inspectCustom.push(inspectionPointHoverTextFromCd(ins.row.cd));
+      });
+    }
+    const last = g[g.length - 1];
+    inspectX.push(last[0]);
+    inspectY.push(last[1]);
+    inspectCustom.push(hoverLine);
+    inspectX.push(null);
+    inspectY.push(null);
+    inspectCustom.push(null);
+  });
+  while (inspectX.length && inspectX[inspectX.length - 1] === null) {
+    inspectX.pop();
+    inspectY.pop();
+    inspectCustom.pop();
+  }
+
+  const kIns = projections.length;
+  console.log(
+    `[blue-route-insert] original_vertices=${originalVertices} inspection_points=${m} inserted=${kIns} final_vertices=${originalVertices + kIns}`
+  );
+  return { inspectX, inspectY, inspectCustom };
+}
+
 function buildMissionTraces(missionPayload) {
   const mission = missionPayload || getCurrentMission();
+  const inspectionPointsLengthAtEntry = mission?.inspection_points?.length ?? 0;
+  console.log(
+    "[dashboard-render] inspection_points=",
+    inspectionPointsLengthAtEntry
+  );
+  console.log(
+    "[dashboard-render] statistics.num_inspection_points=",
+    mission?.statistics?.num_inspection_points
+  );
+  console.log(
+    "[point-flow] ui_draw_points=",
+    inspectionPointsLengthAtEntry,
+    "cv_after_merge=",
+    mission?.metadata?.image_detection_stats?.after_merge ??
+      mission?.metadata?.image_detection_stats?.merged_points
+  );
   const segments = mission?.segments || [];
-  const inspectX = [],
-    inspectY = [],
-    inspectCustom = [];
+  const inspectSegs = [];
   const connectX = [],
     connectY = [],
     connectCustom = [];
@@ -1181,9 +1791,10 @@ function buildMissionTraces(missionPayload) {
     const hoverLine = `${segLabel}<br>${typeLabel} · ${Math.round(seg.length || 0)}px`;
 
     if (seg.type === "inspect") {
-      inspectX.push(...geom.map((p) => p[0]), null);
-      inspectY.push(...geom.map((p) => p[1]), null);
-      inspectCustom.push(...geom.map(() => hoverLine), null);
+      inspectSegs.push({
+        geom: geom.map((p) => [Number(p[0]), Number(p[1])]),
+        hoverLine,
+      });
     } else if (seg.type === "connect") {
       connectX.push(...geom.map((p) => p[0]), null);
       connectY.push(...geom.map((p) => p[1]), null);
@@ -1191,9 +1802,45 @@ function buildMissionTraces(missionPayload) {
     }
   });
 
-  [inspectX, inspectY, inspectCustom, connectX, connectY, connectCustom].forEach((arr) => {
+  [connectX, connectY, connectCustom].forEach((arr) => {
     if (arr.length && arr[arr.length - 1] === null) arr.pop();
   });
+
+  /** Dashboard：巡检点 marker（不连线）；蓝线顶点 = 原 inspect 折线 + 按弧长投影插入的巡检点 */
+  const drawPts = Array.isArray(mission.inspection_points) ? mission.inspection_points : [];
+  const rowsWithXY = [];
+  if (drawPts.length) {
+    const totalPoints = drawPts.length;
+    drawPts.forEach((p, idx) => {
+      const xy = inspectionPointDisplayXY(p);
+      if (!xy) return;
+      const pointLabel = `巡检点 ${String(p.point_id || p.id || idx + 1).replace(/^point_/, "")}`;
+      const segmentLabel = p.segment_id
+        ? `巡检区段 ${String(p.segment_id).replace(/^seg_/, "")}`
+        : "—";
+      const cd = [
+        segmentLabel,
+        p.image_available ? "真实图片" : "占位图",
+        `${p.progress_index || idx + 1}/${totalPoints}`,
+        pointLabel,
+      ];
+      rowsWithXY.push({ x: xy.x, y: xy.y, cd, missionIndex: idx, point: p });
+    });
+  }
+
+  let inspectX = [];
+  let inspectY = [];
+  let inspectCustom = [];
+  if (inspectSegs.length) {
+    const aug = augmentInspectSegmentsWithInspectionPoints(inspectSegs, mission);
+    inspectX = aug.inspectX;
+    inspectY = aug.inspectY;
+    inspectCustom = aug.inspectCustom;
+  } else if (rowsWithXY.length) {
+    console.log(
+      `[blue-route-insert] original_vertices=0 inspection_points=${rowsWithXY.length} inserted=0 final_vertices=0`
+    );
+  }
 
   const traces = [];
   if (state.showWeatherLayer) {
@@ -1206,10 +1853,16 @@ function buildMissionTraces(missionPayload) {
     traces.push(...(window.LayerManager?.getLayer(window.LayerIds?.T1_ADAPTIVE_FLASH) || buildAdaptiveReplanTraces()));
   }
 
-  const pendingTopo = buildPendingTopoEdgesTrace(mission);
-  if (pendingTopo) {
-    traces.push(pendingTopo);
-  }
+  const { trace: unvisitedRedTrace, diag: redDiag } = buildUnvisitedRedLinesTrace(mission);
+  traces.push(unvisitedRedTrace);
+
+  const redTraceFiniteCount = (unvisitedRedTrace.x || []).filter(
+    (v) => v != null && Number.isFinite(Number(v))
+  ).length;
+  console.log(
+    "[dashboard-render] red_unvisited_trace_points=",
+    redTraceFiniteCount
+  );
 
   if (state.showInspect && inspectX.length) {
     traces.push({
@@ -1241,144 +1894,47 @@ function buildMissionTraces(missionPayload) {
     });
   }
 
-  const visiblePts = selectInspectionPoints(
-    mission.inspection_points || [],
-    state.pointMode
-  );
-  if (visiblePts.length) {
-    const isAll = state.pointMode === "all";
-    const playbackVisual = typeof window.getPlaybackVisualState === "function"
-      ? window.getPlaybackVisualState()
-      : null;
-    const visited = playbackVisual?.visitedIds || new Set();
-    const currentId = playbackVisual?.currentPointId || null;
-    const totalPoints = (mission.inspection_points || []).length || visiblePts.length;
-    const unvisited = [];
-    const visitedPts = [];
-    let currentPt = null;
-
-    visiblePts.forEach((p, idx) => {
-      const pid = p.id || p.point_id || `point_${idx}`;
-      const pointLabel = `巡检点 ${String(p.point_id || p.id || idx + 1).replace(/^point_/, "")}`;
-      const segmentLabel = p.segment_id
-        ? `巡检区段 ${String(p.segment_id).replace(/^seg_/, "")}`
-        : "—";
-      const isCurrent = currentId && pid === currentId;
-      const isVisited = visited.has(pid);
-      const cd = [
-        segmentLabel,
-        p.image_available ? "真实图片" : "占位图",
-        `${p.progress_index || idx + 1}/${totalPoints}`,
-        pointLabel,
-      ];
-      const item = { p, cd };
-      if (isCurrent) currentPt = item;
-      else if (isVisited) visitedPts.push(item);
-      else unvisited.push(item);
+  if (rowsWithXY.length) {
+    traces.push({
+      x: rowsWithXY.map((r) => r.x),
+      y: rowsWithXY.map((r) => r.y),
+      mode: "markers",
+      name: "巡检点",
+      marker: {
+        color: "#22c55e",
+        size: 11,
+        symbol: "circle",
+        line: { color: "#052e16", width: 1.5 },
+      },
+      text: rowsWithXY.map((r) => r.cd[3]),
+      customdata: rowsWithXY.map((r) => {
+        const p = r.point;
+        const pointId = String(p.point_id || p.id || "").trim();
+        return {
+          point_id: pointId,
+          image_url:
+            (typeof p.image_url === "string" && p.image_url.trim()) ||
+            `/api/inspection-image/${pointId}.jpg`,
+        };
+      }),
+      hovertemplate:
+        "<b>%{text}</b><br>" +
+        "point_id: %{customdata.point_id}<br>" +
+        "url: %{customdata.image_url}<br>" +
+        "<span style='opacity:0.85'>点击在侧栏查看巡检图</span><extra></extra>",
+      hoverinfo: "text",
+      showlegend: true,
+      legendgroup: "points",
+      legendrank: 3,
     });
-
-    if (unvisited.length) {
-      traces.push({
-        x: unvisited.map((v) => v.p.x),
-        y: unvisited.map((v) => v.p.y),
-        mode: "markers",
-        name: "巡检点光晕",
-        marker: {
-          size: isAll ? 12 : 16,
-          color: "rgba(34, 211, 238, 0.18)",
-          line: { width: 0, color: "rgba(0,0,0,0)" },
-        },
-        hoverinfo: "skip",
-        showlegend: false,
-        legendgroup: "points",
-      });
-      traces.push({
-        x: unvisited.map((v) => v.p.x),
-        y: unvisited.map((v) => v.p.y),
-        mode: "markers",
-        name: "巡检点",
-        marker: {
-          size: isAll ? 6 : 8,
-          color: "#22d3ee",
-          opacity: isAll ? 0.72 : 0.95,
-          line: { width: isAll ? 1.4 : 2, color: "#ffffff" },
-        },
-        text: unvisited.map((v) => v.cd[3]),
-        customdata: unvisited.map((v) => v.cd),
-        hovertemplate:
-          "<b>%{text}</b><br>" +
-          "区段: %{customdata[0]}<br>" +
-          "图片: %{customdata[1]}<br>" +
-          "进度: %{customdata[2]}<extra></extra>",
-        showlegend: true,
-        legendgroup: "points",
-        legendrank: 4,
-      });
-    }
-
-    if (visitedPts.length) {
-      traces.push({
-        x: visitedPts.map((v) => v.p.x),
-        y: visitedPts.map((v) => v.p.y),
-        mode: "markers",
-        name: "已巡检点",
-        marker: {
-          size: isAll ? 6 : 8,
-          color: "#22c55e",
-          opacity: 0.88,
-          line: { width: 2, color: "#ffffff" },
-        },
-        text: visitedPts.map((v) => v.cd[3]),
-        customdata: visitedPts.map((v) => v.cd),
-        hovertemplate:
-          "<b>%{text}</b><br>" +
-          "区段: %{customdata[0]}<br>" +
-          "图片: %{customdata[1]}<br>" +
-          "进度: %{customdata[2]}<extra></extra>",
-        showlegend: true,
-        legendgroup: "points",
-        legendrank: 5,
-      });
-    }
-
-    if (currentPt) {
-      traces.push({
-        x: [currentPt.p.x],
-        y: [currentPt.p.y],
-        mode: "markers",
-        name: "当前巡检点光晕",
-        marker: {
-          size: 28,
-          color: "rgba(250, 204, 21, 0.24)",
-          line: { width: 0, color: "rgba(0,0,0,0)" },
-        },
-        hoverinfo: "skip",
-        showlegend: false,
-        legendgroup: "points",
-      });
-      traces.push({
-        x: [currentPt.p.x],
-        y: [currentPt.p.y],
-        mode: "markers",
-        name: "当前巡检点",
-        marker: {
-          size: 13,
-          color: "#facc15",
-          opacity: 1,
-          line: { width: 2.4, color: "#ffffff" },
-        },
-        text: [currentPt.cd[3]],
-        customdata: [currentPt.cd],
-        hovertemplate:
-          "<b>%{text}</b><br>" +
-          "区段: %{customdata[0]}<br>" +
-          "图片: %{customdata[1]}<br>" +
-          "进度: %{customdata[2]}<extra></extra>",
-        showlegend: true,
-        legendgroup: "points",
-        legendrank: 6,
-      });
-    }
+    console.log(
+      "[demo-point-render] inspection_points=",
+      drawPts.length,
+      "rendered_green_points=",
+      rowsWithXY.length
+    );
+  } else {
+    console.log("[demo-point-render] inspection_points=0 rendered_green_points=0");
   }
 
   const markers = mission.markers || {};
@@ -1599,6 +2155,19 @@ window.getMissionMapPlotLayout = getMissionMapPlotLayout;
 window.plotlyUpdateMissionPlot = plotlyUpdateMissionPlot;
 window.refreshMissionMap = refreshMissionMap;
 
+function logInspectionImageStatsFromMission(mission) {
+  const st = mission?.metadata?.inspection_image_stats;
+  if (st && typeof st === "object") {
+    console.log("[inspection-image]", `total_images=${Number(st.total_images) || 0}`);
+    console.log("[inspection-image]", `mapped_points=${Number(st.mapped_points) || 0}`);
+    console.log("[inspection-image]", `missing_images=${Number(st.missing_images) || 0}`);
+    return;
+  }
+  console.log("[inspection-image]", "total_images=— (reload mission via server to refresh stats)");
+  console.log("[inspection-image]", "mapped_points=—");
+  console.log("[inspection-image]", "missing_images=—");
+}
+
 function onMissionLoaded(result, options = {}) {
   const normalized = normalizeMissionResult(result || {});
   if (window.MissionStore) {
@@ -1608,6 +2177,7 @@ function onMissionLoaded(result, options = {}) {
   } else {
     state.lastResult = normalized;
   }
+  logInspectionImageStatsFromMission(getCurrentMission() || normalized);
   resetDynamicWeather(getCurrentMission() || normalized);
   updateSpacingControlsVisibility();
   if (typeof updateReplanInputLimits === "function") {
@@ -1626,8 +2196,46 @@ function bindMapClick(plotId) {
   if (!el || el.__dashMapClick) return;
   el.__dashMapClick = true;
   el.on("plotly_click", (ev) => {
-    if (!state.pickPhase || !ev?.points?.length) return;
+    if (!ev?.points?.length) return;
     const p = ev.points[0];
+    const data = p.data || {};
+    const traceName = data.name;
+
+    if (!state.pickPhase) {
+      if (traceName === "巡检点" && p.customdata && typeof p.customdata === "object" && !Array.isArray(p.customdata)) {
+        const cd = p.customdata;
+        const point_id = String(cd.point_id || "").trim();
+        if (!point_id) return;
+        const image_url =
+          (typeof cd.image_url === "string" && cd.image_url.trim()) ||
+          `/api/inspection-image/${point_id}.jpg`;
+        console.log(
+          `[inspection-image] map_click point_id=${point_id} url=${image_url}`
+        );
+        const mission = typeof getCurrentMission === "function" ? getCurrentMission() : null;
+        const ipFull =
+          mission?.inspection_points?.find(
+            (x) => String(x.point_id || x.id || "").trim() === point_id
+          ) || { point_id, id: point_id, image_url };
+        if (typeof window.showInspectionImage === "function") {
+          window.showInspectionImage(ipFull, { logAs: "map_click" });
+        }
+        if (mission?.inspection_points?.length && typeof window.showInspectCardForDashboardPoint === "function") {
+          const missionIdx = mission.inspection_points.findIndex(
+            (x) => String(x.point_id || x.id || "").trim() === point_id
+          );
+          if (missionIdx >= 0) {
+            const ip = mission.inspection_points[missionIdx];
+            const total = mission.inspection_points.length;
+            window.showInspectCardForDashboardPoint(ip, missionIdx + 1, total, {
+              skipImageRefresh: true,
+            });
+          }
+        }
+      }
+      return;
+    }
+
     const x = Math.round(p.x);
     const y = Math.round(p.y);
     const { width, height } = getImageSize(state.lastResult || { map_background: state.mapConfig });
@@ -1671,6 +2279,8 @@ function renderMission(result, targetId = "mapPlot", options = {}) {
   if (!result) return;
   readUiToState();
   updateMapModeHint();
+
+  purgeSingleMissionPlot(targetId);
 
   const normalized = normalizeMissionResult(result);
   const plot = buildPlotFromMission(normalized, options);
@@ -1765,6 +2375,7 @@ async function runPlanning() {
   const pipeline = body.pipeline;
 
   $("runBtn").disabled = true;
+  purgeDashboardMapPlots();
   setStatus(
     pipeline === "image" ? "正在生成/加载图像主线…" : "统一管线规划中…",
     "running"
@@ -1878,6 +2489,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     } else {
       state.lastResult = null;
     }
+    purgeDashboardMapPlots();
     state.experiment.active = false;
     state.experiment.runA = null;
     state.experiment.runB = null;

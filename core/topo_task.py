@@ -123,9 +123,12 @@ def snap_point_to_topo_graph(
     point: Sequence[float],
     topo_graph,
     *,
-    max_distance: float = 80.0,
+    max_distance: Optional[float] = 80.0,
 ) -> Optional[Dict[str, Any]]:
-    """Snap a point to the nearest topo edge polyline."""
+    """Snap a point to the nearest topo edge polyline.
+
+    max_distance=None：不丢弃远距离点，始终返回全局最近边投影（供 fallback）。
+    """
     best: Optional[Dict[str, Any]] = None
     for edge_id, edge in topo_graph.edges.items():
         proj = project_point_to_polyline(point, edge.polyline)
@@ -140,7 +143,7 @@ def snap_point_to_topo_graph(
 
     if best is None:
         return None
-    if float(best["distance"]) > float(max_distance):
+    if max_distance is not None and float(best["distance"]) > float(max_distance):
         return None
     return best
 
@@ -353,6 +356,9 @@ def _enrich_point_on_chain(
     line_id: str,
     proj: Dict[str, Any],
     merged_len: float,
+    *,
+    snap_fallback: bool = False,
+    snap_distance_px: Optional[float] = None,
 ) -> None:
     s = float(proj["distance_along_edge"])
     tnorm = float(s / merged_len) if merged_len > 1e-6 else 0.0
@@ -361,14 +367,131 @@ def _enrich_point_on_chain(
         point["line_id"] = line_id
         point["distance_along_edge"] = s
         point["projected_t"] = tnorm
+        point["snap_fallback"] = bool(snap_fallback)
+        if snap_distance_px is not None:
+            point["snap_distance_px"] = float(snap_distance_px)
     else:
         try:
             setattr(point, "edge_id", chain_edge_id)
             setattr(point, "line_id", line_id)
             setattr(point, "distance_along_edge", s)
             setattr(point, "projected_t", tnorm)
+            setattr(point, "snap_fallback", bool(snap_fallback))
+            if snap_distance_px is not None:
+                setattr(point, "snap_distance_px", float(snap_distance_px))
+            dr = getattr(point, "detection_result", None)
+            if isinstance(dr, dict):
+                dr = {**dr, "snap_fallback": bool(snap_fallback)}
+                if snap_distance_px is not None:
+                    dr["snap_distance_px"] = float(snap_distance_px)
+                setattr(point, "detection_result", dr)
         except Exception:
             pass
+
+
+def _stash_original_mapping_fields(point: Any, pt_pos: Tuple[float, float]) -> None:
+    """在覆盖 edge_id/line_id 之前保留原始像素与标识（dict 与对象）。"""
+    ox, oy = float(pt_pos[0]), float(pt_pos[1])
+    if isinstance(point, dict):
+        point.setdefault("original_pixel_x", ox)
+        point.setdefault("original_pixel_y", oy)
+        pid = point.get("point_id") or point.get("id")
+        if pid is not None:
+            point.setdefault("original_point_id", pid)
+        if point.get("line_id") is not None:
+            point.setdefault("original_line_id", str(point.get("line_id")))
+        if point.get("edge_id") is not None:
+            point.setdefault("original_edge_id", str(point.get("edge_id")))
+        return
+    try:
+        if getattr(point, "original_pixel_x", None) is None:
+            setattr(point, "original_pixel_x", ox)
+            setattr(point, "original_pixel_y", oy)
+        pid = getattr(point, "point_id", None) or getattr(point, "id", None)
+        if pid is not None and getattr(point, "original_point_id", None) is None:
+            setattr(point, "original_point_id", pid)
+        lid = getattr(point, "line_id", None)
+        if lid is not None and getattr(point, "original_line_id", None) is None:
+            setattr(point, "original_line_id", str(lid))
+        eid = getattr(point, "edge_id", None)
+        if eid is not None and getattr(point, "original_edge_id", None) is None:
+            setattr(point, "original_edge_id", str(eid))
+    except Exception:
+        pass
+
+
+def _point_identity(point: Any) -> str:
+    if isinstance(point, dict):
+        return str(point.get("point_id") or point.get("id") or id(point))
+    return str(getattr(point, "point_id", None) or getattr(point, "id", None) or id(point))
+
+
+def _point_xy(point: Any) -> Optional[Tuple[float, float]]:
+    if hasattr(point, "pixel_position"):
+        pos = getattr(point, "pixel_position", None)
+    elif isinstance(point, dict):
+        pos = point.get("pixel_position") or point.get("pos2d") or point.get("position")
+    else:
+        pos = None
+    if pos is None or len(pos) < 2:
+        return None
+    return (float(pos[0]), float(pos[1]))
+
+
+def _point_line_id(point: Any, default: Optional[str] = None) -> Optional[str]:
+    if isinstance(point, dict):
+        v = point.get("line_id", default)
+    else:
+        v = getattr(point, "line_id", default)
+    return str(v) if v not in (None, "") else None
+
+
+def _point_edge_id(point: Any) -> Optional[str]:
+    if isinstance(point, dict):
+        v = point.get("edge_id")
+    else:
+        v = getattr(point, "edge_id", None)
+    return str(v) if v not in (None, "") else None
+
+
+def _point_type(point: Any) -> str:
+    if isinstance(point, dict):
+        return str(point.get("point_type", point.get("type", "unknown")))
+    return str(getattr(point, "point_type", "unknown"))
+
+
+def _set_point_mapping_mode(point: Any, mode: str) -> None:
+    if isinstance(point, dict):
+        point["_chain_mapping_mode"] = mode
+        return
+    try:
+        setattr(point, "_chain_mapping_mode", mode)
+    except Exception:
+        pass
+
+
+def _point_mapping_mode(point: Any) -> str:
+    if isinstance(point, dict):
+        return str(point.get("_chain_mapping_mode") or "")
+    return str(getattr(point, "_chain_mapping_mode", "") or "")
+
+
+def _iter_input_points(line_inspection_points_by_line: Dict[str, List]) -> List[Tuple[Optional[str], Any]]:
+    rows: List[Tuple[Optional[str], Any]] = []
+    for line_id, points in line_inspection_points_by_line.items():
+        for point in points or []:
+            rows.append((str(line_id) if line_id not in (None, "") else None, point))
+    return rows
+
+
+def _chain_specs_flat(
+    chain_specs_by_line: Dict[str, List[Tuple[str, List[str], List[Tuple[float, float]], str, str]]]
+) -> List[Tuple[str, str, List[str], List[Tuple[float, float]], str, str]]:
+    out: List[Tuple[str, str, List[str], List[Tuple[float, float]], str, str]] = []
+    for line_id, chains in chain_specs_by_line.items():
+        for cid, ordered, merged, uu, vv in chains:
+            out.append((str(line_id), cid, ordered, merged, uu, vv))
+    return out
 
 
 def map_points_to_edges(
@@ -389,6 +512,7 @@ def map_points_to_edges(
         }
 
     edge_points: Dict[str, List[Any]] = defaultdict(list)
+    assigned_point_ids: Set[int] = set()
     point_map_logs = 0
     point_map_limit = 60
 
@@ -398,18 +522,11 @@ def map_points_to_edges(
             continue
 
         for point in points:
-            if hasattr(point, "pixel_position"):
-                pt_pos = point.pixel_position
-                point_type = getattr(point, "point_type", "unknown")
-            elif isinstance(point, dict):
-                pt_pos = point.get("pixel_position") or point.get("pos2d") or point.get("position")
-                point_type = point.get("point_type", point.get("type", "unknown"))
-            else:
-                pt_pos = None
-                point_type = "unknown"
-
+            pt_pos = _point_xy(point)
+            point_type = _point_type(point)
             if pt_pos is None or len(pt_pos) < 2:
                 continue
+            _stash_original_mapping_fields(point, pt_pos)
 
             snap_threshold = 80.0 if point_type == "image_detected" else 10.0
             best_cid = None
@@ -431,21 +548,94 @@ def map_points_to_edges(
             if best_cid is not None and best_proj is not None and best_dist < snap_threshold:
                 merged_sel = next(c[2] for c in chains if c[0] == best_cid)
                 mlen = _polyline_len2d(merged_sel)
-                _enrich_point_on_chain(point, best_cid, line_id, best_proj, mlen)
+                _enrich_point_on_chain(
+                    point,
+                    best_cid,
+                    line_id,
+                    best_proj,
+                    mlen,
+                    snap_fallback=False,
+                    snap_distance_px=best_dist,
+                )
+                _set_point_mapping_mode(point, "strict")
                 edge_points[best_cid].append(point)
+                assigned_point_ids.add(id(point))
                 if point_map_logs < point_map_limit:
-                    pid = (
-                        point.get("point_id", point.get("id", "?"))
-                        if isinstance(point, dict)
-                        else getattr(point, "point_id", getattr(point, "id", "?"))
-                    )
                     print(
-                        f"[point-map] point_id={pid} line_id={line_id} edge_id={best_cid} "
+                        f"[point-map] point_id={_point_identity(point)} line_id={line_id} edge_id={best_cid} "
                         f"distance_along_edge={float(best_proj['distance_along_edge']):.2f}"
                     )
                     point_map_logs += 1
 
+    flat_chains = _chain_specs_flat(chain_specs_by_line)
+    for hinted_line_id, point in _iter_input_points(line_inspection_points_by_line):
+        if id(point) in assigned_point_ids:
+            continue
+        pt_pos = _point_xy(point)
+        if pt_pos is None:
+            continue
+        _stash_original_mapping_fields(point, pt_pos)
+
+        point_line_id = _point_line_id(point, hinted_line_id)
+        candidates = [
+            row for row in flat_chains if point_line_id is not None and row[0] == point_line_id
+        ]
+        mode = "line_id_fallback"
+        if not candidates:
+            candidates = flat_chains
+            mode = "nearest_fallback"
+
+        best = None
+        for line_id, cid, _ordered, merged, _uu, _vv in candidates:
+            if len(merged) < 2:
+                continue
+            proj = project_point_to_polyline(pt_pos, merged)
+            if proj is None:
+                continue
+            d = float(proj["distance"])
+            if best is None or d < best[0]:
+                best = (d, line_id, cid, merged, proj)
+
+        if best is None:
+            print(
+                f"[inspection-point-unassigned] point_id={_point_identity(point)} "
+                f"edge_id={_point_edge_id(point)} xy=({pt_pos[0]:.1f},{pt_pos[1]:.1f}) "
+                "nearest_line=None nearest_chain=None distance=None"
+            )
+            continue
+
+        best_dist, best_line_id, best_cid, best_merged, best_proj = best
+        if mode == "nearest_fallback" and best_dist > 120.0:
+            print(
+                f"[point-map-fallback-warn] point_id={_point_identity(point)} "
+                f"nearest_chain={best_cid} distance={best_dist:.2f}px (mapping anyway)"
+            )
+
+        _enrich_point_on_chain(
+            point,
+            best_cid,
+            best_line_id,
+            best_proj,
+            _polyline_len2d(best_merged),
+            snap_fallback=True,
+            snap_distance_px=best_dist,
+        )
+        _set_point_mapping_mode(point, mode)
+        edge_points[best_cid].append(point)
+        assigned_point_ids.add(id(point))
+        print(
+            f"[point-map-fallback] mode={mode} point_id={_point_identity(point)} "
+            f"line_id={best_line_id} edge_id={best_cid} distance={best_dist:.2f} "
+            f"distance_along_edge={float(best_proj['distance_along_edge']):.2f}"
+        )
+
+    input_xy = 0
+    for _lid, pts in line_inspection_points_by_line.items():
+        for p in pts or []:
+            if _point_xy(p) is not None:
+                input_xy += 1
     total_mapped = sum(len(pts) for pts in edge_points.values())
+    print(f"[point-flow] mapped_points={total_mapped} input_xy_points={input_xy}")
     print(f"  [点边映射] 完成: {len(edge_points)} 条合并链, {total_mapped} 个巡检点")
 
     return dict(edge_points)
@@ -473,6 +663,10 @@ def build_edge_tasks(topo_graph, line_inspection_points_by_line: Dict[str, List]
         for cid, ordered, merged, uu, vv in chain_specs_by_line.get(line_id, []):
             pts = edge_points.get(cid, [])
             if not pts:
+                print(
+                    f"[edge-task-build] chain_id={cid} line_id={line_id} "
+                    f"topo_edges={list(ordered)} mapped_points=0 fallback_points=0 generated=False"
+                )
                 continue
             pts_sorted = sorted(
                 pts,
@@ -505,6 +699,14 @@ def build_edge_tasks(topo_graph, line_inspection_points_by_line: Dict[str, List]
             edge_tasks.append(task)
             merged_topo_count += len(ordered)
             lines_with_tasks.add(line_id)
+            fallback_count = sum(
+                1 for p in pts_sorted if _point_mapping_mode(p).endswith("_fallback")
+            )
+            print(
+                f"[edge-task-build] chain_id={cid} line_id={line_id} "
+                f"topo_edges={list(ordered)} mapped_points={len(pts_sorted)} "
+                f"fallback_points={fallback_count} generated=True"
+            )
 
     total_topo = len(topo_graph.edges)
     print(
@@ -512,6 +714,8 @@ def build_edge_tasks(topo_graph, line_inspection_points_by_line: Dict[str, List]
         f"merged_from_topo_edges={merged_topo_count} topo_edges_total={total_topo}"
     )
     print(f"  [边任务构建] 完成: {len(edge_tasks)} 个合并链任务")
+    edge_task_pts = sum(len(t.inspection_points or []) for t in edge_tasks)
+    print(f"[point-flow] edge_task_points={edge_task_pts}")
 
     return edge_tasks
 

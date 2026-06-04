@@ -16,6 +16,7 @@ import numpy as np
 from weather.weather_cost import compute_edge_weather_penalty
 
 from core.topo import TopoGraph
+from core.topo_plan import generate_connection_segment_along_topo
 from core.topo_task import EdgeTask
 from planner.mission_result_builder import (
     is_image_inspection_point,
@@ -31,6 +32,28 @@ IMAGE_HEIGHT = 960
 STRAIGHT_FALLBACK_WARN_PX = 150.0
 
 Point = Tuple[float, float]
+
+
+def _fmt_xy_pt(p: Point) -> str:
+    return f"({float(p[0]):.1f},{float(p[1]):.1f})"
+
+
+def _log_replan_connect_return(
+    geom: List[Point],
+    *,
+    mode: str,
+    reason: str,
+    from_edge: str,
+    to_edge: str,
+) -> None:
+    n = len(geom)
+    ln = _path_length(geom) if n >= 2 else 0.0
+    fst = _fmt_xy_pt(geom[0]) if n else "(?,?)"
+    lst = _fmt_xy_pt(geom[-1]) if n else "(?,?)"
+    print(
+        f"[replan-connect-return] mode={mode} reason={reason} from_edge={from_edge} "
+        f"to_edge={to_edge} npts={n} len={ln:.1f} first={fst} last={lst}"
+    )
 
 
 def _merge_mission_metadata_nested(base_mission: Dict[str, Any]) -> None:
@@ -330,10 +353,20 @@ def _connect_geometry_topo(
     cost_config: Optional[Dict[str, Any]],
 ) -> List[Point]:
     """
-    Connect along TopoGraph via Dijkstra (planner/topo_dijkstra.py).
-    Falls back to dense Euclidean interpolation only if topo is missing or planner errors.
-    同一 edge 上两点：沿该边 pixel_polyline 截取子折线，不拉直线、不走跨边 Dijkstra。
+    链间 connect：优先 core.topo_plan.generate_connection_segment_along_topo（与首次生成一致），
+    失败再 Dijkstra planner，最后欧氏密分。
+    同一 edge 上两点：沿该边 pixel_polyline 截取子折线。
     """
+    fe = str(from_edge_id or "")
+    te = str(to_edge_id or "")
+    euclidean_reason = "euclidean_no_topo"
+    print(
+        f"[replan-connect-enter] role={role} from_edge={fe} to_edge={te} "
+        f"point_a={_fmt_xy_pt(point_a)} point_b={_fmt_xy_pt(point_b)} "
+        f"has_topo_graph={topo_graph is not None} has_edge_task_map={bool(edge_task_map)} "
+        f"connect_planner=along_topo_then_dijkstra"
+    )
+
     if (
         from_edge_id
         and to_edge_id
@@ -350,11 +383,60 @@ def _connect_geometry_topo(
             if sa is not None and sb is not None:
                 seg = _slice_polyline(poly, sa, sb)
                 if len(seg) >= 2:
+                    _log_replan_connect_return(
+                        seg,
+                        mode="planner_fallback",
+                        reason="same_edge_pixel_polyline_slice",
+                        from_edge=fe,
+                        to_edge=te,
+                    )
                     return seg
 
     if topo_graph is not None and edge_task_map:
+        try_along = bool(fe and te)
+        if try_along:
+            try:
+                geom_along, glen = generate_connection_segment_along_topo(
+                    point_a,
+                    point_b,
+                    topo_graph,
+                    edge_task_map,
+                    from_edge_id=from_edge_id,
+                    to_edge_id=to_edge_id,
+                    pixel_coord_mode=True,
+                )
+                out_along = [(float(p[0]), float(p[1])) for p in geom_along]
+                if len(out_along) > 2:
+                    print(
+                        f"[replan-connect] mode=along_topo from_edge={fe} to_edge={te} "
+                        f"out_pts={len(out_along)} out_len={float(glen):.1f}"
+                    )
+                    _warn_straight_fallback(out_along, role)
+                    _log_replan_connect_return(
+                        out_along,
+                        mode="along_topo",
+                        reason="generate_connection_segment_along_topo",
+                        from_edge=fe,
+                        to_edge=te,
+                    )
+                    return out_along
+                rsn = (
+                    "along_topo_empty"
+                    if not out_along or len(out_along) < 2
+                    else "along_topo_too_few_points"
+                )
+                print(
+                    f"[replan-connect] mode=planner_fallback reason={rsn} "
+                    f"from_edge={fe} to_edge={te} out_pts={len(out_along)}"
+                )
+            except Exception as exc:
+                print(
+                    f"[replan-connect] mode=planner_fallback reason=along_topo_exc:{exc!r} "
+                    f"from_edge={fe} to_edge={te} out_pts=0"
+                )
+
         try:
-            geom, _ = generate_connection_segment_with_planner(
+            geom, glen = generate_connection_segment_with_planner(
                 point_a,
                 point_b,
                 topo_graph,
@@ -366,18 +448,43 @@ def _connect_geometry_topo(
                 to_edge_id=to_edge_id,
             )
             out = [(float(p[0]), float(p[1])) for p in geom]
-            _warn_straight_fallback(out, role)
-            return out
+            if len(out) > 2:
+                print(
+                    f"[replan-connect] mode=planner_fallback reason=dijkstra_ok "
+                    f"from_edge={fe} to_edge={te} out_pts={len(out)} out_len={float(glen):.1f}"
+                )
+                _warn_straight_fallback(out, role)
+                _log_replan_connect_return(
+                    out,
+                    mode="planner_fallback",
+                    reason="generate_connection_segment_with_planner_dijkstra",
+                    from_edge=fe,
+                    to_edge=te,
+                )
+                return out
+            rsn = "planner_empty" if not out or len(out) < 2 else "planner_too_few_points"
+            euclidean_reason = f"euclidean_after_{rsn}"
         except Exception as exc:
-            print(f"[WARN] topo Dijkstra connect failed role={role}: {exc}")
+            euclidean_reason = f"euclidean_after_planner_exc:{exc!r}"
 
     out = _interpolate_line(point_a, point_b)
+    print(
+        f"[replan-connect] mode=straight_fallback reason={euclidean_reason} "
+        f"from_edge={fe} to_edge={te} out_pts={len(out)}"
+    )
     if len(out) == 2 and _dist(out[0], out[1]) > STRAIGHT_FALLBACK_WARN_PX:
         d = _dist(out[0], out[1])
         print(
             f"[WARN] straight fallback (role={role}, points=2, dist={d:.1f}px, "
             "euclidean_fallback)"
         )
+    _log_replan_connect_return(
+        out,
+        mode="straight_fallback",
+        reason=euclidean_reason,
+        from_edge=fe,
+        to_edge=te,
+    )
     return out
 
 
@@ -879,6 +986,7 @@ def _compute_replan_edge_visit_order(
             start_edge_id=start_edge_id,
             enable_sa=False,
             eps=150.0,
+            task_granularity="chain",
         )
         tokens = list(getattr(gmission, "visit_order", None) or [])
         expanded = [_strip_visit_direction_suffix(str(t)) for t in tokens]
@@ -1378,6 +1486,14 @@ def build_start_end_replan_mission(
         edge_task_map=edge_task_map,
         cost_config=cost_cfg,
     )
+    _cs_len = _path_length(connect_start_geom)
+    _cs_n = len(connect_start_geom)
+    _cs_f = _fmt_xy_pt(connect_start_geom[0]) if _cs_n else "(?,?)"
+    _cs_l = _fmt_xy_pt(connect_start_geom[-1]) if _cs_n else "(?,?)"
+    print(
+        f"[replan-final-connect] role=from_start from_edge=- to_edge={visit_order[0]} "
+        f"len={_cs_len:.1f} npts={_cs_n} first={_cs_f} last={_cs_l}"
+    )
     segments_out.append(
         _make_connect_segment(
             seg_idx,
@@ -1416,6 +1532,14 @@ def build_start_end_replan_mission(
                 edge_task_map=edge_task_map,
                 cost_config=cost_cfg,
             )
+            _cs_len = _path_length(connect_geom)
+            _cs_n = len(connect_geom)
+            _cs_f = _fmt_xy_pt(connect_geom[0]) if _cs_n else "(?,?)"
+            _cs_l = _fmt_xy_pt(connect_geom[-1]) if _cs_n else "(?,?)"
+            print(
+                f"[replan-final-connect] role=between_edges from_edge={prev_edge} to_edge={eid} "
+                f"len={_cs_len:.1f} npts={_cs_n} first={_cs_f} last={_cs_l}"
+            )
             segments_out.append(
                 _make_connect_segment(
                     seg_idx,
@@ -1452,6 +1576,14 @@ def build_start_end_replan_mission(
         cost_config=cost_cfg,
     )
     end_connected = _dist(connect_end_geom[-1], end) < 2.0
+    _ce_len = _path_length(connect_end_geom)
+    _ce_n = len(connect_end_geom)
+    _ce_f = _fmt_xy_pt(connect_end_geom[0]) if _ce_n else "(?,?)"
+    _ce_l = _fmt_xy_pt(connect_end_geom[-1]) if _ce_n else "(?,?)"
+    print(
+        f"[replan-final-connect] role=to_end from_edge={prev_edge} to_edge=- "
+        f"len={_ce_len:.1f} npts={_ce_n} first={_ce_f} last={_ce_l}"
+    )
     segments_out.append(
         _make_connect_segment(
             seg_idx,

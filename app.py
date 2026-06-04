@@ -1199,6 +1199,13 @@ async def api_inspection_image(filename: str):
         media = "image/png" if ext == ".png" else "image/jpeg"
         return FileResponse(path, media_type=media)
 
+    # 便于排查：打印真实磁盘路径（exists=False）
+    try:
+        abs_path = str(path.resolve())
+    except OSError:
+        abs_path = str(path)
+    print(f"[inspection-image-api] path={abs_path} exists=False", flush=True)
+
     if INSPECTION_PLACEHOLDER.exists():
         return FileResponse(INSPECTION_PLACEHOLDER, media_type="image/svg+xml")
     raise HTTPException(status_code=404, detail=f"Inspection image not found: {safe}")

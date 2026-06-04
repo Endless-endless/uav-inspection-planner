@@ -18,7 +18,7 @@ Phase 1特点：
 - 为未来真正图算法（如中国邮路）预留接口
 """
 
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 import numpy as np
 from collections import deque
 
@@ -1449,6 +1449,29 @@ def get_edge_inspection_geometry_with_direction(
     polyline = edge_pixel_polyline(edge_task)
     if len(polyline) < 2:
         return []
+    total = _polyline_length(polyline)
+    meta = getattr(edge_task, "meta", None) or {}
+    is_physical_line = (
+        edge_task.__class__.__name__ == "PhysicalLineChain"
+        or (
+            meta.get("member_chain_ids") is not None
+            and meta.get("build_mode") is not None
+        )
+    )
+    if is_physical_line:
+        geom = list(polyline)
+        if direction == "reverse":
+            geom = list(reversed(geom))
+        inspect_len = _polyline_length(geom)
+        if debug:
+            coverage = inspect_len / total if total > 1e-9 else 0.0
+            print(
+                f"[inspect-geometry] edge={getattr(edge_task, 'edge_id', None)} "
+                f"mode=physical_full physical_length={total:.2f} "
+                f"inspect_length={inspect_len:.2f} coverage={coverage:.4f}"
+            )
+        return geom
+
     points = list(getattr(edge_task, "inspection_points", None) or [])
     if not points:
         if debug:
@@ -1494,7 +1517,6 @@ def get_edge_inspection_geometry_with_direction(
             )
         return []
 
-    total = _polyline_length(polyline)
     s_min = min(projected)
     s_max = max(projected)
     if len(projected) == 1:
@@ -1512,6 +1534,13 @@ def get_edge_inspection_geometry_with_direction(
                 f"[DEBUG] edge inspection targets edge={getattr(edge_task, 'edge_id', None)} "
                 + "; ".join(target_debug)
             )
+        inspect_len = _polyline_length(geom)
+        coverage = inspect_len / total if total > 1e-9 else 0.0
+        print(
+            f"[inspect-geometry] edge={getattr(edge_task, 'edge_id', None)} "
+            f"mode=chain_slice physical_length={total:.2f} "
+            f"inspect_length={inspect_len:.2f} coverage={coverage:.4f}"
+        )
         print(
             f"[DEBUG] dead-end branch skipped/truncated edge={getattr(edge_task, 'edge_id', None)} "
             f"slice=({s_min:.2f},{s_max:.2f}) total={_polyline_length(polyline):.2f} "
@@ -1556,6 +1585,9 @@ def generate_connection_segment_along_topo(
     from_edge_id: Optional[str] = None,
     to_edge_id: Optional[str] = None,
     pixel_coord_mode: Optional[bool] = None,
+    completed_topo_edge_ids: Optional[Set[str]] = None,
+    completed_edge_penalty: float = 450.0,
+    route_connect_stats: Optional[dict] = None,
     **_,
 ) -> Tuple[List[Tuple[float, float]], float]:
     """
@@ -1566,8 +1598,11 @@ def generate_connection_segment_along_topo(
         point_b: 终点
         topo_graph: 拓扑图
         edge_task_map: 边任务映射
-        kwargs: 兼容 core/topo_global_optimizer 传入的路由提示参数
-            （如 completed_lines、target_line_id 等）；当前实现中忽略。
+        completed_topo_edge_ids: 已完成巡检的 chain 所覆盖的 TopoEdge.id 集合；
+            仅影响 connect 段候选路径的择优（对经过边加惩罚），不影响 inspect。
+        completed_edge_penalty: 每条已完成的拓扑边在 connect 择优中的加罚（像素量级）。
+        route_connect_stats: 可选；累计 completed_line_cross_count 等统计。
+        kwargs: 兼容其它调用方传入的提示参数（如 completed_lines 等）。
 
     Returns:
         Tuple[List[Tuple[float, float]], float]: (几何路径, 长度)
@@ -1576,6 +1611,10 @@ def generate_connection_segment_along_topo(
 
     if pixel_coord_mode is None:
         pixel_coord_mode = use_image_pixel_coords()
+
+    ct_ids: Optional[Set[str]] = None
+    if completed_topo_edge_ids:
+        ct_ids = {str(x) for x in completed_topo_edge_ids}
 
     def _append_polyline(dst: List[Tuple[float, float]], src: List[Tuple[float, float]]) -> None:
         if not src:
@@ -1680,6 +1719,8 @@ def generate_connection_segment_along_topo(
 
                 middle_geo: List[Tuple[float, float]] = []
                 middle_cost = 0.0
+                crosses_completed = 0
+                penalty_added = 0.0
                 for i in range(len(node_path) - 1):
                     u = node_path[i]
                     v = node_path[i + 1]
@@ -1688,7 +1729,13 @@ def generate_connection_segment_along_topo(
                         middle_geo = []
                         middle_cost = float("inf")
                         break
-                    middle_cost += float(getattr(e, "len2d", 0.0) or 0.0)
+                    base = float(getattr(e, "len2d", 0.0) or 0.0)
+                    eid = str(getattr(e, "id", "") or "")
+                    if ct_ids and eid in ct_ids:
+                        crosses_completed += 1
+                        penalty_added += float(completed_edge_penalty)
+                        base += float(completed_edge_penalty)
+                    middle_cost += base
                     _append_polyline(middle_geo, _edge_polyline_aligned(e, u, v))
 
                 total_cost = float(a_info["cost"]) + float(middle_cost) + float(b_info["cost"])
@@ -1701,6 +1748,8 @@ def generate_connection_segment_along_topo(
                         "a_geo": a_info["point_to_anchor"],
                         "middle_geo": middle_geo,
                         "b_geo": _anchor_to_point(to_edge, point_b, b_anchor) or [point_b],
+                        "crosses_completed": crosses_completed,
+                        "penalty_added": penalty_added,
                     }
 
         if best is not None:
@@ -1716,6 +1765,27 @@ def generate_connection_segment_along_topo(
                 geometry.append((float(point_b[0]), float(point_b[1])))
 
             length = _geom_length(geometry)
+            crosses = int(best.get("crosses_completed", 0))
+            pen_add = float(best.get("penalty_added", 0.0))
+            if crosses > 0:
+                print(
+                    f"[route-connect] from={from_edge_id} to={to_edge_id} "
+                    f"crosses_completed={crosses} penalty={pen_add:.1f} length={length:.1f}"
+                )
+                if route_connect_stats is not None:
+                    route_connect_stats["completed_line_cross_count"] = int(
+                        route_connect_stats.get("completed_line_cross_count", 0)
+                    ) + 1
+                    details = route_connect_stats.setdefault("cross_details", [])
+                    details.append(
+                        {
+                            "from": from_edge_id,
+                            "to": to_edge_id,
+                            "crosses_completed": crosses,
+                            "penalty": pen_add,
+                            "length": length,
+                        }
+                    )
             print(
                 f"[DEBUG] endpoint included reason=anchor_combo_optimal "
                 f"from_anchor={best['a_anchor']} to_anchor={best['b_anchor']} path={best['node_path']}"
@@ -4307,15 +4377,21 @@ def export_grouped_mission_to_json(
 
         segments_data.append(segment_data)
 
-    # 6. Inspection Points - 需要从 edge_tasks 和 line_inspection_points 构建
+    # 6. Inspection Points - 优先使用 mission 任务对象，保证 PL visit_order 的点归属为 PL_xxx。
     inspection_points_data = []
     point_id_counter = 0
     # 为每个 edge 获取其巡检点
     edge_to_inspection_points = {}  # {edge_id: [points]}
 
-    # 首先从 edge_tasks 获取已有的 inspection_points
+    mission_task_by_id = getattr(mission, "task_by_id", None) or {}
+    for task_id, task in mission_task_by_id.items():
+        points = getattr(task, "inspection_points", None) or []
+        if points:
+            edge_to_inspection_points[str(task_id)] = list(points)
+
+    # 再从 edge_tasks 获取已有的 inspection_points，供旧 chain/line visit_order 回退使用。
     for task in edge_tasks:
-        if task.inspection_points:
+        if task.inspection_points and task.edge_id not in edge_to_inspection_points:
             edge_to_inspection_points[task.edge_id] = task.inspection_points
 
     # 根据 visit_order 为每个点分配访问顺序
@@ -4366,7 +4442,7 @@ def export_grouped_mission_to_json(
                 detection_result = point.detection_result
                 status = point.status
                 source_reason = point.source_reason
-                point_edge_id = getattr(point, "edge_id", None) or edge_id
+                point_edge_id = edge_id if str(edge_id).startswith("PL_") else (getattr(point, "edge_id", None) or edge_id)
             elif isinstance(point, dict):
                 # 字典格式
                 point_type = point.get('type', point.get('point_type', 'unknown'))
@@ -4378,7 +4454,7 @@ def export_grouped_mission_to_json(
                 detection_result = point.get('detection_result')
                 status = point.get('status', 'uninspected')
                 source_reason = point.get('source_reason', '')
-                point_edge_id = point.get("edge_id") or edge_id
+                point_edge_id = edge_id if str(edge_id).startswith("PL_") else (point.get("edge_id") or edge_id)
             else:
                 # 未知格式，跳过
                 continue

@@ -169,7 +169,9 @@ class PowerlinePlannerV3:
         self.topo_nodes = []        # List[TopoNode], 拓扑节点
         self.topo_edges = []        # List[TopoEdge], 拓扑边
         self.topo_graph = None      # TopoGraph, 拓扑图
-        self.edge_tasks = []        # List[EdgeTask], 边任务
+        self.edge_tasks = []        # List[EdgeTask], 边任务（Chain 粒度，保留）
+        self.task_granularity = "physical_line"  # "chain" | "physical_line" — Mission 优化粒度
+        self.physical_line_chains = []  # List[PhysicalLineChain]，task_granularity=physical_line 时填充
         self.edge_ord = []          # List[str], 优化后的边任务顺序
         self.edge_dir = {}          # Dict[str, int], 边任务方向映射
         self.topo_path_3d = []      # List[Tuple], 拓扑规划3D路径
@@ -2854,17 +2856,19 @@ class PowerlinePlannerV3:
         - 角度去重窗口: 10px
         - 切分优先级: 端点 > 角度切分 > 长度切分
         - 节点去重: 25px 距离阈值合并重复端点
+        - 跨线 junction: merge_cross_line_junctions（端点吸附 + 端点到邻线投影）
 
         Returns:
             TopoGraph: 拓扑图
         """
         from core.topo import (
-            detect_topo_nodes, merge_duplicate_nodes, update_edges_after_merge,
+            detect_topo_nodes, merge_duplicate_nodes, merge_cross_line_junctions,
+            update_edges_after_merge,
             split_lines_to_edges, build_topo_graph,
             update_node_3d, visualize_topo_graph, compute_topo_stats
         )
 
-        print("[STEP 7.5] 构建拓扑图（保守版本 v1.1 + 节点去重）...")
+        print("[STEP 7.5] 构建拓扑图（保守版本 v1.1 + 节点去重 + 跨线 junction）...")
 
         # 检测拓扑节点
         self.topo_nodes = detect_topo_nodes(self.independent_lines)
@@ -2877,6 +2881,14 @@ class PowerlinePlannerV3:
             print("  [节点聚类] 真实地图模式：跳过节点合并，保留原图像素锚点")
         else:
             self.topo_nodes, old_to_new_id = merge_duplicate_nodes(self.topo_nodes, thresh=25.0)
+
+        # 跨 line_id 端点/投影 junction（独立于 25px 聚类；真实地图模式也执行以恢复图连通）
+        self.topo_nodes, junc_map = merge_cross_line_junctions(
+            self.topo_nodes, self.independent_lines
+        )
+        for k in list(old_to_new_id.keys()):
+            v = old_to_new_id[k]
+            old_to_new_id[k] = junc_map.get(v, v)
 
         # 更新3D坐标
         if self.height_map_smooth is not None:
@@ -3388,72 +3400,108 @@ class PowerlinePlannerV3:
         # =====================================================
         print("\n[方案2] 运行新算法 (全局拓扑优化)...")
 
-        mission_new = plan_global_topology_optimized_mission(
-            topo_graph=self.topo_graph,
-            edge_tasks=self.edge_tasks,
-            start_edge_id=start_edge_id,
-            enable_sa=enable_sa,
-            eps=eps
-        )
+        if getattr(self, "task_granularity", "physical_line") == "physical_line":
+            from core.physical_line_chain import build_physical_line_chains
 
-        # =====================================================
-        # 自动择优：分层比较
-        # =====================================================
-        print("\n[择优] 比较两个方案...")
-
-        if mission_old is None:
-            print("  [决策] 旧算法不可用，使用新算法")
-            final_mission = mission_new
-            winner = "新算法"
+            self.physical_line_chains = build_physical_line_chains(
+                self.edge_tasks, self.topo_graph
+            )
+            mission_new = plan_global_topology_optimized_mission(
+                topo_graph=self.topo_graph,
+                edge_tasks=self.edge_tasks,
+                start_edge_id=start_edge_id,
+                enable_sa=enable_sa,
+                eps=eps,
+                task_granularity="physical_line",
+                mission_edge_tasks=self.physical_line_chains,
+            )
+            print("[physical-chain-build] 验证（step9_4）: PhysicalLineChain 成员链")
+            for pl in self.physical_line_chains:
+                print(f"  {pl.id}: member_chain_ids={pl.chain_ids}")
         else:
-            # 提取关键指标
-            old_connect = mission_old.connect_length
-            new_connect = mission_new.connect_length
-            old_total = mission_old.total_length
-            new_total = mission_new.total_length
-            old_connect_count = sum(1 for s in mission_old.segments if s.type == 'connect')
-            new_connect_count = sum(1 for s in mission_new.segments if s.type == 'connect')
+            self.physical_line_chains = []
+            mission_new = plan_global_topology_optimized_mission(
+                topo_graph=self.topo_graph,
+                edge_tasks=self.edge_tasks,
+                start_edge_id=start_edge_id,
+                enable_sa=enable_sa,
+                eps=eps,
+                task_granularity="chain",
+            )
 
-            print(f"\n  [旧算法] Connect={old_connect:.1f}px ({old_connect_count}段), Total={old_total:.1f}px")
-            print(f"  [新算法] Connect={new_connect:.1f}px ({new_connect_count}段), Total={new_total:.1f}px")
+        # =====================================================
+        # 自动择优 / Mission 粒度决策
+        # =====================================================
+        if getattr(self, "task_granularity", "physical_line") == "physical_line":
+            chain_connect = getattr(mission_old, "connect_length", None) if mission_old is not None else None
+            physical_connect = getattr(mission_new, "connect_length", None) if mission_new is not None else None
+            chain_connect_s = f"{chain_connect:.1f}" if chain_connect is not None else "None"
+            physical_connect_s = f"{physical_connect:.1f}" if physical_connect is not None else "None"
+            print(
+                "[mission-granularity] task_granularity=physical_line "
+                "decision=force_physical_line "
+                f"chain_connect_length={chain_connect_s} "
+                f"physical_connect_length={physical_connect_s} "
+                "chain_kept_for=benchmark_only"
+            )
+            final_mission = mission_new
+            winner = "PhysicalLineChain (force_physical_line)"
+        else:
+            print("\n[择优] 比较两个方案...")
 
-            # 分层比较
-            if abs(new_connect - old_connect) < 1.0:  # connect长度接近（误差<1px）
-                # 二级：比较connect段数
-                if new_connect_count < old_connect_count:
-                    final_mission = mission_new
-                    winner = "新算法 (connect段数更少)"
-                elif new_connect_count > old_connect_count:
-                    final_mission = mission_old
-                    winner = "旧算法 (connect段数更少)"
-                else:
-                    # 三级：比较总长度
-                    if new_total < old_total:
-                        final_mission = mission_new
-                        winner = "新算法 (总长度更短)"
-                    else:
-                        final_mission = mission_old
-                        winner = "旧算法 (总长度更短或持平)"
-            elif new_connect < old_connect:
+            if mission_old is None:
+                print("  [决策] 旧算法不可用，使用新算法")
                 final_mission = mission_new
-                winner = "新算法 (connect更短)"
+                winner = "新算法"
             else:
-                final_mission = mission_old
-                winner = "旧算法 (connect更短或持平)"
+                # 提取关键指标
+                old_connect = mission_old.connect_length
+                new_connect = mission_new.connect_length
+                old_total = mission_old.total_length
+                new_total = mission_new.total_length
+                old_connect_count = sum(1 for s in mission_old.segments if s.type == 'connect')
+                new_connect_count = sum(1 for s in mission_new.segments if s.type == 'connect')
 
-            # 计算改进幅度
-            if winner.startswith("新算法"):
-                conn_improve = (old_connect - new_connect) / old_connect * 100 if old_connect > 0 else 0
-                total_improve = (old_total - new_total) / old_total * 100 if old_total > 0 else 0
-                print(f"\n  [结果] 采用: {winner}")
-                print(f"  [改进] Connect: {conn_improve:+.1f}%, Total: {total_improve:+.1f}%")
-            else:
-                conn_improve = (new_connect - old_connect) / old_connect * 100 if old_connect > 0 else 0
-                total_improve = (new_total - old_total) / old_total * 100 if old_total > 0 else 0
-                print(f"\n  [结果] 采用: {winner}")
-                print(f"  [差异] Connect: {conn_improve:+.1f}%, Total: {total_improve:+.1f}%")
-                if conn_improve > 0:
-                    print(f"  [说明] 新算法未产生改进，保持旧算法")
+                print(f"\n  [旧算法] Connect={old_connect:.1f}px ({old_connect_count}段), Total={old_total:.1f}px")
+                print(f"  [新算法] Connect={new_connect:.1f}px ({new_connect_count}段), Total={new_total:.1f}px")
+
+                # 分层比较
+                if abs(new_connect - old_connect) < 1.0:  # connect长度接近（误差<1px）
+                    # 二级：比较connect段数
+                    if new_connect_count < old_connect_count:
+                        final_mission = mission_new
+                        winner = "新算法 (connect段数更少)"
+                    elif new_connect_count > old_connect_count:
+                        final_mission = mission_old
+                        winner = "旧算法 (connect段数更少)"
+                    else:
+                        # 三级：比较总长度
+                        if new_total < old_total:
+                            final_mission = mission_new
+                            winner = "新算法 (总长度更短)"
+                        else:
+                            final_mission = mission_old
+                            winner = "旧算法 (总长度更短或持平)"
+                elif new_connect < old_connect:
+                    final_mission = mission_new
+                    winner = "新算法 (connect更短)"
+                else:
+                    final_mission = mission_old
+                    winner = "旧算法 (connect更短或持平)"
+
+                # 计算改进幅度
+                if winner.startswith("新算法"):
+                    conn_improve = (old_connect - new_connect) / old_connect * 100 if old_connect > 0 else 0
+                    total_improve = (old_total - new_total) / old_total * 100 if old_total > 0 else 0
+                    print(f"\n  [结果] 采用: {winner}")
+                    print(f"  [改进] Connect: {conn_improve:+.1f}%, Total: {total_improve:+.1f}%")
+                else:
+                    conn_improve = (new_connect - old_connect) / old_connect * 100 if old_connect > 0 else 0
+                    total_improve = (new_total - old_total) / old_total * 100 if old_total > 0 else 0
+                    print(f"\n  [结果] 采用: {winner}")
+                    print(f"  [差异] Connect: {conn_improve:+.1f}%, Total: {total_improve:+.1f}%")
+                    if conn_improve > 0:
+                        print(f"  [说明] 新算法未产生改进，保持旧算法")
 
         # 保存最终结果
         self.grouped_mission = final_mission

@@ -7,10 +7,75 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 INSPECTION_IMAGE_REL_DIR = Path("figures") / "inspection_images"
+
+
+def _normalize_dashboard_inspection_point_id(pt: Dict[str, Any], index: int) -> str:
+    """
+    Dashboard 稳定图片 id：已有 IP_nnnn 则规范化零填充；否则按顺序分配 IP_0001…
+    不把 L_/point_ 等用作 figures/inspection_images 下的文件名键。
+    """
+    raw = str(pt.get("point_id") or pt.get("id") or "").strip()
+    m = re.match(r"^IP_(\d+)$", raw, re.IGNORECASE)
+    if m:
+        return f"IP_{int(m.group(1)):04d}"
+    return f"IP_{index + 1:04d}"
+
+
+def _inspection_ip_image_filename(point_id: Optional[str]) -> Optional[str]:
+    """
+    巡检拍图文件名：point_id=IP_0001 → IP_0001.jpg（位于 figures/inspection_images/）。
+    """
+    if not point_id or not isinstance(point_id, str):
+        return None
+    pid = point_id.strip()
+    if not pid.upper().startswith("IP_"):
+        return None
+    base = Path(pid.replace("\\", "/")).name
+    low = base.lower()
+    if low.endswith((".jpg", ".jpeg", ".png")):
+        return base
+    return f"{base}.jpg"
+
+
+def _inspection_image_stats_dict(
+    inspection_points: List[Dict[str, Any]],
+    root: Optional[Path],
+) -> Dict[str, int]:
+    """磁盘巡检图数量 + 与 IP_* 巡检点的文件对齐统计。"""
+    img_dir = (root / INSPECTION_IMAGE_REL_DIR) if root else None
+    total_images = 0
+    if img_dir and img_dir.is_dir():
+        exts = {".jpg", ".jpeg", ".png"}
+        total_images = sum(1 for p in img_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+    mapped_points = 0
+    missing_images = 0
+    for pt in inspection_points or []:
+        fn = _inspection_ip_image_filename(str(pt.get("point_id") or pt.get("id") or ""))
+        if not fn:
+            continue
+        ok = bool(img_dir and (img_dir / fn).is_file())
+        if ok:
+            mapped_points += 1
+        else:
+            missing_images += 1
+    return {
+        "total_images": total_images,
+        "mapped_points": mapped_points,
+        "missing_images": missing_images,
+    }
+
+
+def _log_inspection_image_stats_console(stats: Dict[str, Any]) -> None:
+    print(f"[inspection-image] total_images={int(stats.get('total_images', 0))}")
+    print(f"[inspection-image] mapped_points={int(stats.get('mapped_points', 0))}")
+    print(f"[inspection-image] missing_images={int(stats.get('missing_images', 0))}")
+
 
 IMAGE_INSPECTION_SOURCES = frozenset(
     {"image", "image_points", "image-point", "image_detected", "image-point-source"}
@@ -158,25 +223,250 @@ def _segment_to_dict(seg: Any, index: int) -> Dict[str, Any]:
     }
 
 
+def _point_segment_distance(x: float, y: float, geometry: List[List[float]]) -> float:
+    if len(geometry) < 2:
+        return float("inf")
+    best = float("inf")
+    for a, b in zip(geometry, geometry[1:]):
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        dx, dy = bx - ax, by - ay
+        denom = dx * dx + dy * dy
+        if denom <= 1e-9:
+            d = ((x - ax) ** 2 + (y - ay) ** 2) ** 0.5
+        else:
+            t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / denom))
+            px, py = ax + t * dx, ay + t * dy
+            d = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+        if d < best:
+            best = d
+    return best
+
+
+def _nearest_inspect_segment_edge_id(x: float, y: float, mission: Any) -> Optional[str]:
+    best: Optional[Tuple[float, str]] = None
+    for seg in getattr(mission, "segments", None) or []:
+        if getattr(seg, "type", None) != "inspect":
+            continue
+        edge_id = getattr(seg, "edge_id", None)
+        geometry = getattr(seg, "geometry", None) or []
+        if not edge_id or not str(edge_id).startswith("PL_"):
+            continue
+        d = _point_segment_distance(x, y, geometry)
+        if best is None or d < best[0]:
+            best = (d, str(edge_id))
+    return best[1] if best is not None else None
+
+
+def _finite_float(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+        return f if math.isfinite(f) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _xy_from_sequence(seq: Any) -> Optional[Tuple[float, float]]:
+    if seq is None:
+        return None
+    try:
+        if len(seq) < 2:
+            return None
+    except TypeError:
+        return None
+    xf = _finite_float(seq[0])
+    yf = _finite_float(seq[1])
+    if xf is None or yf is None:
+        return None
+    return (xf, yf)
+
+
+def _detection_dict(pt: Any) -> Dict[str, Any]:
+    if isinstance(pt, dict):
+        dr = pt.get("detection_result")
+        return dr if isinstance(dr, dict) else {}
+    dr = getattr(pt, "detection_result", None)
+    return dr if isinstance(dr, dict) else {}
+
+
+def extract_cv_dashboard_xy_and_snapped(
+    pt: Any,
+) -> Tuple[Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
+    """
+    Dashboard 主坐标 x/y：优先 CV / 原始像素，不得用 snapped_coord 作为主来源。
+    顺序：original_pixel_x/y → raw_x/y → detection_result.raw_coord → pixel_position / position_2d / position。
+    吸附/投影坐标单独返回供 snapped_x / snapped_y / metadata。
+    """
+    dr = _detection_dict(pt)
+    display: Optional[Tuple[float, float]] = None
+
+    if isinstance(pt, dict):
+        ox = _finite_float(pt.get("original_pixel_x"))
+        oy = _finite_float(pt.get("original_pixel_y"))
+        if ox is not None and oy is not None:
+            display = (ox, oy)
+        if display is None:
+            rx = _finite_float(pt.get("raw_x"))
+            ry = _finite_float(pt.get("raw_y"))
+            if rx is not None and ry is not None:
+                display = (rx, ry)
+        if display is None:
+            display = _xy_from_sequence(dr.get("raw_coord"))
+        if display is None and isinstance(pt, dict):
+            display = _xy_from_sequence(pt.get("raw_coord"))
+        if display is None:
+            display = _xy_from_sequence(
+                pt.get("pixel_position")
+                or pt.get("position_2d")
+                or pt.get("position")
+                or pt.get("pos2d")
+            )
+    else:
+        ox = _finite_float(getattr(pt, "original_pixel_x", None))
+        oy = _finite_float(getattr(pt, "original_pixel_y", None))
+        if ox is not None and oy is not None:
+            display = (ox, oy)
+        if display is None:
+            rx = _finite_float(getattr(pt, "raw_x", None))
+            ry = _finite_float(getattr(pt, "raw_y", None))
+            if rx is not None and ry is not None:
+                display = (rx, ry)
+        if display is None:
+            display = _xy_from_sequence(dr.get("raw_coord"))
+        if display is None:
+            display = _xy_from_sequence(getattr(pt, "raw_coord", None))
+        if display is None:
+            pos = getattr(pt, "pixel_position", None) or getattr(pt, "pos2d", None) or getattr(pt, "position", None)
+            display = _xy_from_sequence(pos)
+
+    snapped: Optional[Tuple[float, float]] = _xy_from_sequence(dr.get("snapped_coord"))
+    if snapped is None and isinstance(pt, dict):
+        snapped = _xy_from_sequence(pt.get("snapped_coord"))
+    if snapped is None and isinstance(pt, dict):
+        sx = _finite_float(pt.get("snapped_x"))
+        sy = _finite_float(pt.get("snapped_y"))
+        if sx is not None and sy is not None:
+            snapped = (sx, sy)
+    if snapped is None and not isinstance(pt, dict):
+        snapped = _xy_from_sequence(getattr(pt, "snapped_coord", None))
+    if snapped is None and not isinstance(pt, dict):
+        sx = _finite_float(getattr(pt, "snapped_x", None))
+        sy = _finite_float(getattr(pt, "snapped_y", None))
+        if sx is not None and sy is not None:
+            snapped = (sx, sy)
+
+    return display, snapped
+
+
+def _log_dashboard_inspection_point_rows(points: List[Dict[str, Any]]) -> None:
+    """控制台：每条 Dashboard inspection_point 的坐标溯源。"""
+    for row in points:
+        print(
+            "[dashboard-inspection-point]",
+            {
+                "point_id": row.get("point_id") or row.get("id"),
+                "x": row.get("x"),
+                "y": row.get("y"),
+                "raw_x": row.get("raw_x"),
+                "raw_y": row.get("raw_y"),
+                "snapped_x": row.get("snapped_x"),
+                "snapped_y": row.get("snapped_y"),
+                "edge_id": row.get("edge_id"),
+            },
+        )
+
+
 def _collect_inspection_points(mission_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     points: List[Dict[str, Any]] = []
-    edge_tasks = mission_result.get("edge_tasks") or []
-    for task in edge_tasks:
-        edge_id = getattr(task, "edge_id", None)
+    mission = mission_result.get("mission")
+    task_by_id = getattr(mission, "task_by_id", None) or {}
+    source_tasks: List[Tuple[str, Any]] = []
+    seen: set = set()
+
+    result_tasks = (
+        mission_result.get("mission_tasks")
+        or mission_result.get("physical_line_chains")
+        or []
+    )
+    result_task_map = {
+        str(getattr(task, "edge_id", None) or getattr(task, "id", "")): task
+        for task in result_tasks
+        if getattr(task, "edge_id", None) or getattr(task, "id", None)
+    }
+
+    for edge_id in getattr(mission, "visit_order", None) or []:
+        eid = str(edge_id).rstrip("+-")
+        task = task_by_id.get(eid) or result_task_map.get(eid)
+        if task is not None and eid not in seen:
+            source_tasks.append((eid, task))
+            seen.add(eid)
+
+    for task_id, task in result_task_map.items():
+        eid = str(task_id)
+        if eid not in seen and getattr(task, "inspection_points", None):
+            source_tasks.append((eid, task))
+            seen.add(eid)
+
+    for task_id, task in task_by_id.items():
+        eid = str(task_id)
+        if eid not in seen and getattr(task, "inspection_points", None):
+            source_tasks.append((eid, task))
+            seen.add(eid)
+
+    # Legacy fallback: old chain-based missions may not populate mission.task_by_id.
+    if not source_tasks:
+        for task in mission_result.get("edge_tasks") or []:
+            edge_id = getattr(task, "edge_id", None)
+            if edge_id is not None:
+                source_tasks.append((str(edge_id), task))
+
+    for edge_id, task in source_tasks:
         for pt in getattr(task, "inspection_points", None) or []:
-            if isinstance(pt, dict):
-                pos = pt.get("pixel_position") or pt.get("position_2d") or pt.get("pos2d")
-            else:
-                pos = getattr(pt, "pixel_position", None) or getattr(pt, "pos2d", None)
-            if not pos or len(pos) < 2:
+            display, snapped = extract_cv_dashboard_xy_and_snapped(pt)
+            if not display:
                 continue
-            points.append({
-                "point_id": pt.get("point_id") if isinstance(pt, dict) else getattr(pt, "point_id", None),
-                "edge_id": edge_id,
-                "x": float(pos[0]),
-                "y": float(pos[1]),
-                "point_type": pt.get("point_type") if isinstance(pt, dict) else getattr(pt, "point_type", "sample"),
-            })
+            dx, dy = display[0], display[1]
+            if isinstance(pt, dict):
+                pid = pt.get("point_id") or pt.get("id")
+                ptype = pt.get("point_type", "sample")
+                sfb = pt.get("snap_fallback")
+                sdist = pt.get("snap_distance_px")
+            else:
+                pid = getattr(pt, "point_id", None) or getattr(pt, "id", None)
+                ptype = getattr(pt, "point_type", "sample")
+                sfb = getattr(pt, "snap_fallback", None)
+                dr = getattr(pt, "detection_result", None) or {}
+                if sfb is None and isinstance(dr, dict):
+                    sfb = dr.get("snap_fallback")
+                sdist = getattr(pt, "snap_distance_px", None)
+                if sdist is None and isinstance(dr, dict):
+                    sdist = dr.get("snap_distance_px", dr.get("snap_distance"))
+            row: Dict[str, Any] = {
+                "point_id": pid,
+                "id": pid,
+                "edge_id": (
+                    edge_id
+                    if str(edge_id).startswith("PL_")
+                    else _nearest_inspect_segment_edge_id(float(dx), float(dy), mission) or edge_id
+                ),
+                "x": float(dx),
+                "y": float(dy),
+                "raw_x": float(dx),
+                "raw_y": float(dy),
+                "point_type": ptype,
+            }
+            if snapped is not None:
+                row["snapped_x"] = float(snapped[0])
+                row["snapped_y"] = float(snapped[1])
+                row["snapped_coord"] = [float(snapped[0]), float(snapped[1])]
+            if sfb is not None:
+                row["snap_fallback"] = bool(sfb)
+            if sdist is not None:
+                try:
+                    row["snap_distance_px"] = float(sdist)
+                except (TypeError, ValueError):
+                    pass
+            points.append(row)
     return points
 
 
@@ -316,23 +606,53 @@ def enrich_inspection_points_for_dashboard(
     image_catalog: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     """扩展 Dashboard 巡检点字段（含 segment_id、priority、image_url 等）。"""
+    _ = image_catalog  # 保留签名兼容；图片键统一为 IP_nnnn + /api/inspection-image/
+    img_dir = (root / INSPECTION_IMAGE_REL_DIR) if root else None
     edge_map = _edge_to_segment_map(segments)
     placeholders = [
         "/static/inspection_placeholder.svg",
         "/static/inspection_placeholder_1.svg",
         "/static/inspection_placeholder_2.svg",
     ]
-    catalog = image_catalog or []
 
     enriched: List[Dict[str, Any]] = []
+    meta_exclude = {
+        "x",
+        "y",
+        "point_id",
+        "id",
+        "edge_id",
+        "segment_id",
+        "point_type",
+        "priority",
+        "image_path",
+        "image_url",
+        "image_placeholder",
+        "image_available",
+        "description",
+        "status",
+        "metadata",
+        "raw_x",
+        "raw_y",
+        "snapped_x",
+        "snapped_y",
+        "raw_coord",
+        "snapped_coord",
+    }
     for i, pt in enumerate(points):
         eid = pt.get("edge_id")
         sid = pt.get("segment_id") or (edge_map.get(eid) if eid else None)
-        image_url = _resolve_inspection_image_url(pt, i, root)
-        image_path = pt.get("image_path")
-        if not image_url and i < len(catalog):
-            image_url = catalog[i]["image_url"]
-            image_path = catalog[i]["image_path"]
+        normalized_pid = _normalize_dashboard_inspection_point_id(pt, i)
+        ip_file = f"{normalized_pid}.jpg"
+        rel_path = (INSPECTION_IMAGE_REL_DIR / ip_file).as_posix()
+        image_url = f"/api/inspection-image/{ip_file}"
+        image_path = rel_path
+        file_exists = bool(img_dir and (img_dir / ip_file).is_file())
+        image_available = file_exists
+        print(
+            "[inspection-image-map] "
+            f"point_id={normalized_pid} image_url={image_url} exists={file_exists}"
+        )
 
         status = pt.get("status") or "pending"
         priority = pt.get("priority") or (
@@ -340,43 +660,48 @@ def enrich_inspection_points_for_dashboard(
         )
         description = pt.get("description") or pt.get("source_reason") or ""
 
+        x = float(pt["x"])
+        y = float(pt["y"])
+        rx = _finite_float(pt.get("raw_x"))
+        ry = _finite_float(pt.get("raw_y"))
+        if rx is None or ry is None:
+            rx, ry = x, y
+        sx = _finite_float(pt.get("snapped_x"))
+        sy = _finite_float(pt.get("snapped_y"))
+        sc = pt.get("snapped_coord")
+        if sx is None and isinstance(sc, (list, tuple)) and len(sc) >= 2:
+            sx = _finite_float(sc[0])
+            sy = _finite_float(sc[1])
+
+        meta_inner: Dict[str, Any] = {
+            k: v
+            for k, v in pt.items()
+            if k not in meta_exclude
+        }
+        if sx is not None and sy is not None:
+            meta_inner.setdefault("snapped_coord", [float(sx), float(sy)])
+
         enriched.append({
-            "id": pt.get("id") or pt.get("point_id") or f"ip_{i:04d}",
-            "point_id": pt.get("point_id") or pt.get("id") or f"ip_{i:04d}",
-            "x": pt["x"],
-            "y": pt["y"],
+            "id": normalized_pid,
+            "point_id": normalized_pid,
+            "x": x,
+            "y": y,
+            "raw_x": float(rx),
+            "raw_y": float(ry),
+            "snapped_x": float(sx) if sx is not None else None,
+            "snapped_y": float(sy) if sy is not None else None,
             "segment_id": sid,
             "edge_id": eid,
             "point_type": pt.get("point_type") or "sample",
             "priority": priority,
             "image_path": image_path,
             "image_url": image_url,
-            "image_available": bool(image_url),
+            "image_available": image_available,
             "image_placeholder": placeholders[i % len(placeholders)],
             "description": description,
             "status": status,
             "progress_index": i + 1,
-            "metadata": {
-                k: v
-                for k, v in pt.items()
-                if k
-                not in (
-                    "x",
-                    "y",
-                    "point_id",
-                    "id",
-                    "edge_id",
-                    "segment_id",
-                    "point_type",
-                    "priority",
-                    "image_path",
-                    "image_url",
-                    "image_placeholder",
-                    "description",
-                    "status",
-                    "metadata",
-                )
-            },
+            "metadata": meta_inner,
         })
     return enriched
 
@@ -397,29 +722,21 @@ def _inspection_points_from_json(
         or meta.get("dataset_type") == "real_satellite"
     )
     for pt in data.get("inspection_points", []):
-        pos = None
-        if pixel_mode:
-            det = pt.get("detection_result") or {}
-            raw = det.get("raw_coord")
-            if raw and len(raw) >= 2:
-                pos = raw
-        if not pos:
-            pos = (
-                pt.get("pixel_position")
-                or pt.get("position_2d")
-                or pt.get("position")
-            )
-        if not pos and pt.get("x") is not None and pt.get("y") is not None:
-            pos = [pt["x"], pt["y"]]
-        if not pos or len(pos) < 2:
+        if not isinstance(pt, dict):
             continue
-        raw_points.append({
+        display, snapped = extract_cv_dashboard_xy_and_snapped(pt)
+        if not display:
+            continue
+        dr = pt.get("detection_result") or {}
+        entry: Dict[str, Any] = {
             "point_id": pt.get("point_id"),
             "id": pt.get("point_id"),
             "edge_id": pt.get("edge_id"),
             "segment_id": pt.get("segment_id"),
-            "x": float(pos[0]),
-            "y": float(pos[1]),
+            "x": float(display[0]),
+            "y": float(display[1]),
+            "raw_x": float(display[0]),
+            "raw_y": float(display[1]),
             "point_type": pt.get("point_type") or pt.get("type") or "sample",
             "priority": pt.get("priority"),
             "image_path": pt.get("image_path"),
@@ -431,10 +748,63 @@ def _inspection_points_from_json(
             "line_id": pt.get("line_id"),
             "visit_order": pt.get("visit_order"),
             "source_reason": pt.get("source_reason"),
-            "raw_coord": (pt.get("detection_result") or {}).get("raw_coord"),
-            "snapped_coord": (pt.get("detection_result") or {}).get("snapped_coord") or list(pos),
+            "raw_coord": dr.get("raw_coord") or list(display),
             "detection_valid": True,
-        })
+        }
+        if snapped is not None:
+            entry["snapped_x"] = float(snapped[0])
+            entry["snapped_y"] = float(snapped[1])
+            entry["snapped_coord"] = [float(snapped[0]), float(snapped[1])]
+        else:
+            sc = dr.get("snapped_coord")
+            if isinstance(sc, (list, tuple)) and len(sc) >= 2:
+                entry["snapped_x"] = float(sc[0])
+                entry["snapped_y"] = float(sc[1])
+                entry["snapped_coord"] = [float(sc[0]), float(sc[1])]
+        raw_points.append(entry)
+    # 图像任务：部分导出版本仅有 metadata.image_inspection_overlay，无顶层 inspection_points
+    if pixel_mode and not raw_points:
+        overlay = meta.get("image_inspection_overlay") or data.get("image_inspection_overlay") or []
+        for ov in overlay:
+            if not isinstance(ov, dict):
+                continue
+            display, snapped = extract_cv_dashboard_xy_and_snapped(ov)
+            if not display:
+                rc = ov.get("raw_coord")
+                if not rc or len(rc) < 2:
+                    continue
+                display = (float(rc[0]), float(rc[1]))
+                snapped = _xy_from_sequence(ov.get("snapped_coord"))
+            raw_points.append({
+                "point_id": ov.get("id"),
+                "id": ov.get("id"),
+                "edge_id": ov.get("edge_id"),
+                "segment_id": ov.get("segment_id"),
+                "x": float(display[0]),
+                "y": float(display[1]),
+                "raw_x": float(display[0]),
+                "raw_y": float(display[1]),
+                "point_type": "image_detected",
+                "priority": "high",
+                "description": ov.get("source"),
+                "status": "uninspected",
+                "line_id": ov.get("line_id"),
+                "source_reason": "image_inspection_overlay",
+                "raw_coord": list(ov.get("raw_coord") or display),
+                "detection_valid": bool(ov.get("valid", True)),
+                "snap_fallback": not bool(ov.get("valid", True)),
+                "snap_distance_px": ov.get("snap_distance"),
+            })
+            if snapped is not None:
+                raw_points[-1]["snapped_x"] = float(snapped[0])
+                raw_points[-1]["snapped_y"] = float(snapped[1])
+                raw_points[-1]["snapped_coord"] = [float(snapped[0]), float(snapped[1])]
+            elif ov.get("snapped_coord"):
+                sc = ov["snapped_coord"]
+                if isinstance(sc, (list, tuple)) and len(sc) >= 2:
+                    raw_points[-1]["snapped_x"] = float(sc[0])
+                    raw_points[-1]["snapped_y"] = float(sc[1])
+                    raw_points[-1]["snapped_coord"] = [float(sc[0]), float(sc[1])]
     return enrich_inspection_points_for_dashboard(
         raw_points, segments, root=root, image_catalog=image_catalog
     )
@@ -456,6 +826,7 @@ def _statistics_from_json(data: Dict[str, Any], inspection_points: List[Dict[str
     visit = data.get("visit_order", {})
     visit_order = visit.get("edge_visit_order", []) if isinstance(visit, dict) else (visit or [])
 
+    nip = len(inspection_points)
     return {
         "total_length": round(total, 2),
         "inspect_length": round(inspect_len, 2),
@@ -463,12 +834,26 @@ def _statistics_from_json(data: Dict[str, Any], inspection_points: List[Dict[str
         "connect_ratio": round(connect_ratio, 4),
         "inspect_ratio": round(inspect_ratio, 4),
         "num_segments": stats_raw.get("num_segments", 0),
-        "num_inspection_points": stats_raw.get(
-            "num_inspection_points", len(inspection_points)
-        ),
+        "num_inspection_points": nip,
+        "inspection_points_count": nip,
+        "dashboard_inspection_points": nip,
         "num_groups": stats_raw.get("num_groups", 0),
         "num_edges": stats_raw.get("num_edges", len(visit_order)),
     }
+
+
+def _point_flow_log_dashboard(dashboard: Dict[str, Any], mission_data: Optional[Dict[str, Any]] = None) -> None:
+    """控制台：CV 与 Dashboard 巡检点数量对齐检查。"""
+    meta = dashboard.get("metadata") or {}
+    if mission_data and isinstance(mission_data.get("metadata"), dict):
+        meta = {**meta, **mission_data["metadata"]}
+    idst = meta.get("image_detection_stats") or {}
+    cv_am = idst.get("after_merge", idst.get("merged_points", idst.get("green_point_count")))
+    n_ip = len(dashboard.get("inspection_points") or [])
+    print(
+        f"[point-flow] cv_after_merge={cv_am} dashboard_inspection_points={n_ip} "
+        f"(detector={idst.get('detector', '—')})"
+    )
 
 
 def build_dashboard_from_mission_json(
@@ -487,7 +872,7 @@ def build_dashboard_from_mission_json(
 ) -> Dict[str, Any]:
     """从已导出的 mission_output.json 构建 Dashboard 结构。"""
     segments = _segments_from_json(data)
-    image_catalog = _scan_inspection_image_catalog(root) if pipeline == "image" else []
+    image_catalog = _scan_inspection_image_catalog(root) if root else []
     inspection_points = _inspection_points_from_json(
         data,
         segments,
@@ -575,6 +960,12 @@ def build_dashboard_from_mission_json(
             "height": map_background.get("height"),
         }
 
+    _img_stats = _inspection_image_stats_dict(inspection_points, root)
+    metadata["inspection_image_stats"] = _img_stats
+    _log_inspection_image_stats_console(_img_stats)
+
+    _point_flow_log_dashboard(payload, data)
+    _log_dashboard_inspection_point_rows(inspection_points)
     return payload
 
 
@@ -663,6 +1054,7 @@ def build_dashboard_payload(
     )
     markers = _start_end_from_segments(segments)
 
+    nip = len(inspection_points)
     statistics = {
         "total_length": stats["total_length"],
         "inspect_length": stats["inspect_length"],
@@ -670,12 +1062,26 @@ def build_dashboard_payload(
         "connect_ratio": stats["connect_ratio"],
         "inspect_ratio": stats["inspect_ratio"],
         "num_segments": stats["num_segments"],
-        "num_inspection_points": len(inspection_points),
+        "num_inspection_points": nip,
         "num_groups": stats["num_groups"],
         "num_edges": stats["num_edges"],
         "num_inspect_segments": stats["num_inspect_segments"],
         "num_connect_segments": stats["num_connect_segments"],
     }
+    _count_keys = ("num_inspection_points", "inspection_points_count", "dashboard_inspection_points")
+    for _src in (
+        mission_result.get("statistics") if isinstance(mission_result.get("statistics"), dict) else None,
+        getattr(mission, "statistics", None),
+    ):
+        if not isinstance(_src, dict):
+            continue
+        for _k, _v in _src.items():
+            if _k in _count_keys:
+                continue
+            statistics.setdefault(_k, _v)
+    statistics["num_inspection_points"] = nip
+    statistics["inspection_points_count"] = nip
+    statistics["dashboard_inspection_points"] = nip
 
     metadata: Dict[str, Any] = {
         "pipeline": "unified",
@@ -696,10 +1102,14 @@ def build_dashboard_payload(
     if extra_metadata:
         metadata.update(extra_metadata)
 
+    _img_stats = _inspection_image_stats_dict(inspection_points, root)
+    metadata["inspection_image_stats"] = _img_stats
+    _log_inspection_image_stats_console(_img_stats)
+
     effective_map_mode = "topology_only" if map_mode != "image_overlay" else "topology_only"
     # Unified 永不使用 test.png 底图（避免 T 型 toy 叠加到真实地图）
 
-    return {
+    payload: Dict[str, Any] = {
         "segments": segments,
         "inspection_points": inspection_points,
         "statistics": statistics,
@@ -712,6 +1122,10 @@ def build_dashboard_payload(
         "map_mode": effective_map_mode,
         "bounds": compute_geometry_bounds(segments, inspection_points),
     }
+    payload["inspection_points"] = inspection_points
+    _point_flow_log_dashboard(payload, mission_result if isinstance(mission_result, dict) else None)
+    _log_dashboard_inspection_point_rows(inspection_points)
+    return payload
 
 
 def apply_custom_markers(
