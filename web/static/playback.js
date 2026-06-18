@@ -280,137 +280,6 @@
     );
   }
 
-  window.buildInspectionPlaybackTimeline = function (result, dwellMs) {
-    const timeline = [];
-    const segments = result?.segments || [];
-    const allPoints = result?.inspection_points || [];
-    const start = getMissionStart(result);
-    const end = getMissionEnd(result);
-    let currentPos = start;
-    let inspectSeq = 0;
-    let reversedSegments = 0;
-    let gapConnects = 0;
-
-    if (start) {
-      timeline.push({
-        type: "move",
-        x: start.x,
-        y: start.y,
-        segment_id: "start",
-        segment_type: "start",
-      });
-    }
-
-    segments.forEach((seg, idx) => {
-      let points = getSegmentPolyline(seg);
-      if (points.length < 2) return;
-
-      const oriented = reverseIfNeeded(points, currentPos);
-      points = oriented.points;
-      if (oriented.reversed) reversedSegments += 1;
-
-      if (currentPos && dist(currentPos, points[0]) > CONTINUITY_EPS) {
-        const gap = buildMoveFrames(
-          [currentPos, points[0]],
-          MOVE_STEP_PX,
-          `${seg.segment_id || `seg_${idx}`}_gap`,
-          "connect_gap"
-        );
-        if (gap.length > 0) {
-          timeline.push(...gap);
-          gapConnects += 1;
-        }
-      }
-
-      const segId = seg.segment_id || `seg_${idx}`;
-      const segType = seg.type || "inspect";
-      const frames = buildMoveFrames(points, MOVE_STEP_PX, segId, segType);
-      if (!frames.length) return;
-
-      if (segType === "inspect") {
-        const segPoints = sortPointsAlongPolyline(
-          pointsForSegment(allPoints, seg),
-          points
-        ).map((pt) => ({
-          point: pt,
-          proj: projectOnPolyline(pt, points),
-          triggered: false,
-        }));
-
-        let pIdx = 0;
-        frames.forEach((frame) => {
-          timeline.push(frame);
-          while (pIdx < segPoints.length) {
-            const it = segPoints[pIdx];
-            const dd = dist(frame, it.point);
-            if (dd <= POINT_TRIGGER_DIST || frame.d >= it.proj) {
-              inspectSeq += 1;
-              timeline.push({
-                type: "inspect",
-                point: it.point,
-                dwell_ms: dwellMs,
-                inspect_index: inspectSeq,
-                segment_id: segId,
-                edge_id:
-                  seg.edge_id != null ? String(seg.edge_id).replace(/[+-]$/, "") : "",
-              });
-              it.triggered = true;
-              pIdx += 1;
-              continue;
-            }
-            break;
-          }
-        });
-      } else {
-        timeline.push(...frames);
-      }
-
-      currentPos = { x: frames[frames.length - 1].x, y: frames[frames.length - 1].y };
-    });
-
-    if (end) {
-      const needEndConnect = !currentPos || dist(currentPos, end) > CONTINUITY_EPS;
-      if (needEndConnect) {
-        const from = currentPos || start || end;
-        const endFrames = buildMoveFrames(
-          [from, end],
-          MOVE_STEP_PX,
-          "to_end",
-          "connect_end"
-        );
-        if (endFrames.length) {
-          timeline.push(...endFrames);
-          currentPos = { x: end.x, y: end.y };
-        }
-      } else if (currentPos) {
-        timeline.push({
-          type: "move",
-          x: end.x,
-          y: end.y,
-          segment_id: "end",
-          segment_type: "end",
-        });
-        currentPos = { x: end.x, y: end.y };
-      }
-    }
-
-    const firstMove = timeline.find((e) => e.type === "move");
-    const lastMove = [...timeline].reverse().find((e) => e.type === "move");
-    const debug = {
-      frame_count: timeline.length,
-      first_point: firstMove ? [firstMove.x, firstMove.y] : null,
-      last_point: lastMove ? [lastMove.x, lastMove.y] : null,
-      inserted_gap_connects: gapConnects,
-      reversed_segments: reversedSegments,
-      inspect_events: inspectSeq,
-    };
-    PLAYBACK.debug = debug;
-    window.__playbackDebug = debug;
-    console.log("[playback timeline]", debug);
-
-    return timeline;
-  };
-
   function getDwellMs() {
     const sel = $("dwellTimeSelect");
     if (sel) return parseFloat(sel.value) * 1000;
@@ -685,30 +554,6 @@
     });
   }
 
-  function freezeStreamAtPoint(point) {
-    PLAYBACK.streamFrozen = true;
-    stopStreamLoop();
-    if (!ENABLE_INSPECTION_IMAGE) return;
-    const u =
-      typeof point?.image_url === "string" && point.image_url.trim()
-        ? point.image_url.trim()
-        : null;
-    PLAYBACK.streamCurrentUrl =
-      u ||
-      (typeof point?.image_path === "string" && point.image_path.trim()
-        ? point.image_path.trim()
-        : null) ||
-      PLAYBACK.streamCurrentUrl ||
-      STREAM_FALLBACKS[0];
-  }
-
-  function nextInspectOffset(fromIndex) {
-    for (let i = fromIndex; i < PLAYBACK.timeline.length; i += 1) {
-      if (PLAYBACK.timeline[i]?.type === "inspect") return i - fromIndex;
-    }
-    return -1;
-  }
-
   function clearInspectCard() {
     clearPhaseTimers();
     if (!ENABLE_INSPECTION_IMAGE) {
@@ -844,50 +689,6 @@
       document.querySelector("#playbackConsole .console-body") ||
       null
     );
-  }
-
-  /**
-   * 地图点选：仅用 payload 的 image_url 更新巡检快照 #inspectCardImg（与播放流 inspectStreamImg 分离）。
-   * 不移动/重建整块布局，避免撑宽右侧栏。
-   */
-  function forceDashboardInspectionImagePanel(point) {
-    if (!ENABLE_INSPECTION_IMAGE) return;
-    const pointIdStr = String(point?.point_id || point?.id || "").trim() || "—";
-    const url =
-      typeof point?.image_url === "string" && point.image_url.trim()
-        ? point.image_url.trim()
-        : null;
-
-    ensureInspectCardVisible();
-    ensureInspectDualSlotsMounted("");
-
-    const img = $("inspectCardImg");
-    const cap = $("inspectCardCaption");
-    if (!img || !cap) return;
-
-    if (!url) {
-      cap.textContent = "暂无巡检图片";
-      cap.classList.add("inspect-live-placeholder--show");
-      img.onerror = null;
-      img.removeAttribute("src");
-      img.style.display = "none";
-      return;
-    }
-
-    cap.classList.remove("inspect-live-placeholder--show");
-    cap.textContent = "加载中…";
-    img.classList.add("inspect-snapshot-img");
-    img.style.display = "block";
-    img.onload = () => {
-      cap.textContent = pointIdStr !== "—" ? pointIdStr : "巡检图像";
-    };
-    img.onerror = () => {
-      cap.textContent = "暂无巡检图片";
-      img.onerror = null;
-      img.removeAttribute("src");
-      img.style.display = "none";
-    };
-    img.src = url;
   }
 
   function insertAfter(parent, node, ref) {
@@ -1310,10 +1111,6 @@
 
   window.appendPlaybackTraces = function (traces) {
     return traces.concat(buildPlaybackTraces());
-  };
-
-  window.registerPlaybackTraceIndices = function () {
-    /* 改为按 name 动态查找，无需预注册 */
   };
 
   window.getPlaybackVisualState = function () {

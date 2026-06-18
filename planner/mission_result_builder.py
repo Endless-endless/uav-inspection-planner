@@ -555,26 +555,6 @@ def _edge_to_segment_map(segments: List[Dict[str, Any]]) -> Dict[str, str]:
     return mapping
 
 
-def _resolve_inspection_image_url(
-    pt: Dict[str, Any],
-    index: int,
-    root: Optional[Path] = None,
-) -> Optional[str]:
-    """解析巡检点图片 URL；无图时返回 None（前端用占位图）。"""
-    ref = pt.get("image_url") or pt.get("image_path") or pt.get("image_ref")
-    if not ref or not isinstance(ref, str):
-        return None
-    ref = ref.strip()
-    if ref.startswith(("http://", "https://", "/")):
-        return ref
-    if root is not None:
-        candidate = root / ref
-        if candidate.is_file():
-            rel = candidate.relative_to(root).as_posix()
-            return f"/api/inspection-file?path={rel}"
-    return None
-
-
 def _scan_inspection_image_catalog(root: Optional[Path]) -> List[Dict[str, str]]:
     """扫描 figures/inspection_images 下可用图片，按文件名排序。"""
     if root is None:
