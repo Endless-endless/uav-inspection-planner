@@ -134,7 +134,7 @@ class PowerlinePlannerV3:
         self.independent_lines = []  # List[IndependentLine]
         self.line_inspection_points = []  # List[LineInspectionPoint]
         self.line_inspection_points_by_line = {}  # Dict[line_id, List[LineInspectionPoint]]
-        self.inspection_point_source = "spacing"  # spacing | image
+        self.inspection_point_source = "spacing"  # spacing | image | manual
         self.image_inspection_detections = []
         self.image_inspection_overlay = []
         self.clean_map_path = None
@@ -169,7 +169,9 @@ class PowerlinePlannerV3:
         self.topo_nodes = []        # List[TopoNode], 拓扑节点
         self.topo_edges = []        # List[TopoEdge], 拓扑边
         self.topo_graph = None      # TopoGraph, 拓扑图
-        self.edge_tasks = []        # List[EdgeTask], 边任务
+        self.edge_tasks = []        # List[EdgeTask], 边任务（Chain 粒度，保留）
+        self.task_granularity = "physical_line"  # "chain" | "physical_line" — Mission 优化粒度
+        self.physical_line_chains = []  # List[PhysicalLineChain]，task_granularity=physical_line 时填充
         self.edge_ord = []          # List[str], 优化后的边任务顺序
         self.edge_dir = {}          # Dict[str, int], 边任务方向映射
         self.topo_path_3d = []      # List[Tuple], 拓扑规划3D路径
@@ -188,6 +190,29 @@ class PowerlinePlannerV3:
         print(f"  图片尺寸: {self.width}x{self.height}")
 
         self.img_array = np.array(self.image).astype(np.float32) / 255.0
+
+        try:
+            from core.real_map_cv import extract_real_map_red_mask, is_real_map_detection_image
+
+            if is_real_map_detection_image(self.image_path):
+                rgb_u8 = np.array(self.image.convert("RGB"))
+                self.mask = extract_real_map_red_mask(rgb_u8)
+                pixel_count = int(np.sum(self.mask > 0))
+                print(f"  [真实地图] 高饱和红线像素: {pixel_count}")
+                os.makedirs("result", exist_ok=True)
+                os.makedirs("result/debug", exist_ok=True)
+                mask_img = Image.fromarray(self.mask)
+                mask_img.save("result/step1_hsv_mask.png")
+                try:
+                    from core.real_map_cv import is_real_map_detection_image, save_chengdu_red_mask
+
+                    if is_real_map_detection_image(self.image_path):
+                        save_chengdu_red_mask(self.mask)
+                except Exception:
+                    pass
+                return self.mask
+        except ImportError:
+            pass
 
         # HSV转换（降级处理）
         if rgb2hsv is not None:
@@ -225,6 +250,18 @@ class PowerlinePlannerV3:
 
         if self.mask is None:
             self.step1_extract_redline_hsv()
+
+        try:
+            from core.real_map_cv import is_real_map_detection_image
+
+            if is_real_map_detection_image(self.image_path):
+                pixel_count = int(np.sum(self.mask > 0))
+                print(f"  [真实地图] 红线已在 step1 完成 close+dilate，像素: {pixel_count}")
+                mask_img = Image.fromarray(self.mask)
+                mask_img.save("result/step2_fixed_mask.png")
+                return self.mask
+        except ImportError:
+            pass
 
         # 膨胀连接断裂（降级处理）
         if dilation is not None:
@@ -2287,6 +2324,19 @@ class PowerlinePlannerV3:
             sort_polylines=True
         )
 
+        try:
+            from core.real_map_cv import (
+                filter_independent_lines_for_real_map,
+                is_real_map_detection_image,
+            )
+
+            if is_real_map_detection_image(self.image_path):
+                self.independent_lines = filter_independent_lines_for_real_map(
+                    self.independent_lines
+                )
+        except ImportError:
+            pass
+
         # 设置主线路ID（最长线路）
         if self.independent_lines:
             self.primary_line_id = self.independent_lines[0].id
@@ -2384,38 +2434,78 @@ class PowerlinePlannerV3:
 
         return self.line_inspection_points
 
+    def load_real_satellite_manual_annotations(self, manual_json_path: str):
+        """从手工标注 JSON 加载线路与巡检点（跳过 CV 检测）。"""
+        from core.real_satellite_manual import apply_manual_dataset_to_planner
+
+        return apply_manual_dataset_to_planner(self, manual_json_path)
+
     def step5_detect_image_inspection_points(self, detector_config=None):
-        """Detect hollow black-ring inspection points from the input image."""
+        """Detect inspection points from the input image (green circles on real map)."""
         print("[STEP 5] 检测图像巡检点...")
         from core.inspection_point_detector import (
-            DEFAULT_DETECTOR_CONFIG,
             detect_black_inspection_points_with_stats,
             generate_clean_map,
+            resolve_detector_config,
         )
 
-        cfg = detector_config or DEFAULT_DETECTOR_CONFIG
+        cfg = resolve_detector_config(self.image_path, detector_config)
         self.inspection_detector_config = cfg
+        red_mask = self.mask if getattr(self, "mask", None) is not None else None
         self.image_inspection_detections, self.image_detection_stats = (
-            detect_black_inspection_points_with_stats(self.image_path, config=cfg)
+            detect_black_inspection_points_with_stats(
+                self.image_path, config=cfg, red_mask=red_mask
+            )
         )
+        try:
+            from core.real_map_cv import (
+                extract_real_map_green_mask,
+                is_real_map_detection_image,
+                save_green_mask,
+            )
+
+            if is_real_map_detection_image(self.image_path):
+                rgb_u8 = np.array(self.image.convert("RGB"))
+                green_mask = extract_real_map_green_mask(rgb_u8, red_mask=red_mask)
+                save_green_mask(green_mask)
+        except Exception as exc:
+            print(f"[WARN] 真实地图绿色点 mask 调试输出失败: {exc}")
         print("[巡检点检测] 统计:")
+        print(f"  - detector: {self.image_detection_stats.get('detector', 'legacy')}")
         print(f"  - raw contour candidates: {self.image_detection_stats.get('contour_candidates', 0)}")
-        print(f"  - hough candidates: {self.image_detection_stats.get('hough_candidates', 0)}")
         print(f"  - merged inspection points: {self.image_detection_stats.get('merged_points', 0)}")
         try:
-            self.clean_map_path = generate_clean_map(
-                self.image_path,
-                detections=self.image_inspection_detections,
-                config=cfg,
-            )
-            print(f"[图像底图] 已生成无黑圈底图: {self.clean_map_path}")
-        except Exception as exc:
-            self.clean_map_path = None
-            print(f"[WARN] clean map 生成失败: {exc}")
+            from core.real_map_cv import is_real_map_detection_image
+
+            real_map_same_image = is_real_map_detection_image(self.image_path)
+        except ImportError:
+            real_map_same_image = False
+
+        if real_map_same_image:
+            self.clean_map_path = str(self.image_path).replace("\\", "/")
+            print(f"[图像底图] 真实地图同源标注图: {self.clean_map_path}")
+        elif os.environ.get("UAV_DISPLAY_MAP", "").strip() and os.path.isfile(
+            os.environ.get("UAV_DISPLAY_MAP", "").strip()
+        ):
+            display_map = os.environ.get("UAV_DISPLAY_MAP", "").strip()
+            self.clean_map_path = display_map.replace("\\", "/")
+            print(f"[图像底图] 使用固定显示底图: {self.clean_map_path}")
+        else:
+            try:
+                self.clean_map_path = generate_clean_map(
+                    self.image_path,
+                    detections=self.image_inspection_detections,
+                    config=cfg,
+                )
+                print(f"[图像底图] 已生成无黑圈底图: {self.clean_map_path}")
+            except Exception as exc:
+                self.clean_map_path = None
+                print(f"[WARN] clean map 生成失败: {exc}")
         self.inspection_point_source = "image"
         self.line_inspection_points = []
         self.line_inspection_points_by_line = {}
-        print(f"[图像巡检点] 检测到 {len(self.image_inspection_detections)} 个黑色空心圆")
+        label = "绿色巡检圆" if self.image_detection_stats.get("detector") == "green_hsv" else "图像特征点"
+        print(f"[图像巡检点] 检测到 {len(self.image_inspection_detections)} 个{label}")
         return self.image_inspection_detections
 
     def step5_finalize_image_inspection_points(self, max_snap_distance: float = None):
@@ -2435,7 +2525,8 @@ class PowerlinePlannerV3:
         from core.inspection_point_detector import DEFAULT_DETECTOR_CONFIG
 
         cfg = self.inspection_detector_config or DEFAULT_DETECTOR_CONFIG
-        snap_threshold = float(max_snap_distance if max_snap_distance is not None else cfg.snap_threshold)
+        default_snap = 120.0 if getattr(cfg, "real_map_mode", False) else cfg.snap_threshold
+        snap_threshold = float(max_snap_distance if max_snap_distance is not None else default_snap)
         terrain = self.height_map_smooth if hasattr(self, "height_map_smooth") else None
         (
             self.line_inspection_points,
@@ -2463,6 +2554,35 @@ class PowerlinePlannerV3:
             self.image_path,
             "result/step5_line_inspection_points.png",
         )
+        try:
+            from core.real_map_cv import (
+                extract_real_map_green_mask,
+                extract_real_map_red_mask,
+                is_real_map_detection_image,
+                save_real_map_detection_debug,
+            )
+
+            if is_real_map_detection_image(self.image_path):
+                rgb_u8 = np.array(self.image.convert("RGB"))
+                red_mask = self.mask if getattr(self, "mask", None) is not None else None
+                if red_mask is None:
+                    red_mask = extract_real_map_red_mask(rgb_u8)
+                green_mask = extract_real_map_green_mask(rgb_u8, red_mask=red_mask)
+                polylines = [
+                    list(getattr(line, "ordered_pixels", None) or getattr(line, "polyline", []) or [])
+                    for line in (self.independent_lines or [])
+                ]
+                save_real_map_detection_debug(
+                    self.image_path,
+                    red_mask,
+                    green_mask,
+                    self.image_inspection_detections,
+                    polylines=polylines,
+                    line_count=len(self.independent_lines or []),
+                    stats=self.image_detection_stats,
+                )
+        except Exception as exc:
+            print(f"[WARN] 真实地图调试输出失败: {exc}")
         return self.line_inspection_points
 
     def _map_existing_points_to_3d(self):
@@ -2648,76 +2768,6 @@ class PowerlinePlannerV3:
 
         return self.g_path_2d, self.g_path_3d
 
-    def step10_prepare_vis(self):
-        """
-        STEP 10: 准备可视化数据
-
-        将阶段2结果转换为可视化系统可接受的格式。
-        """
-        print("[STEP 10] 准备可视化数据...")
-
-        if not self.g_path_3d:
-            print("[WARN] 尚未构建全局路径，请先调用 step9_build_g_path()")
-            return
-
-        from core.vis_adapter import adapt_stage2_to_vis
-
-        self.vis_pts, self.vis_tasks, self.vis_stats, self.anim_path_3d = \
-            adapt_stage2_to_vis(self)
-
-        print(f"  [可视化] 巡检点: {len(self.vis_pts)}")
-        print(f"  [可视化] 任务段: {len(self.vis_tasks)}")
-        print(f"  [可视化] 动画路径: {len(self.anim_path_3d)} 点")
-
-        return self.vis_pts, self.vis_tasks, self.vis_stats, self.anim_path_3d
-
-    def step11_export_stage2_demo(self, output_html="result/mission_stage2_demo.html"):
-        """
-        STEP 11: 导出Stage2 HTML演示
-
-        生成阶段2任务优化的3D交互式HTML演示文件。
-
-        Args:
-            output_html: 输出HTML文件路径
-        """
-        print("[STEP 11] 导出Stage2 HTML演示...")
-
-        if not self.anim_path_3d:
-            print("[WARN] 尚未准备可视化数据，请先调用 step10_prepare_vis()")
-            return
-
-        from core.visualization_enhanced import create_stage2_mission_view
-        import os
-
-        # 确保输出目录存在
-        os.makedirs(os.path.dirname(output_html) or '.', exist_ok=True)
-
-        # 获取地形（使用平滑地形用于显示）
-        terrain = self.height_map_smooth if hasattr(self, 'height_map_smooth') else None
-
-        # 获取图像对象（用于底图显示）
-        image_obj = self.image if hasattr(self, 'image') else None
-
-        # 生成HTML
-        html = create_stage2_mission_view(
-            anim_path_3d=self.anim_path_3d,
-            vis_pts=self.vis_pts,
-            vis_tasks=self.vis_tasks,
-            vis_stats=self.vis_stats,
-            terrain=terrain,
-            image_obj=image_obj,
-            image_path=self.image_path
-        )
-
-        # 保存文件
-        with open(output_html, 'w', encoding='utf-8') as f:
-            f.write(html)
-
-        print(f"  [保存] {output_html}")
-
-        return output_html
-
-
     # =====================================================
     # 拓扑层方法（新增 - Phase 1）
     # =====================================================
@@ -2736,23 +2786,39 @@ class PowerlinePlannerV3:
         - 角度去重窗口: 10px
         - 切分优先级: 端点 > 角度切分 > 长度切分
         - 节点去重: 25px 距离阈值合并重复端点
+        - 跨线 junction: merge_cross_line_junctions（端点吸附 + 端点到邻线投影）
 
         Returns:
             TopoGraph: 拓扑图
         """
         from core.topo import (
-            detect_topo_nodes, merge_duplicate_nodes, update_edges_after_merge,
+            detect_topo_nodes, merge_duplicate_nodes, merge_cross_line_junctions,
+            update_edges_after_merge,
             split_lines_to_edges, build_topo_graph,
             update_node_3d, visualize_topo_graph, compute_topo_stats
         )
 
-        print("[STEP 7.5] 构建拓扑图（保守版本 v1.1 + 节点去重）...")
+        print("[STEP 7.5] 构建拓扑图（保守版本 v1.1 + 节点去重 + 跨线 junction）...")
 
         # 检测拓扑节点
         self.topo_nodes = detect_topo_nodes(self.independent_lines)
 
-        # 合并重复节点（距离相近的端点）
-        self.topo_nodes, old_to_new_id = merge_duplicate_nodes(self.topo_nodes, thresh=25.0)
+        # 合并重复节点（距离相近的端点）；真实地图像素模式跳过，避免 merged_* 锚点拉偏连线
+        from core.image_pixel_coords import use_image_pixel_coords
+
+        if use_image_pixel_coords():
+            old_to_new_id = {node.id: node.id for node in self.topo_nodes}
+            print("  [节点聚类] 真实地图模式：跳过节点合并，保留原图像素锚点")
+        else:
+            self.topo_nodes, old_to_new_id = merge_duplicate_nodes(self.topo_nodes, thresh=25.0)
+
+        # 跨 line_id 端点/投影 junction（独立于 25px 聚类；真实地图模式也执行以恢复图连通）
+        self.topo_nodes, junc_map = merge_cross_line_junctions(
+            self.topo_nodes, self.independent_lines
+        )
+        for k in list(old_to_new_id.keys()):
+            v = old_to_new_id[k]
+            old_to_new_id[k] = junc_map.get(v, v)
 
         # 更新3D坐标
         if self.height_map_smooth is not None:
@@ -3237,7 +3303,11 @@ class PowerlinePlannerV3:
 
         centroids = compute_edge_centroids(self.edge_tasks)
         groups_old = group_edges_spatially(self.edge_tasks, centroids, eps=eps)
-        adjacency_old = build_edge_adjacency_simple(self.topo_graph)
+        from core.topo_global_optimizer import build_merged_edge_task_adjacency
+
+        adjacency_merged = build_merged_edge_task_adjacency(
+            self.edge_tasks, self.topo_graph
+        )
 
         try:
             from sklearn.cluster import DBSCAN
@@ -3249,7 +3319,7 @@ class PowerlinePlannerV3:
             group_visit_order_old = order_groups_greedy(groups_old, {e.edge_id: e for e in self.edge_tasks})
             mission_old = build_grouped_continuous_mission(
                 self.topo_graph, self.edge_tasks, groups_old,
-                group_visit_order_old, adjacency_old
+                group_visit_order_old, adjacency_merged
             )
         else:
             print("  [SKIP] scikit-learn未安装，跳过旧算法")
@@ -3260,72 +3330,108 @@ class PowerlinePlannerV3:
         # =====================================================
         print("\n[方案2] 运行新算法 (全局拓扑优化)...")
 
-        mission_new = plan_global_topology_optimized_mission(
-            topo_graph=self.topo_graph,
-            edge_tasks=self.edge_tasks,
-            start_edge_id=start_edge_id,
-            enable_sa=enable_sa,
-            eps=eps
-        )
+        if getattr(self, "task_granularity", "physical_line") == "physical_line":
+            from core.physical_line_chain import build_physical_line_chains
 
-        # =====================================================
-        # 自动择优：分层比较
-        # =====================================================
-        print("\n[择优] 比较两个方案...")
-
-        if mission_old is None:
-            print("  [决策] 旧算法不可用，使用新算法")
-            final_mission = mission_new
-            winner = "新算法"
+            self.physical_line_chains = build_physical_line_chains(
+                self.edge_tasks, self.topo_graph
+            )
+            mission_new = plan_global_topology_optimized_mission(
+                topo_graph=self.topo_graph,
+                edge_tasks=self.edge_tasks,
+                start_edge_id=start_edge_id,
+                enable_sa=enable_sa,
+                eps=eps,
+                task_granularity="physical_line",
+                mission_edge_tasks=self.physical_line_chains,
+            )
+            print("[physical-chain-build] 验证（step9_4）: PhysicalLineChain 成员链")
+            for pl in self.physical_line_chains:
+                print(f"  {pl.id}: member_chain_ids={pl.chain_ids}")
         else:
-            # 提取关键指标
-            old_connect = mission_old.connect_length
-            new_connect = mission_new.connect_length
-            old_total = mission_old.total_length
-            new_total = mission_new.total_length
-            old_connect_count = sum(1 for s in mission_old.segments if s.type == 'connect')
-            new_connect_count = sum(1 for s in mission_new.segments if s.type == 'connect')
+            self.physical_line_chains = []
+            mission_new = plan_global_topology_optimized_mission(
+                topo_graph=self.topo_graph,
+                edge_tasks=self.edge_tasks,
+                start_edge_id=start_edge_id,
+                enable_sa=enable_sa,
+                eps=eps,
+                task_granularity="chain",
+            )
 
-            print(f"\n  [旧算法] Connect={old_connect:.1f}px ({old_connect_count}段), Total={old_total:.1f}px")
-            print(f"  [新算法] Connect={new_connect:.1f}px ({new_connect_count}段), Total={new_total:.1f}px")
+        # =====================================================
+        # 自动择优 / Mission 粒度决策
+        # =====================================================
+        if getattr(self, "task_granularity", "physical_line") == "physical_line":
+            chain_connect = getattr(mission_old, "connect_length", None) if mission_old is not None else None
+            physical_connect = getattr(mission_new, "connect_length", None) if mission_new is not None else None
+            chain_connect_s = f"{chain_connect:.1f}" if chain_connect is not None else "None"
+            physical_connect_s = f"{physical_connect:.1f}" if physical_connect is not None else "None"
+            print(
+                "[mission-granularity] task_granularity=physical_line "
+                "decision=force_physical_line "
+                f"chain_connect_length={chain_connect_s} "
+                f"physical_connect_length={physical_connect_s} "
+                "chain_kept_for=benchmark_only"
+            )
+            final_mission = mission_new
+            winner = "PhysicalLineChain (force_physical_line)"
+        else:
+            print("\n[择优] 比较两个方案...")
 
-            # 分层比较
-            if abs(new_connect - old_connect) < 1.0:  # connect长度接近（误差<1px）
-                # 二级：比较connect段数
-                if new_connect_count < old_connect_count:
-                    final_mission = mission_new
-                    winner = "新算法 (connect段数更少)"
-                elif new_connect_count > old_connect_count:
-                    final_mission = mission_old
-                    winner = "旧算法 (connect段数更少)"
-                else:
-                    # 三级：比较总长度
-                    if new_total < old_total:
-                        final_mission = mission_new
-                        winner = "新算法 (总长度更短)"
-                    else:
-                        final_mission = mission_old
-                        winner = "旧算法 (总长度更短或持平)"
-            elif new_connect < old_connect:
+            if mission_old is None:
+                print("  [决策] 旧算法不可用，使用新算法")
                 final_mission = mission_new
-                winner = "新算法 (connect更短)"
+                winner = "新算法"
             else:
-                final_mission = mission_old
-                winner = "旧算法 (connect更短或持平)"
+                # 提取关键指标
+                old_connect = mission_old.connect_length
+                new_connect = mission_new.connect_length
+                old_total = mission_old.total_length
+                new_total = mission_new.total_length
+                old_connect_count = sum(1 for s in mission_old.segments if s.type == 'connect')
+                new_connect_count = sum(1 for s in mission_new.segments if s.type == 'connect')
 
-            # 计算改进幅度
-            if winner.startswith("新算法"):
-                conn_improve = (old_connect - new_connect) / old_connect * 100 if old_connect > 0 else 0
-                total_improve = (old_total - new_total) / old_total * 100 if old_total > 0 else 0
-                print(f"\n  [结果] 采用: {winner}")
-                print(f"  [改进] Connect: {conn_improve:+.1f}%, Total: {total_improve:+.1f}%")
-            else:
-                conn_improve = (new_connect - old_connect) / old_connect * 100 if old_connect > 0 else 0
-                total_improve = (new_total - old_total) / old_total * 100 if old_total > 0 else 0
-                print(f"\n  [结果] 采用: {winner}")
-                print(f"  [差异] Connect: {conn_improve:+.1f}%, Total: {total_improve:+.1f}%")
-                if conn_improve > 0:
-                    print(f"  [说明] 新算法未产生改进，保持旧算法")
+                print(f"\n  [旧算法] Connect={old_connect:.1f}px ({old_connect_count}段), Total={old_total:.1f}px")
+                print(f"  [新算法] Connect={new_connect:.1f}px ({new_connect_count}段), Total={new_total:.1f}px")
+
+                # 分层比较
+                if abs(new_connect - old_connect) < 1.0:  # connect长度接近（误差<1px）
+                    # 二级：比较connect段数
+                    if new_connect_count < old_connect_count:
+                        final_mission = mission_new
+                        winner = "新算法 (connect段数更少)"
+                    elif new_connect_count > old_connect_count:
+                        final_mission = mission_old
+                        winner = "旧算法 (connect段数更少)"
+                    else:
+                        # 三级：比较总长度
+                        if new_total < old_total:
+                            final_mission = mission_new
+                            winner = "新算法 (总长度更短)"
+                        else:
+                            final_mission = mission_old
+                            winner = "旧算法 (总长度更短或持平)"
+                elif new_connect < old_connect:
+                    final_mission = mission_new
+                    winner = "新算法 (connect更短)"
+                else:
+                    final_mission = mission_old
+                    winner = "旧算法 (connect更短或持平)"
+
+                # 计算改进幅度
+                if winner.startswith("新算法"):
+                    conn_improve = (old_connect - new_connect) / old_connect * 100 if old_connect > 0 else 0
+                    total_improve = (old_total - new_total) / old_total * 100 if old_total > 0 else 0
+                    print(f"\n  [结果] 采用: {winner}")
+                    print(f"  [改进] Connect: {conn_improve:+.1f}%, Total: {total_improve:+.1f}%")
+                else:
+                    conn_improve = (new_connect - old_connect) / old_connect * 100 if old_connect > 0 else 0
+                    total_improve = (new_total - old_total) / old_total * 100 if old_total > 0 else 0
+                    print(f"\n  [结果] 采用: {winner}")
+                    print(f"  [差异] Connect: {conn_improve:+.1f}%, Total: {total_improve:+.1f}%")
+                    if conn_improve > 0:
+                        print(f"  [说明] 新算法未产生改进，保持旧算法")
 
         # 保存最终结果
         self.grouped_mission = final_mission
@@ -3623,14 +3729,6 @@ def plan_powerline_mission_v2(
     planner.step7_build_tasks()
     planner.step8_opt_mission(start_pos=start_pos, wind=wind)
     planner.step9_build_g_path(start_pos=start_pos)
-
-    # 可选：导出Stage2 HTML演示
-    if export_html:
-        print("\n" + "=" * 70)
-        print("生成Stage2可视化演示...")
-        print("=" * 70)
-        planner.step10_prepare_vis()
-        planner.step11_export_stage2_demo(output_html=html_output_path)
 
     print("\n" + "=" * 70)
     print("任务规划完成！")

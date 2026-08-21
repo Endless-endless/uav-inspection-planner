@@ -18,7 +18,7 @@ Phase 1特点：
 - 为未来真正图算法（如中国邮路）预留接口
 """
 
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 import numpy as np
 from collections import deque
 
@@ -1293,7 +1293,9 @@ def get_edge_geometry_with_direction(edge_task, direction: str = 'forward') -> L
     Returns:
         List[Tuple[float, float]]: 几何路径
     """
-    polyline = edge_task.polyline
+    from core.image_pixel_coords import edge_pixel_polyline
+
+    polyline = edge_pixel_polyline(edge_task)
 
     if direction == 'reverse':
         # 反向：翻转 polyline
@@ -1382,29 +1384,52 @@ def _slice_polyline_by_distance(
     start_s: float,
     end_s: float,
 ) -> List[Tuple[float, float]]:
+    """沿折线弧长子段，保留中间顶点（避免 inspect 几何退化为首尾两点弦）。"""
     total = _polyline_length(polyline)
     if total < 1e-9:
+        return [tuple(polyline[0])] if polyline else []
+    if len(polyline) < 2:
         return [tuple(polyline[0])] if polyline else []
     s0 = max(0.0, min(float(start_s), total))
     s1 = max(0.0, min(float(end_s), total))
     if s1 < s0:
         s0, s1 = s1, s0
-    start_pt = _point_at_polyline_distance(polyline, s0)
-    end_pt = _point_at_polyline_distance(polyline, s1)
-    out: List[Tuple[float, float]] = [start_pt]
+    if s1 - s0 < 1e-4:
+        mid = 0.5 * (s0 + s1)
+        delta = min(8.0, max(3.0, total * 0.02))
+        s0 = max(0.0, mid - delta)
+        s1 = min(total, mid + delta)
+
+    out: List[Tuple[float, float]] = []
     cum = 0.0
     for i in range(len(polyline) - 1):
-        p0 = np.array(polyline[i], dtype=np.float64)
-        p1 = np.array(polyline[i + 1], dtype=np.float64)
-        seg_len = float(np.linalg.norm(p1 - p0))
-        next_cum = cum + seg_len
-        if seg_len >= 1e-9 and cum > s0 + 1e-9 and cum < s1 - 1e-9:
-            out.append((float(p0[0]), float(p0[1])))
-        cum = next_cum
-    if np.linalg.norm(np.array(out[-1]) - np.array(end_pt)) > 1e-6:
-        out.append(end_pt)
-    if len(out) == 1:
-        out.append(end_pt)
+        p_a = np.array(polyline[i], dtype=np.float64)
+        p_b = np.array(polyline[i + 1], dtype=np.float64)
+        seg_len = float(np.linalg.norm(p_b - p_a))
+        if seg_len < 1e-9:
+            continue
+        seg_lo, seg_hi = cum, cum + seg_len
+        lo = max(s0, seg_lo)
+        hi = min(s1, seg_hi)
+        if hi < lo - 1e-9:
+            cum += seg_len
+            continue
+        t_lo = max(0.0, min(1.0, (lo - seg_lo) / seg_len))
+        t_hi = max(0.0, min(1.0, (hi - seg_lo) / seg_len))
+        q_lo = p_a + t_lo * (p_b - p_a)
+        q_hi = p_a + t_hi * (p_b - p_a)
+        if not out:
+            out.append((float(q_lo[0]), float(q_lo[1])))
+        elif float(np.linalg.norm(np.array(out[-1]) - q_lo)) > 1e-4:
+            out.append((float(q_lo[0]), float(q_lo[1])))
+        if float(np.linalg.norm(q_hi - q_lo)) > 1e-4:
+            out.append((float(q_hi[0]), float(q_hi[1])))
+        cum += seg_len
+
+    if len(out) < 2:
+        p0 = _point_at_polyline_distance(polyline, s0)
+        p1 = _point_at_polyline_distance(polyline, min(total, s0 + max(1.0, total * 0.001)))
+        return [p0, p1]
     return out
 
 
@@ -1419,9 +1444,34 @@ def get_edge_inspection_geometry_with_direction(
     - 无巡检点：返回空，调用方应跳过该 edge。
     - 有巡检点：截断到 [first_required_point, last_required_point] 区间。
     """
-    polyline = list(getattr(edge_task, "polyline", None) or [])
+    from core.image_pixel_coords import edge_pixel_polyline
+
+    polyline = edge_pixel_polyline(edge_task)
     if len(polyline) < 2:
         return []
+    total = _polyline_length(polyline)
+    meta = getattr(edge_task, "meta", None) or {}
+    is_physical_line = (
+        edge_task.__class__.__name__ == "PhysicalLineChain"
+        or (
+            meta.get("member_chain_ids") is not None
+            and meta.get("build_mode") is not None
+        )
+    )
+    if is_physical_line:
+        geom = list(polyline)
+        if direction == "reverse":
+            geom = list(reversed(geom))
+        inspect_len = _polyline_length(geom)
+        if debug:
+            coverage = inspect_len / total if total > 1e-9 else 0.0
+            print(
+                f"[inspect-geometry] edge={getattr(edge_task, 'edge_id', None)} "
+                f"mode=physical_full physical_length={total:.2f} "
+                f"inspect_length={inspect_len:.2f} coverage={coverage:.4f}"
+            )
+        return geom
+
     points = list(getattr(edge_task, "inspection_points", None) or [])
     if not points:
         if debug:
@@ -1434,20 +1484,29 @@ def get_edge_inspection_geometry_with_direction(
     projected: List[float] = []
     target_debug: List[str] = []
     for p in points:
+        s_pre = None
+        if isinstance(p, dict) and p.get("distance_along_edge") is not None:
+            try:
+                s_pre = float(p["distance_along_edge"])
+            except (TypeError, ValueError):
+                s_pre = None
         pos = _point_xy_from_inspection_point(p)
-        if pos is None:
-            continue
-        s = _project_point_to_polyline_distance(pos, polyline)
+        s = None
+        if pos is not None:
+            s = _project_point_to_polyline_distance(pos, polyline)
+        if s is None and s_pre is not None:
+            s = s_pre
         if s is not None:
-            projected.append(s)
+            projected.append(float(s))
             if isinstance(p, dict):
                 pid = p.get("id") or p.get("point_id") or "unknown"
                 ptype = p.get("point_type", "unknown")
             else:
                 pid = getattr(p, "id", None) or getattr(p, "point_id", None) or "unknown"
                 ptype = getattr(p, "point_type", "unknown")
+            coord = pos if pos is not None else (0.0, 0.0)
             target_debug.append(
-                f"id={pid}/type={ptype}/coord=({pos[0]:.1f},{pos[1]:.1f})/s={s:.2f}"
+                f"id={pid}/type={ptype}/coord=({coord[0]:.1f},{coord[1]:.1f})/s={s:.2f}"
             )
 
     if not projected:
@@ -1460,6 +1519,11 @@ def get_edge_inspection_geometry_with_direction(
 
     s_min = min(projected)
     s_max = max(projected)
+    if len(projected) == 1:
+        pad = min(35.0, max(8.0, total * 0.04))
+        s_min = max(0.0, s_min - pad)
+        s_max = min(total, s_max + pad)
+
     geom = _slice_polyline_by_distance(polyline, s_min, s_max)
     if direction == "reverse":
         geom = list(reversed(geom))
@@ -1470,6 +1534,13 @@ def get_edge_inspection_geometry_with_direction(
                 f"[DEBUG] edge inspection targets edge={getattr(edge_task, 'edge_id', None)} "
                 + "; ".join(target_debug)
             )
+        inspect_len = _polyline_length(geom)
+        coverage = inspect_len / total if total > 1e-9 else 0.0
+        print(
+            f"[inspect-geometry] edge={getattr(edge_task, 'edge_id', None)} "
+            f"mode=chain_slice physical_length={total:.2f} "
+            f"inspect_length={inspect_len:.2f} coverage={coverage:.4f}"
+        )
         print(
             f"[DEBUG] dead-end branch skipped/truncated edge={getattr(edge_task, 'edge_id', None)} "
             f"slice=({s_min:.2f},{s_max:.2f}) total={_polyline_length(polyline):.2f} "
@@ -1513,6 +1584,11 @@ def generate_connection_segment_along_topo(
     edge_task_map: dict,
     from_edge_id: Optional[str] = None,
     to_edge_id: Optional[str] = None,
+    pixel_coord_mode: Optional[bool] = None,
+    completed_topo_edge_ids: Optional[Set[str]] = None,
+    completed_edge_penalty: float = 450.0,
+    route_connect_stats: Optional[dict] = None,
+    **_,
 ) -> Tuple[List[Tuple[float, float]], float]:
     """
     沿拓扑图生成连接段（替代简单的直线连接）
@@ -1522,10 +1598,24 @@ def generate_connection_segment_along_topo(
         point_b: 终点
         topo_graph: 拓扑图
         edge_task_map: 边任务映射
+        completed_topo_edge_ids: 已完成巡检的 chain 所覆盖的 TopoEdge.id 集合；
+            仅影响 connect 段候选路径的择优（对经过边加惩罚），不影响 inspect。
+        completed_edge_penalty: 每条已完成的拓扑边在 connect 择优中的加罚（像素量级）。
+        route_connect_stats: 可选；累计 completed_line_cross_count 等统计。
+        kwargs: 兼容其它调用方传入的提示参数（如 completed_lines 等）。
 
     Returns:
         Tuple[List[Tuple[float, float]], float]: (几何路径, 长度)
     """
+    from core.image_pixel_coords import edge_pixel_polyline, use_image_pixel_coords
+
+    if pixel_coord_mode is None:
+        pixel_coord_mode = use_image_pixel_coords()
+
+    ct_ids: Optional[Set[str]] = None
+    if completed_topo_edge_ids:
+        ct_ids = {str(x) for x in completed_topo_edge_ids}
+
     def _append_polyline(dst: List[Tuple[float, float]], src: List[Tuple[float, float]]) -> None:
         if not src:
             return
@@ -1545,10 +1635,16 @@ def generate_connection_segment_along_topo(
         return None
 
     def _edge_polyline_aligned(edge_obj, u: str, v: str) -> List[Tuple[float, float]]:
-        poly = list(edge_obj.polyline or [])
+        poly = edge_pixel_polyline(edge_obj)
         if edge_obj.u == u and edge_obj.v == v:
             return [(float(p[0]), float(p[1])) for p in poly]
         return [(float(p[0]), float(p[1])) for p in reversed(poly)]
+
+    def _task_polyline_aligned(edge_task, u: str, v: str) -> List[Tuple[float, float]]:
+        poly = edge_pixel_polyline(edge_task)
+        if edge_task.u == u and edge_task.v == v:
+            return list(poly)
+        return list(reversed(poly))
 
     def _geom_length(geom: List[Tuple[float, float]]) -> float:
         if len(geom) < 2:
@@ -1556,7 +1652,7 @@ def generate_connection_segment_along_topo(
         return float(sum(np.linalg.norm(np.array(geom[i + 1]) - np.array(geom[i])) for i in range(len(geom) - 1)))
 
     def _point_to_anchor(edge_task, point_xy: Tuple[float, float], anchor_node: str):
-        poly = list(getattr(edge_task, "polyline", None) or [])
+        poly = edge_pixel_polyline(edge_task)
         if len(poly) < 2:
             return None
         s = _project_point_to_polyline_distance(point_xy, poly)
@@ -1587,7 +1683,7 @@ def generate_connection_segment_along_topo(
 
     # inspection-target-aware: 同边连接直接切片，避免 edge endpoint 往返
     if from_edge is not None and to_edge is not None and from_edge.edge_id == to_edge.edge_id:
-        poly = list(from_edge.polyline or [])
+        poly = edge_pixel_polyline(from_edge)
         if len(poly) >= 2:
             sa = _project_point_to_polyline_distance(point_a, poly)
             sb = _project_point_to_polyline_distance(point_b, poly)
@@ -1623,6 +1719,8 @@ def generate_connection_segment_along_topo(
 
                 middle_geo: List[Tuple[float, float]] = []
                 middle_cost = 0.0
+                crosses_completed = 0
+                penalty_added = 0.0
                 for i in range(len(node_path) - 1):
                     u = node_path[i]
                     v = node_path[i + 1]
@@ -1631,7 +1729,13 @@ def generate_connection_segment_along_topo(
                         middle_geo = []
                         middle_cost = float("inf")
                         break
-                    middle_cost += float(getattr(e, "len2d", 0.0) or 0.0)
+                    base = float(getattr(e, "len2d", 0.0) or 0.0)
+                    eid = str(getattr(e, "id", "") or "")
+                    if ct_ids and eid in ct_ids:
+                        crosses_completed += 1
+                        penalty_added += float(completed_edge_penalty)
+                        base += float(completed_edge_penalty)
+                    middle_cost += base
                     _append_polyline(middle_geo, _edge_polyline_aligned(e, u, v))
 
                 total_cost = float(a_info["cost"]) + float(middle_cost) + float(b_info["cost"])
@@ -1644,6 +1748,8 @@ def generate_connection_segment_along_topo(
                         "a_geo": a_info["point_to_anchor"],
                         "middle_geo": middle_geo,
                         "b_geo": _anchor_to_point(to_edge, point_b, b_anchor) or [point_b],
+                        "crosses_completed": crosses_completed,
+                        "penalty_added": penalty_added,
                     }
 
         if best is not None:
@@ -1659,6 +1765,27 @@ def generate_connection_segment_along_topo(
                 geometry.append((float(point_b[0]), float(point_b[1])))
 
             length = _geom_length(geometry)
+            crosses = int(best.get("crosses_completed", 0))
+            pen_add = float(best.get("penalty_added", 0.0))
+            if crosses > 0:
+                print(
+                    f"[route-connect] from={from_edge_id} to={to_edge_id} "
+                    f"crosses_completed={crosses} penalty={pen_add:.1f} length={length:.1f}"
+                )
+                if route_connect_stats is not None:
+                    route_connect_stats["completed_line_cross_count"] = int(
+                        route_connect_stats.get("completed_line_cross_count", 0)
+                    ) + 1
+                    details = route_connect_stats.setdefault("cross_details", [])
+                    details.append(
+                        {
+                            "from": from_edge_id,
+                            "to": to_edge_id,
+                            "crosses_completed": crosses,
+                            "penalty": pen_add,
+                            "length": length,
+                        }
+                    )
             print(
                 f"[DEBUG] endpoint included reason=anchor_combo_optimal "
                 f"from_anchor={best['a_anchor']} to_anchor={best['b_anchor']} path={best['node_path']}"
@@ -1690,24 +1817,34 @@ def generate_connection_segment_along_topo(
         return geometry, length
 
     geometry: List[Tuple[float, float]] = [(float(point_a[0]), float(point_a[1]))]
-    node_a_obj = topo_graph.nodes[node_a]
-    if np.linalg.norm(np.array(point_a) - np.array(node_a_obj.pos2d)) > 1.0:
-        geometry.append((float(node_a_obj.pos2d[0]), float(node_a_obj.pos2d[1])))
+    if not pixel_coord_mode:
+        node_a_obj = topo_graph.nodes[node_a]
+        if np.linalg.norm(np.array(point_a) - np.array(node_a_obj.pos2d)) > 1.0:
+            geometry.append((float(node_a_obj.pos2d[0]), float(node_a_obj.pos2d[1])))
 
     for i in range(len(node_path) - 1):
         u = node_path[i]
         v = node_path[i + 1]
         edge = _find_edge_between_nodes(u, v)
-        if edge and edge.polyline:
+        if edge and edge_pixel_polyline(edge):
             _append_polyline(geometry, _edge_polyline_aligned(edge, u, v))
-        else:
+        elif not pixel_coord_mode:
             next_node = topo_graph.nodes[v]
             geometry.append((float(next_node.pos2d[0]), float(next_node.pos2d[1])))
 
-    node_b_obj = topo_graph.nodes[node_b]
-    if np.linalg.norm(np.array(point_b) - np.array(node_b_obj.pos2d)) > 1.0:
-        geometry.append((float(node_b_obj.pos2d[0]), float(node_b_obj.pos2d[1])))
+    if not pixel_coord_mode:
+        node_b_obj = topo_graph.nodes[node_b]
+        if np.linalg.norm(np.array(point_b) - np.array(node_b_obj.pos2d)) > 1.0:
+            geometry.append((float(node_b_obj.pos2d[0]), float(node_b_obj.pos2d[1])))
     geometry.append((float(point_b[0]), float(point_b[1])))
+
+    if pixel_coord_mode:
+        geometry = [(float(p[0]), float(p[1])) for p in geometry]
+        if len(geometry) < 2:
+            geometry = [(float(point_a[0]), float(point_a[1])), (float(point_b[0]), float(point_b[1]))]
+        length = _geom_length(geometry)
+        print("[DEBUG] endpoint included reason=fallback_nearest_node_pixel_polyline_only")
+        return geometry, length
 
     length = _geom_length(geometry)
     print("[DEBUG] endpoint included reason=fallback_nearest_node")
@@ -4093,6 +4230,29 @@ def export_grouped_mission_to_json(
     if extra_metadata:
         metadata.update(extra_metadata)
 
+    if metadata.get("pixel_coordinate_mode") or str(metadata.get("coordinate_mode") or "").startswith("image_pixel"):
+        from core.image_pixel_coords import edge_pixel_polyline
+
+        metadata["topo_edges_pixel"] = [
+            {
+                "edge_id": task.edge_id,
+                "line_id": task.line_id,
+                "pixel_polyline": [
+                    [round(float(p[0]), 2), round(float(p[1]), 2)]
+                    for p in edge_pixel_polyline(task)
+                ],
+                "original_polyline": [
+                    [round(float(p[0]), 2), round(float(p[1]), 2)]
+                    for p in (getattr(task, "original_polyline", None) or edge_pixel_polyline(task))
+                ],
+                "image_polyline": [
+                    [round(float(p[0]), 2), round(float(p[1]), 2)]
+                    for p in (getattr(task, "image_polyline", None) or edge_pixel_polyline(task))
+                ],
+            }
+            for task in edge_tasks
+        ]
+
     # 2. 统计信息
     inspect_ratio = (mission.inspect_length / mission.total_length * 100
                      if mission.total_length > 0 else 0)
@@ -4217,20 +4377,26 @@ def export_grouped_mission_to_json(
 
         segments_data.append(segment_data)
 
-    # 6. Inspection Points - 需要从 edge_tasks 和 line_inspection_points 构建
+    # 6. Inspection Points - 优先使用 mission 任务对象，保证 PL visit_order 的点归属为 PL_xxx。
     inspection_points_data = []
     point_id_counter = 0
-
     # 为每个 edge 获取其巡检点
     edge_to_inspection_points = {}  # {edge_id: [points]}
 
-    # 首先从 edge_tasks 获取已有的 inspection_points
+    mission_task_by_id = getattr(mission, "task_by_id", None) or {}
+    for task_id, task in mission_task_by_id.items():
+        points = getattr(task, "inspection_points", None) or []
+        if points:
+            edge_to_inspection_points[str(task_id)] = list(points)
+
+    # 再从 edge_tasks 获取已有的 inspection_points，供旧 chain/line visit_order 回退使用。
     for task in edge_tasks:
-        if task.inspection_points:
+        if task.inspection_points and task.edge_id not in edge_to_inspection_points:
             edge_to_inspection_points[task.edge_id] = task.inspection_points
 
     # 根据 visit_order 为每个点分配访问顺序
     visit_order_counter = 0
+    from core.topo_task import _edge_task_topo_index
 
     for edge_id_with_dir in mission.visit_order:
         # 去除方向标记（+/-）
@@ -4245,6 +4411,16 @@ def export_grouped_mission_to_json(
             direction = direction_map.get(edge_id_with_dir, 'forward')
 
         points = edge_to_inspection_points.get(edge_id, [])
+        # 旧版线路级 visit_order（line_id）：无直接边键时聚合该 line 下各 EdgeTask；合并链 *_chain_* 不走此分支
+        if not points and "_chain_" not in edge_id:
+            line_edge_tasks = sorted(
+                [et for et in edge_tasks if getattr(et, "line_id", "") == edge_id],
+                key=_edge_task_topo_index,
+            )
+            for et in line_edge_tasks:
+                pts = edge_to_inspection_points.get(et.edge_id, [])
+                if pts:
+                    points.extend(pts)
 
         # 如果 direction_map 中有相反的方向，则反转
         if direction == 'reverse':
@@ -4266,6 +4442,7 @@ def export_grouped_mission_to_json(
                 detection_result = point.detection_result
                 status = point.status
                 source_reason = point.source_reason
+                point_edge_id = edge_id if str(edge_id).startswith("PL_") else (getattr(point, "edge_id", None) or edge_id)
             elif isinstance(point, dict):
                 # 字典格式
                 point_type = point.get('type', point.get('point_type', 'unknown'))
@@ -4277,6 +4454,7 @@ def export_grouped_mission_to_json(
                 detection_result = point.get('detection_result')
                 status = point.get('status', 'uninspected')
                 source_reason = point.get('source_reason', '')
+                point_edge_id = edge_id if str(edge_id).startswith("PL_") else (point.get("edge_id") or edge_id)
             else:
                 # 未知格式，跳过
                 continue
@@ -4293,12 +4471,16 @@ def export_grouped_mission_to_json(
                     z = terrain_3d[h_idx, w_idx, 2]
                     pos_3d = [round(x, 2), round(y, 2), round(z, 2)]
 
-            # 获取 group_id
-            group_id = mission.edge_to_group.get(edge_id) if hasattr(mission, 'edge_to_group') else None
+            # 获取 group_id（优先按拓扑边，其次线路级 token）
+            group_id = None
+            if hasattr(mission, 'edge_to_group') and mission.edge_to_group:
+                group_id = mission.edge_to_group.get(str(point_edge_id))
+                if group_id is None:
+                    group_id = mission.edge_to_group.get(edge_id)
 
             point_data = {
                 "point_id": f"IP_{point_id_counter:05d}",
-                "edge_id": edge_id,
+                "edge_id": str(point_edge_id),
                 "group_id": group_id,
                 "line_id": line_id,
                 "point_type": point_type,

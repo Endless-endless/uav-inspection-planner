@@ -4,10 +4,12 @@
 (function () {
   const $ = (id) => document.getElementById(id);
 
-  const MOVE_STEP_PX = 10;
-  const MOVE_FRAME_MS = 20;
-  const POINT_TRIGGER_DIST = 8;
-  const CONTINUITY_EPS = 5;
+  /** 关闭图传/快照/右侧巡检卡片相关 DOM，避免干扰主播放链路 */
+  const ENABLE_INSPECTION_IMAGE = true;
+
+  const MOVE_FRAME_MS = 120;
+  const CONTINUITY_EPS = 1e-3;
+  const TICK_LOG_EVERY = 50;
   const STREAM_INTERVAL_MIN = 300;
   const STREAM_INTERVAL_MAX = 1000;
   const MAX_EVENT_ITEMS = 10;
@@ -21,6 +23,7 @@
     CAPTURING: "采集中",
     COMPLETED: "任务完成",
     PAUSED: "已暂停",
+    EXECUTING: "巡检执行",
   };
   const STREAM_FALLBACKS = [
     "/static/inspection_placeholder.svg",
@@ -67,22 +70,37 @@
       mode: "待命",
     },
     phaseTimers: [],
+    /** segment_id -> 已对该 inspect 段批量点亮同 edge_id 巡检点 */
+    activatedInspectSegments: new Set(),
+    /** 巡检 API 图显示期间禁止图传轮播覆盖快照 */
+    holdInspectSnapshot: false,
+    /** 与 status 同步，便于调试与 UI 文案 */
+    running: false,
+    paused: false,
+    t: 0,
+    /** 巡检点 + route_index（仅图传，不参与路线） */
+    inspectPlotPoints: [],
+    /** 当前帧 route_index */
+    currentRouteIndex: 0,
   };
 
-  function getMissionForPlayback(fallback) {
-    if (window.MissionStore?.getCurrentMission) {
-      return MissionStore.getCurrentMission() || fallback || null;
-    }
-    if (window.MissionStore?.getMission) {
-      return MissionStore.getMission() || fallback || null;
-    }
-    // deprecated alias
-    return window.state?.lastResult || fallback || null;
+  function getMissionForPlayback() {
+    const result =
+      window.MissionStore?.current?.dashboard ||
+      window.MissionStore?.current ||
+      window.currentMission?.dashboard ||
+      window.currentMission ||
+      window.LATEST_DASHBOARD ||
+      null;
+    console.log("[getMissionForPlayback]", result);
+    return result;
   }
 
   function notifyPlaybackPhase(status) {
-    if (window.AppPhaseManager?.setPlaybackStatus) {
-      AppPhaseManager.setPlaybackStatus(status);
+    if (typeof window.setTaskControlPhase === "function") {
+      if (status === "playing") window.setTaskControlPhase("playing");
+      else if (status === "paused") window.setTaskControlPhase("paused");
+      else if (status === "idle") window.setTaskControlPhase("idle");
     }
   }
 
@@ -267,135 +285,6 @@
     );
   }
 
-  window.buildInspectionPlaybackTimeline = function (result, dwellMs) {
-    const timeline = [];
-    const segments = result?.segments || [];
-    const allPoints = result?.inspection_points || [];
-    const start = getMissionStart(result);
-    const end = getMissionEnd(result);
-    let currentPos = start;
-    let inspectSeq = 0;
-    let reversedSegments = 0;
-    let gapConnects = 0;
-
-    if (start) {
-      timeline.push({
-        type: "move",
-        x: start.x,
-        y: start.y,
-        segment_id: "start",
-        segment_type: "start",
-      });
-    }
-
-    segments.forEach((seg, idx) => {
-      let points = getSegmentPolyline(seg);
-      if (points.length < 2) return;
-
-      const oriented = reverseIfNeeded(points, currentPos);
-      points = oriented.points;
-      if (oriented.reversed) reversedSegments += 1;
-
-      if (currentPos && dist(currentPos, points[0]) > CONTINUITY_EPS) {
-        const gap = buildMoveFrames(
-          [currentPos, points[0]],
-          MOVE_STEP_PX,
-          `${seg.segment_id || `seg_${idx}`}_gap`,
-          "connect_gap"
-        );
-        if (gap.length > 0) {
-          timeline.push(...gap);
-          gapConnects += 1;
-        }
-      }
-
-      const segId = seg.segment_id || `seg_${idx}`;
-      const segType = seg.type || "inspect";
-      const frames = buildMoveFrames(points, MOVE_STEP_PX, segId, segType);
-      if (!frames.length) return;
-
-      if (segType === "inspect") {
-        const segPoints = sortPointsAlongPolyline(
-          pointsForSegment(allPoints, seg),
-          points
-        ).map((pt) => ({
-          point: pt,
-          proj: projectOnPolyline(pt, points),
-          triggered: false,
-        }));
-
-        let pIdx = 0;
-        frames.forEach((frame) => {
-          timeline.push(frame);
-          while (pIdx < segPoints.length) {
-            const it = segPoints[pIdx];
-            const dd = dist(frame, it.point);
-            if (dd <= POINT_TRIGGER_DIST || frame.d >= it.proj) {
-              inspectSeq += 1;
-              timeline.push({
-                type: "inspect",
-                point: it.point,
-                dwell_ms: dwellMs,
-                inspect_index: inspectSeq,
-                segment_id: segId,
-              });
-              it.triggered = true;
-              pIdx += 1;
-              continue;
-            }
-            break;
-          }
-        });
-      } else {
-        timeline.push(...frames);
-      }
-
-      currentPos = { x: frames[frames.length - 1].x, y: frames[frames.length - 1].y };
-    });
-
-    if (end) {
-      const needEndConnect = !currentPos || dist(currentPos, end) > CONTINUITY_EPS;
-      if (needEndConnect) {
-        const from = currentPos || start || end;
-        const endFrames = buildMoveFrames(
-          [from, end],
-          MOVE_STEP_PX,
-          "to_end",
-          "connect_end"
-        );
-        if (endFrames.length) {
-          timeline.push(...endFrames);
-          currentPos = { x: end.x, y: end.y };
-        }
-      } else if (currentPos) {
-        timeline.push({
-          type: "move",
-          x: end.x,
-          y: end.y,
-          segment_id: "end",
-          segment_type: "end",
-        });
-        currentPos = { x: end.x, y: end.y };
-      }
-    }
-
-    const firstMove = timeline.find((e) => e.type === "move");
-    const lastMove = [...timeline].reverse().find((e) => e.type === "move");
-    const debug = {
-      frame_count: timeline.length,
-      first_point: firstMove ? [firstMove.x, firstMove.y] : null,
-      last_point: lastMove ? [lastMove.x, lastMove.y] : null,
-      inserted_gap_connects: gapConnects,
-      reversed_segments: reversedSegments,
-      inspect_events: inspectSeq,
-    };
-    PLAYBACK.debug = debug;
-    window.__playbackDebug = debug;
-    console.log("[playback timeline]", debug);
-
-    return timeline;
-  };
-
   function getDwellMs() {
     const sel = $("dwellTimeSelect");
     if (sel) return parseFloat(sel.value) * 1000;
@@ -417,6 +306,7 @@
 
   function setMissionState(state) {
     PLAYBACK.missionState = state;
+    if (!ENABLE_INSPECTION_IMAGE) return;
     const text = STATE_TEXT[state] || state;
     setForBoth("inspectCardUavStatus", text);
     setForBoth("inspectTelemMode", text);
@@ -455,11 +345,13 @@
     if (PLAYBACK.events.length > MAX_EVENT_ITEMS) {
       PLAYBACK.events = PLAYBACK.events.slice(-MAX_EVENT_ITEMS);
     }
+    if (!ENABLE_INSPECTION_IMAGE) return;
     renderEventTimeline("");
     renderEventTimeline("Fs");
   }
 
   function updateProgressVisual() {
+    if (!ENABLE_INSPECTION_IMAGE) return;
     const total = Math.max(PLAYBACK.timeline.length, 1);
     const pct = Math.round((Math.min(PLAYBACK.index, total) / total) * 100);
     setForBoth("inspectCardProgressBarText", `${pct}%`);
@@ -478,7 +370,65 @@
     return text;
   }
 
+  function riskLabelFromSignal(signalStr) {
+    const raw = String(signalStr || "").trim();
+    const n = parseInt(raw.replace(/\D/g, ""), 10);
+    if (!Number.isFinite(n)) return raw || "—";
+    if (n >= 90) return `良好（${raw}）`;
+    if (n >= 75) return `一般（${raw}）`;
+    return `关注（${raw}）`;
+  }
+
+  /** 右侧精简面板：当前点 / 速度 / 高度 / 风险 / 进度 */
+  function syncInspectCompactMeta(suffix) {
+    if (!ENABLE_INSPECTION_IMAGE) return;
+    const p = suffix || "";
+    const set = (baseId, val) => {
+      const el = $(`${baseId}${p}`);
+      if (el) el.textContent = val;
+    };
+    const t = PLAYBACK.telemetry || {};
+    set("inspectMetaSpeed", t.speed || "—");
+    set("inspectMetaAlt", t.altitude || "—");
+    set("inspectMetaRisk", riskLabelFromSignal(t.signal));
+    const total = Math.max(PLAYBACK.timeline?.length || 0, 1);
+    const pct = Math.min(100, Math.round(((PLAYBACK.index || 0) / total) * 100));
+    set("inspectMetaProgress", `${pct}%`);
+    let pid = PLAYBACK.currentPointId ? String(PLAYBACK.currentPointId) : "";
+    if (!pid && PLAYBACK.currentPoint) {
+      pid = String(PLAYBACK.currentPoint.point_id || PLAYBACK.currentPoint.id || "").trim();
+    }
+    set("inspectMetaCurrentPoint", pid || "—");
+  }
+
+  function ensureInspectCompactMetaBlock(mount, suffix) {
+    const p = suffix || "";
+    const tag = p ? "fs" : "main";
+    if (!mount || mount.querySelector(`[data-inspect-compact-meta="${tag}"]`)) return;
+    const wrap = document.createElement("div");
+    wrap.className = "inspect-compact-meta";
+    wrap.setAttribute("data-inspect-compact-meta", tag);
+    wrap.innerHTML = `
+      <div class="inspect-compact-meta-row"><span class="inspect-compact-k">当前巡检点</span><span class="inspect-compact-v" id="inspectMetaCurrentPoint${p}">—</span></div>
+      <div class="inspect-compact-meta-row"><span class="inspect-compact-k">速度</span><span class="inspect-compact-v" id="inspectMetaSpeed${p}">—</span></div>
+      <div class="inspect-compact-meta-row"><span class="inspect-compact-k">高度</span><span class="inspect-compact-v" id="inspectMetaAlt${p}">—</span></div>
+      <div class="inspect-compact-meta-row"><span class="inspect-compact-k">风险等级</span><span class="inspect-compact-v" id="inspectMetaRisk${p}">—</span></div>
+      <div class="inspect-compact-meta-row"><span class="inspect-compact-k">进度</span><span class="inspect-compact-v" id="inspectMetaProgress${p}">—</span></div>`;
+    mount.appendChild(wrap);
+  }
+
+  function hideLegacyInspectStreamUI(mount, suffix) {
+    const p = suffix || "";
+    const sid = p === "Fs" ? "inspectStreamPanelFs" : "inspectStreamPanel";
+    const el = (mount && mount.querySelector(`#${sid}`)) || document.getElementById(sid);
+    if (el) {
+      el.classList.add("inspect-ui-hidden-legacy");
+      el.setAttribute("aria-hidden", "true");
+    }
+  }
+
   function renderTelemetry() {
+    if (!ENABLE_INSPECTION_IMAGE) return;
     setForBoth("inspectHudFps", PLAYBACK.telemetry.fps);
     setForBoth("inspectHudSignal", PLAYBACK.telemetry.signal);
     setForBoth("inspectHudBattery", hudDisplayValue(PLAYBACK.telemetry.battery, "battery"));
@@ -489,6 +439,8 @@
     setForBoth("inspectTelemBattery", PLAYBACK.telemetry.battery);
     setForBoth("inspectTelemAlt", PLAYBACK.telemetry.altitude);
     setForBoth("inspectTelemMode", STATE_TEXT[PLAYBACK.missionState] || "自动");
+    syncInspectCompactMeta("");
+    syncInspectCompactMeta("Fs");
   }
 
   function updateTelemetryFromPlayback(stateHint) {
@@ -514,21 +466,30 @@
       speed: `${speedVal.toFixed(1)}m/s`,
       mode: STATE_TEXT[PLAYBACK.missionState] || "自动",
     };
-    renderTelemetry();
-    updateProgressVisual();
+    if (ENABLE_INSPECTION_IMAGE) {
+      renderTelemetry();
+      updateProgressVisual();
+    }
   }
 
   function setStreamImage(url, hintText) {
+    if (!ENABLE_INSPECTION_IMAGE) return;
+    if (PLAYBACK.streamFrozen) return;
     PLAYBACK.streamCurrentUrl = url || STREAM_FALLBACKS[0];
     ["", "Fs"].forEach((p) => {
-      const img = $(`inspectCardImg${p}`);
+      ensureInspectDualSlotsMounted(p);
+      const img = getCanonicalInspectImg(p);
       if (!img) return;
       img.onerror = () => {
         img.src = STREAM_FALLBACKS[(PLAYBACK.streamIndex + 1) % STREAM_FALLBACKS.length];
       };
       img.src = PLAYBACK.streamCurrentUrl;
-      const hint = $(`inspectCardImgHint${p}`);
-      if (hint) hint.textContent = hintText || "实时图传 · 图像持续更新中";
+      img.style.display = "block";
+      const cap = $(`inspectCardCaption${p}`);
+      if (cap) {
+        cap.textContent = hintText || "";
+        cap.classList.remove("inspect-live-placeholder--show");
+      }
     });
   }
 
@@ -570,6 +531,7 @@
   }
 
   function scheduleStreamLoop() {
+    if (!ENABLE_INSPECTION_IMAGE) return;
     stopStreamLoop();
     if (PLAYBACK.status !== "playing" || PLAYBACK.streamFrozen) return;
     PLAYBACK.streamTimer = setTimeout(() => {
@@ -589,34 +551,52 @@
   }
 
   function ensureInspectCardVisible() {
+    if (!ENABLE_INSPECTION_IMAGE) return;
+    ensureInspectFallbackCardIfMissing();
     ["", "Fs"].forEach((p) => {
       const card = $(`inspectInfoCard${p}`);
       if (card) card.classList.remove("hidden");
     });
   }
 
-  function freezeStreamAtPoint(point) {
-    PLAYBACK.streamFrozen = true;
-    stopStreamLoop();
-    const capture = point?.image_url || point?.image_path || PLAYBACK.streamCurrentUrl || STREAM_FALLBACKS[0];
-    setStreamImage(capture, "图像冻结 · 拍摄中");
-  }
-
-  function nextInspectOffset(fromIndex) {
-    for (let i = fromIndex; i < PLAYBACK.timeline.length; i += 1) {
-      if (PLAYBACK.timeline[i]?.type === "inspect") return i - fromIndex;
-    }
-    return -1;
-  }
-
   function clearInspectCard() {
     clearPhaseTimers();
+    if (!ENABLE_INSPECTION_IMAGE) {
+      PLAYBACK.events = [{ ts: "T+00:00", text: "系统待命" }];
+      PLAYBACK.streamCurrentUrl = STREAM_FALLBACKS[0];
+      PLAYBACK.streamFrozen = false;
+      PLAYBACK.holdInspectSnapshot = false;
+      PLAYBACK.telemetry = {
+        fps: "--",
+        signal: "--",
+        battery: "--",
+        altitude: "--",
+        speed: "--",
+        mode: "待命",
+      };
+      PLAYBACK.missionState = "IDLE";
+      return;
+    }
     ["", "Fs"].forEach((p) => {
       const card = $(`inspectInfoCard${p}`);
       if (!card) return;
       card.classList.add("hidden");
+      const sImg = $(`inspectStreamImg${p}`);
+      if (sImg) {
+        sImg.onerror = null;
+        sImg.src = "/static/inspection_placeholder.svg";
+      }
       const img = $(`inspectCardImg${p}`);
-      if (img) img.src = "/static/inspection_placeholder.svg";
+      if (img) {
+        img.onerror = null;
+        img.removeAttribute("src");
+        img.style.display = "none";
+      }
+      const cap = $(`inspectCardCaption${p}`);
+      if (cap) {
+        cap.textContent = "暂无巡检图片";
+        cap.classList.add("inspect-live-placeholder--show");
+      }
       const hint = $(`inspectCardImgHint${p}`);
       if (hint) hint.textContent = "";
       const uav = $(`inspectCardUavStatus${p}`);
@@ -634,6 +614,7 @@
     PLAYBACK.events = [{ ts: "T+00:00", text: "系统待命" }];
     PLAYBACK.streamCurrentUrl = STREAM_FALLBACKS[0];
     PLAYBACK.streamFrozen = false;
+    PLAYBACK.holdInspectSnapshot = false;
     PLAYBACK.telemetry = {
       fps: "--",
       signal: "--",
@@ -674,7 +655,232 @@
     return raw || "普通";
   }
 
-  function fillInspectCard(prefix, point, index, total) {
+  function resolveInspectionCardImage(point) {
+    const pointId = String(point?.point_id || point?.id || "").trim() || "—";
+    const url =
+      typeof point?.image_url === "string" && point.image_url.trim()
+        ? point.image_url.trim()
+        : null;
+    return {
+      url,
+      logPath: "",
+      pointId,
+      hasFile: point?.image_available === true,
+    };
+  }
+
+  function findFlightStatusMountEl(forFs) {
+    if (forFs) {
+      const c = document.getElementById("inspectInfoCardFs");
+      if (c) return c;
+    }
+    const rowCard = document.querySelector(".map-inspect-row .inspect-info-card");
+    if (rowCard) return rowCard;
+    const ids = [
+      "inspectInfoCard",
+      "playbackFlightCard",
+      "flightStatusCard",
+      "dashboardFlightPanel",
+      "playbackSidePanel",
+    ];
+    for (let i = 0; i < ids.length; i += 1) {
+      const el = document.getElementById(ids[i]);
+      if (el) return el;
+    }
+    return (
+      document.querySelector("[data-inspect-card-mount]") ||
+      document.querySelector("[data-flight-status-card]") ||
+      document.querySelector(".flight-status-card") ||
+      document.querySelector("#playbackConsole .console-body") ||
+      null
+    );
+  }
+
+  function insertAfter(parent, node, ref) {
+    if (!ref || ref.parentNode !== parent) {
+      parent.insertBefore(node, parent.firstChild);
+      return;
+    }
+    if (ref.nextSibling) parent.insertBefore(node, ref.nextSibling);
+    else parent.appendChild(node);
+  }
+
+  function getCanonicalInspectImg(suffix) {
+    const p = suffix || "";
+    const mount =
+      p === "Fs"
+        ? document.getElementById("inspectInfoCardFs")
+        : document.getElementById("inspectInfoCard");
+    if (!mount) return document.getElementById(`inspectCardImg${p}`);
+    const wrapImg = mount.querySelector(".inspect-img-wrap img");
+    if (wrapImg) return wrapImg;
+    return document.getElementById(`inspectCardImg${p}`);
+  }
+
+  /** 移除动态插入的重复图传面板，只保留 index.html 内 .inspect-img-wrap 中的单图 */
+  function removeDuplicateInspectPanels(mount) {
+    if (!mount) return;
+    const canonical = mount.querySelector(".inspect-img-wrap img");
+    mount.querySelectorAll("#inspectImagePanel, #inspectImagePanelFs").forEach((panel) => {
+      if (!panel.closest(".inspect-img-wrap")) panel.remove();
+    });
+    const imgs = mount.querySelectorAll("img#inspectCardImg, img#inspectCardImgFs, img.inspect-flight-img");
+    imgs.forEach((img) => {
+      if (canonical && img !== canonical && !canonical.parentElement?.contains(img)) {
+        img.remove();
+      }
+    });
+  }
+
+  /**
+   * 保证右侧飞行状态卡片内存在唯一图传 img（复用 index.html #inspectCardImg，不 append 新节点）。
+   */
+  function ensureInspectDualSlotsMounted(suffix) {
+    const p = suffix || "";
+    let mount =
+      p === "Fs"
+        ? document.getElementById("inspectInfoCardFs")
+        : document.getElementById("inspectInfoCard");
+    if (!mount) {
+      if (p) return false;
+      ensureInspectInfoCardShellIfMissing();
+      mount = document.getElementById("inspectInfoCard");
+    }
+    if (!mount) return false;
+
+    removeDuplicateInspectPanels(mount);
+    hideLegacyInspectStreamUI(mount, p);
+
+    const img = getCanonicalInspectImg(p);
+    if (img) {
+      const wantId = p === "Fs" ? "inspectCardImgFs" : "inspectCardImg";
+      if (img.id !== wantId) img.id = wantId;
+      img.classList.add("inspect-flight-img");
+    }
+
+    ensureInspectCompactMetaBlock(mount, p);
+    return Boolean(img);
+  }
+
+  function ensureInspectImagePanelMounted(suffix) {
+    return ensureInspectDualSlotsMounted(suffix);
+  }
+
+  function ensureInspectFlightImgElement(suffix) {
+    ensureInspectDualSlotsMounted(suffix || "");
+    return getCanonicalInspectImg(suffix || "");
+  }
+
+  function createInspectImgInRightPanel() {
+    ensureInspectDualSlotsMounted("");
+    return getCanonicalInspectImg("") || document.getElementById("inspectCardImg");
+  }
+
+  function ensureInspectInfoCardShellIfMissing() {
+    if ($("inspectInfoCard")) return;
+    const wrap = document.createElement("aside");
+    wrap.id = "inspectInfoCard";
+    wrap.className = "inspect-fallback-card";
+    wrap.setAttribute(
+      "style",
+      "position:fixed;bottom:16px;right:16px;z-index:10020;max-width:360px;max-height:85vh;overflow-x:hidden;overflow-y:auto;background:rgba(15,23,42,.96);color:#e5e7eb;padding:12px;border-radius:10px;border:1px solid rgba(148,163,184,.25);box-shadow:0 8px 24px rgba(0,0,0,.35);"
+    );
+    wrap.innerHTML = `
+      <div class="inspect-panel-compact">
+        <div class="inspect-section-h">飞行状态</div>
+        <div id="inspectCardUavStatus" class="inspect-flight-status-line">待命</div>
+        <div class="inspect-img-wrap inspect-img-wrap-slim">
+          <img id="inspectCardImg" class="inspect-flight-img" src="/static/inspection_placeholder.svg" alt="实时图传" />
+        </div>
+        <div class="inspect-compact-meta" data-inspect-compact-meta="main">
+          <div class="inspect-compact-meta-row"><span class="inspect-compact-k">当前巡检点</span><span class="inspect-compact-v" id="inspectMetaCurrentPoint">—</span></div>
+          <div class="inspect-compact-meta-row"><span class="inspect-compact-k">速度</span><span class="inspect-compact-v" id="inspectMetaSpeed">—</span></div>
+          <div class="inspect-compact-meta-row"><span class="inspect-compact-k">高度</span><span class="inspect-compact-v" id="inspectMetaAlt">—</span></div>
+          <div class="inspect-compact-meta-row"><span class="inspect-compact-k">风险等级</span><span class="inspect-compact-v" id="inspectMetaRisk">—</span></div>
+          <div class="inspect-compact-meta-row"><span class="inspect-compact-k">进度</span><span class="inspect-compact-v" id="inspectMetaProgress">—</span></div>
+        </div>
+        <div id="inspectCardImgHint" class="inspect-ui-hidden-legacy" aria-hidden="true"></div>
+        <div id="inspectCardId" class="inspect-ui-hidden-legacy" aria-hidden="true"></div>
+        <div id="inspectCardSegment" class="inspect-ui-hidden-legacy" aria-hidden="true"></div>
+        <div id="inspectCardCoord" class="inspect-ui-hidden-legacy" aria-hidden="true"></div>
+        <div id="inspectCardType" class="inspect-ui-hidden-legacy" aria-hidden="true"></div>
+        <div id="inspectCardPriority" class="inspect-ui-hidden-legacy" aria-hidden="true"></div>
+        <div id="inspectCardProgress" class="inspect-ui-hidden-legacy" aria-hidden="true"></div>
+        <div id="inspectCardTime" class="inspect-ui-hidden-legacy" aria-hidden="true"></div>
+        <div id="inspectCardStatus" class="inspect-ui-hidden-legacy inspect-status idle" aria-hidden="true"></div>
+        <ul id="inspectEventList" class="inspect-ui-hidden-legacy" aria-hidden="true"></ul>
+      </div>`;
+    document.body.appendChild(wrap);
+  }
+
+  window.showInspectionImage = function (point, opts) {
+    opts = opts || {};
+    if (!point) return;
+    const pointId = String(point.point_id || point.id || "").trim();
+    if (!pointId) {
+      console.warn("[inspection-image-ui] missing point_id", point);
+      return;
+    }
+    const url =
+      (typeof point.image_url === "string" && point.image_url.trim()) ||
+      `/api/inspection-image/${pointId}.jpg`;
+
+    if (typeof url === "string" && url.indexOf("/api/inspection-image/") === 0) {
+      stopStreamLoop();
+      PLAYBACK.streamFrozen = true;
+      if (opts.logAs === "current_point" || PLAYBACK.status === "playing") {
+        PLAYBACK.holdInspectSnapshot = true;
+      }
+    }
+
+    const applyToImg = (imgEl, sfx) => {
+      if (!imgEl) return;
+      const cap = $(`inspectCardCaption${sfx}`);
+      if (cap) {
+        cap.textContent = "";
+        cap.classList.remove("inspect-live-placeholder--show");
+      }
+      imgEl.classList.add("inspect-flight-img", "inspect-snapshot-img");
+      imgEl.style.display = "block";
+      imgEl.onerror = () => {
+        console.warn("[inspection-image-ui] img error", imgEl.src);
+        if (cap) {
+          cap.textContent = "暂无巡检图片";
+          cap.classList.add("inspect-live-placeholder--show");
+        }
+        imgEl.onerror = null;
+        imgEl.removeAttribute("src");
+        imgEl.style.display = "none";
+      };
+      imgEl.onload = () => {
+        console.log("[inspection-image-ui] load ok", imgEl.src);
+        if (cap) cap.classList.remove("inspect-live-placeholder--show");
+      };
+      imgEl.src = url;
+    };
+
+    const main = getCanonicalInspectImg("") || document.getElementById("inspectCardImg");
+    applyToImg(main, "");
+    const fsImg = getCanonicalInspectImg("Fs");
+    if (fsImg) applyToImg(fsImg, "Fs");
+
+    if (opts.logAs === "current_point") {
+      console.log(`[inspection-image-ui] current_point=${pointId} url=${url}`);
+    } else {
+      console.log(`[inspection-image-ui] ${opts.logAs || "show"} point_id=${pointId} url=${url}`);
+    }
+  };
+
+  /** 保证右侧飞行状态卡片内存在巡检图容器；无宿主卡片时创建最小 aside */
+  function ensureInspectFallbackCardIfMissing() {
+    ensureInspectInfoCardShellIfMissing();
+    ensureInspectImagePanelMounted("");
+    ensureInspectImagePanelMounted("Fs");
+  }
+
+  function fillInspectCard(prefix, point, index, total, opts) {
+    if (!ENABLE_INSPECTION_IMAGE) return;
+    ensureInspectFallbackCardIfMissing();
     const p = prefix || "";
     const card = $(`inspectInfoCard${p}`);
     if (!card) return;
@@ -691,31 +897,28 @@
     set("inspectCardProgress", `${index} / ${Math.max(total, 1)}`);
     set("inspectCardUavStatus", STATE_TEXT[PLAYBACK.missionState] || "巡检中");
     set("inspectCardTime", new Date().toLocaleTimeString("zh-CN"));
-    const img = $(`inspectCardImg${p}`);
-    const imageUrl =
-      point.image_url ||
-      point.image_path ||
-      point.image_placeholder;
-    const finalUrl = PLAYBACK.imageCache.get(imageUrl) || imageUrl;
-    if (img && finalUrl) {
-      img.onerror = () => {
-        img.src = point.image_placeholder || PLAYBACK.streamCurrentUrl || STREAM_FALLBACKS[0];
-        PLAYBACK.usingPlaceholder = true;
-      };
-      img.src = finalUrl;
-      PLAYBACK.streamCurrentUrl = finalUrl;
+
+    const rawPid = String(point.point_id || point.id || "—").trim();
+    set("inspectMetaCurrentPoint", rawPid);
+    set(
+      "inspectMetaProgress",
+      `${Math.round((index / Math.max(total, 1)) * 100)}%`
+    );
+    syncInspectCompactMeta(p);
+
+    if (!opts?.skipImage && typeof window.showInspectionImage === "function") {
+      window.showInspectionImage(point, {
+        suffix: p,
+        quiet: !!opts?.silentLog,
+        logAs: "point_id",
+      });
     }
-    if (imageUrl && !PLAYBACK.imageCache.has(imageUrl)) {
-      const preload = new Image();
-      preload.onload = () => PLAYBACK.imageCache.set(imageUrl, imageUrl);
-      preload.src = imageUrl;
-    }
+
     const hint = $(`inspectCardImgHint${p}`);
     if (hint) {
+      const hasUrl = typeof point?.image_url === "string" && point.image_url.trim();
       hint.textContent =
-        point.image_available && point.image_url
-          ? "巡检图像采集成功"
-          : "巡检图像已冻结，使用占位图";
+        hasUrl && point.image_available === true ? "巡检图像采集成功" : "暂无巡检图片";
     }
     const st = $(`inspectCardStatus${p}`);
     if (st) {
@@ -724,10 +927,47 @@
     }
   }
 
-  function showInspectCard(point, index, total) {
+  /**
+   * Dashboard：点击地图上的巡检点 marker 时更新巡检卡片与图像（不进入播放时间轴动画）
+   */
+  window.showInspectCardForDashboardPoint = function (point, index, total, opts = {}) {
+    if (!ENABLE_INSPECTION_IMAGE) return;
+    if (!point) return;
     ensureInspectCardVisible();
-    fillInspectCard("", point, index, total);
-    fillInspectCard("Fs", point, index, total);
+    if (!opts.skipImageRefresh && typeof window.showInspectionImage === "function") {
+      window.showInspectionImage(point, { logAs: "point_id", quiet: true });
+    }
+    fillInspectCard("", point, index, total, { silentLog: true, skipImage: true });
+    fillInspectCard("Fs", point, index, total, { silentLog: true, skipImage: true });
+    ["", "Fs"].forEach((pfx) => {
+      const hint = $(`inspectCardImgHint${pfx}`);
+      if (hint) {
+        const hasUrl = typeof point?.image_url === "string" && point.image_url.trim();
+        hint.textContent =
+          hasUrl && point.image_available === true
+            ? "巡检采集图像（地图选点）"
+            : "暂无巡检图片";
+      }
+      const st = $(`inspectCardStatus${pfx}`);
+      if (st) {
+        st.textContent = "地图浏览";
+        st.className = "inspect-status done";
+      }
+      const uav = $(`inspectCardUavStatus${pfx}`);
+      if (uav) uav.textContent = "已选中巡检点";
+    });
+  };
+
+  function showInspectCard(point, index, total, cardOpts = {}) {
+    if (!ENABLE_INSPECTION_IMAGE) return;
+    const sp = resolveInspectionCardImage(point);
+    console.log("[inspection-image-ui]", `current_point=${sp.pointId}`, `url=${sp.url}`);
+    ensureInspectCardVisible();
+    fillInspectCard("", point, index, total, { silentLog: true, skipImage: true });
+    fillInspectCard("Fs", point, index, total, { silentLog: true, skipImage: true });
+    if (!cardOpts.skipInspectionImage && typeof window.showInspectionImage === "function") {
+      window.showInspectionImage(point, { quiet: true, logAs: "current_point" });
+    }
     const pid = point.id || point.point_id;
     const dwell = Math.max(600, getDwellMs());
     clearPhaseTimers();
@@ -849,10 +1089,6 @@
     return traces.concat(buildPlaybackTraces());
   };
 
-  window.registerPlaybackTraceIndices = function () {
-    /* 改为按 name 动态查找，无需预注册 */
-  };
-
   window.getPlaybackVisualState = function () {
     return {
       status: PLAYBACK.status,
@@ -962,7 +1198,18 @@
   function setPlaybackUi() {
     const running = PLAYBACK.status === "playing";
     const paused = PLAYBACK.status === "paused";
+    PLAYBACK.running = running;
+    PLAYBACK.paused = paused;
+    PLAYBACK.t = PLAYBACK.index;
     const hasTimeline = PLAYBACK.timeline.length > 0;
+    const startBtn = $("playbackStartBtn");
+    if (startBtn) {
+      if (running && !paused) {
+        startBtn.textContent = "巡检执行";
+      } else {
+        startBtn.textContent = "开始巡检";
+      }
+    }
     $("playbackStartBtn")?.toggleAttribute("disabled", running);
     $("playbackPauseBtn")?.toggleAttribute("disabled", !running);
     $("playbackResumeBtn")?.toggleAttribute("disabled", !paused);
@@ -972,11 +1219,13 @@
       : 0;
     const stateText = STATE_TEXT[PLAYBACK.missionState] || "执行中";
     const ev = PLAYBACK.timeline[PLAYBACK.index];
-    const segLabel = ev?.segment_id
-      ? `区段 ${String(ev.segment_id).replace(/^seg_/, "")}`
-      : ev?.type === "inspect"
-        ? "巡检点"
-        : "区段 —";
+    const segLabel =
+      ev?.label ||
+      (ev?.segment_id
+        ? `区段 ${String(ev.segment_id).replace(/^seg_/, "")}`
+        : ev?.type === "inspect"
+          ? "巡检点"
+          : "区段 —");
     if ($("timelinePercent")) $("timelinePercent").textContent = `${pct}%`;
     if ($("timelineSegment")) $("timelineSegment").textContent = segLabel;
     if ($("timelineFill")) $("timelineFill").style.width = `${pct}%`;
@@ -988,10 +1237,20 @@
       $("headerSpeedBadge").textContent = `${PLAYBACK.speed || 1}x`;
     }
     const prog = $("playbackProgress");
-    if (!prog) return;
+    if (!prog) {
+      if (ENABLE_INSPECTION_IMAGE) {
+        syncInspectCompactMeta("");
+        syncInspectCompactMeta("Fs");
+      }
+      return;
+    }
     if (!hasTimeline) {
       prog.textContent = "待命";
       if (typeof window.renderSystemStatus === "function") window.renderSystemStatus();
+      if (ENABLE_INSPECTION_IMAGE) {
+        syncInspectCompactMeta("");
+        syncInspectCompactMeta("Fs");
+      }
       return;
     }
     prog.textContent = `${pct}% · ${stateText}`;
@@ -999,6 +1258,10 @@
     if (typeof window.renderStats === "function") {
       const mission = window.MissionStore?.getCurrentMission?.() || window.state?.lastResult;
       if (mission?.statistics) window.renderStats(mission.statistics);
+    }
+    if (ENABLE_INSPECTION_IMAGE) {
+      syncInspectCompactMeta("");
+      syncInspectCompactMeta("Fs");
     }
   }
 
@@ -1017,19 +1280,66 @@
     PLAYBACK.currentPoint = null;
     PLAYBACK.currentPointId = null;
     clearPhaseTimers();
-    PLAYBACK.streamFrozen = false;
-    setMissionState("LEAVING");
-    updateTelemetryFromPlayback("LEAVING");
-    setStreamImage(CRUISE_STREAM_IMAGES[PLAYBACK.streamIndex % CRUISE_STREAM_IMAGES.length], "离开巡检点 · 恢复巡航图传");
-    const toCruise = setTimeout(() => {
-      if (PLAYBACK.status !== "playing") return;
-      setMissionState("CRUISING");
-      updateTelemetryFromPlayback("CRUISING");
-    }, 450);
-    PLAYBACK.phaseTimers.push(toCruise);
-    scheduleStreamLoop();
+    if (!PLAYBACK.holdInspectSnapshot) {
+      PLAYBACK.streamFrozen = false;
+      setMissionState("LEAVING");
+      updateTelemetryFromPlayback("LEAVING");
+      setStreamImage(
+        CRUISE_STREAM_IMAGES[PLAYBACK.streamIndex % CRUISE_STREAM_IMAGES.length],
+        "离开巡检点 · 恢复巡航图传"
+      );
+      const toCruise = setTimeout(() => {
+        if (PLAYBACK.status !== "playing") return;
+        setMissionState("CRUISING");
+        updateTelemetryFromPlayback("CRUISING");
+      }, 450);
+      PLAYBACK.phaseTimers.push(toCruise);
+      scheduleStreamLoop();
+    } else {
+      setMissionState("LEAVING");
+      updateTelemetryFromPlayback("LEAVING");
+      const toCruise = setTimeout(() => {
+        if (PLAYBACK.status !== "playing") return;
+        setMissionState("EXECUTING");
+        updateTelemetryFromPlayback("EXECUTING");
+      }, 450);
+      PLAYBACK.phaseTimers.push(toCruise);
+    }
     updateAllPlotPlayback();
     if (PLAYBACK.status === "playing") tickPlayback();
+  }
+
+  function resolveInspectEdgeIdForSegment(segKey) {
+    const mission = getMissionForPlayback();
+    const segs = mission?.segments || [];
+    const hit = segs.find((s) => String(s.segment_id || "") === String(segKey || ""));
+    if (hit && hit.edge_id != null) {
+      return String(hit.edge_id).replace(/[+-]$/, "");
+    }
+    return "";
+  }
+
+  function activateInspectSegmentForAllPoints(segKey, evEdgeId) {
+    let eid = String(evEdgeId || "").replace(/[+-]$/, "");
+    if (!eid) eid = resolveInspectEdgeIdForSegment(segKey);
+    if (!eid || !segKey) return;
+    if (PLAYBACK.activatedInspectSegments.has(segKey)) return;
+    PLAYBACK.activatedInspectSegments.add(segKey);
+    const mission = getMissionForPlayback();
+    (mission?.inspection_points || []).forEach((p) => {
+      const pe = p.edge_id != null ? String(p.edge_id).replace(/[+-]$/, "") : "";
+      if (pe && pe === eid) {
+        const pid = p.id || p.point_id;
+        if (pid) {
+          PLAYBACK.visitedIds.add(pid);
+          PLAYBACK.visitedCoords.set(pid, { x: p.x, y: p.y });
+        }
+      }
+    });
+  }
+
+  function markAllInspectionPointsVisited() {
+    updateAllPlotPlayback();
   }
 
   function tickPlayback() {
@@ -1037,74 +1347,213 @@
 
     if (PLAYBACK.index >= PLAYBACK.timeline.length) {
       PLAYBACK.status = "finished";
+      PLAYBACK.running = false;
+      PLAYBACK.paused = false;
       notifyPlaybackPhase("finished");
       stopTimer();
       stopStreamLoop();
-      PLAYBACK.streamFrozen = true;
+      PLAYBACK.holdInspectSnapshot = false;
+      PLAYBACK.streamFrozen = false;
+      markAllInspectionPointsVisited();
+      printPlaybackCheck();
       setMissionState("COMPLETED");
       updateTelemetryFromPlayback("COMPLETED");
       pushEvent("任务执行完成");
       setPlaybackUi();
-      ["", "Fs"].forEach((p) => {
-        const st = $(`inspectCardStatus${p}`);
-        if (st) {
-          st.textContent = "任务完成";
-          st.className = "inspect-status done";
-        }
-      });
+      if (ENABLE_INSPECTION_IMAGE) {
+        ["", "Fs"].forEach((p) => {
+          const st = $(`inspectCardStatus${p}`);
+          if (st) {
+            st.textContent = "任务完成";
+            st.className = "inspect-status done";
+          }
+        });
+      }
+      updateAllPlotPlayback();
       return;
     }
 
     const ev = PLAYBACK.timeline[PLAYBACK.index];
+    const frameIndex = PLAYBACK.index;
     PLAYBACK.index += 1;
-
-    if (ev.type === "inspect") {
-      PLAYBACK.uavPos = { x: ev.point.x, y: ev.point.y };
-      PLAYBACK.currentPoint = { x: ev.point.x, y: ev.point.y };
-      PLAYBACK.currentPointId = ev.point.id || ev.point.point_id;
-      freezeStreamAtPoint(ev.point);
-      updateAllPlotPlayback();
-      showInspectCard(ev.point, ev.inspect_index, PLAYBACK.totalInspectCount);
-      stopTimer();
-      const dwell = (ev.dwell_ms || getDwellMs()) / getSpeed();
-      PLAYBACK.timer = setTimeout(onInspectComplete, dwell);
-      setPlaybackUi();
-      return;
+    PLAYBACK.uavPos = { x: ev.x, y: ev.y };
+    PLAYBACK.currentRouteIndex = ev.routeIndex != null ? ev.routeIndex : frameIndex;
+    PLAYBACK.currentPoint = null;
+    PLAYBACK.currentPointId = null;
+    checkInspectTriggersAtFrame(ev, frameIndex);
+    const tickPointIds = getFramePointIds(ev);
+    if (frameIndex % TICK_LOG_EVERY === 0 || tickPointIds.length) {
+      console.log(
+        `[tick] frame=${frameIndex} segment=${ev.segment_id || ""} point=${tickPointIds.join(",")}`
+      );
     }
-
-    if (ev.type === "move") {
-      PLAYBACK.uavPos = { x: ev.x, y: ev.y };
-      PLAYBACK.currentPoint = null;
-      PLAYBACK.currentPointId = null;
-      const nearOffset = nextInspectOffset(PLAYBACK.index);
-      if (PLAYBACK.index < 8) setMissionState("TAKEOFF");
-      else if (nearOffset >= 0 && nearOffset < 18) setMissionState("APPROACHING");
-      else if (PLAYBACK.missionState !== "LEAVING") setMissionState("CRUISING");
-      updateTelemetryFromPlayback(PLAYBACK.missionState);
-      updateAllPlotPlayback();
-      setPlaybackUi();
-      scheduleNext(MOVE_FRAME_MS / getSpeed());
-      return;
-    }
-
+    setMissionState("EXECUTING");
+    updateTelemetryFromPlayback("EXECUTING");
+    updateAllPlotPlayback();
     setPlaybackUi();
-    scheduleNext(8 / getSpeed());
+    scheduleNext(MOVE_FRAME_MS / getSpeed());
   }
 
-  function buildTimelineFromResult(result) {
-    PLAYBACK.dwellMs = getDwellMs();
-    PLAYBACK.speed = getSpeed();
-    PLAYBACK.timeline = window.buildInspectionPlaybackTimeline(result, PLAYBACK.dwellMs);
-    PLAYBACK.totalInspectCount = PLAYBACK.timeline.filter((e) => e.type === "inspect").length;
-    return PLAYBACK.timeline;
+  function getFramePointIds(frame) {
+    if (Array.isArray(frame.routePointIds)) return frame.routePointIds;
+    if (frame.routePointId) return [frame.routePointId];
+    return [];
   }
 
-  function initialUavPosition(result) {
-    const start = result?.markers?.start;
-    if (start) return { x: start.x, y: start.y };
-    const first = PLAYBACK.timeline.find((e) => e.type === "move");
-    if (first) return { x: first.x, y: first.y };
-    return null;
+  function triggerInspectionPoint(pointId) {
+    if (!pointId || PLAYBACK.visitedIds.has(pointId)) return;
+
+    const points = PLAYBACK.inspectPlotPoints || [];
+    const pt = points.find((p) => (p.point_id || p.id) === pointId);
+    if (!pt) return;
+
+    PLAYBACK.visitedIds.add(pointId);
+    PLAYBACK.currentPointId = pointId;
+    PLAYBACK.currentPoint = pt;
+    if (typeof window.showInspectionImage === "function") {
+      window.showInspectionImage(pt, { logAs: "route-point" });
+    }
+    if (ENABLE_INSPECTION_IMAGE) {
+      const total = PLAYBACK.totalInspectCount || points.length;
+      showInspectCard(
+        pt,
+        pt.orderIndex >= 0 ? pt.orderIndex + 1 : PLAYBACK.visitedIds.size,
+        total,
+        { skipInspectionImage: true }
+      );
+    }
+  }
+
+  function checkInspectTriggersAtFrame(ev, frameIndex) {
+    const ids = getFramePointIds(ev);
+    ids.forEach((pointId) => {
+      triggerInspectionPoint(pointId);
+    });
+  }
+
+  function getPlotlyMapElement() {
+    const candidates = [
+      document.getElementById("mapPlot"),
+      document.getElementById("mapPlotFs"),
+      document.querySelector(".js-plotly-plot"),
+    ].filter(Boolean);
+    for (let i = 0; i < candidates.length; i += 1) {
+      const el = candidates[i];
+      if (el?.data?.some((t) => t && (t.name === "巡检路径" || t.name === "连接路径"))) {
+        return el;
+      }
+    }
+    return (
+      document.getElementById("mapPlot") ||
+      document.getElementById("mapPlotFs") ||
+      document.querySelector(".js-plotly-plot")
+    );
+  }
+
+  function appendVerticesInOrder(timeline, xs, ys) {
+    if (!Array.isArray(xs) || !Array.isArray(ys)) return timeline;
+    for (let i = 0; i < xs.length; i += 1) {
+      const x = xs[i];
+      const y = ys[i];
+      if (x == null || y == null || !Number.isFinite(Number(x)) || !Number.isFinite(Number(y))) {
+        continue;
+      }
+      const px = Number(x);
+      const py = Number(y);
+      const prev = timeline[timeline.length - 1];
+      if (prev && dist(prev, { x: px, y: py }) <= CONTINUITY_EPS) continue;
+      timeline.push({
+        type: "move",
+        x: px,
+        y: py,
+        routeIndex: timeline.length,
+      });
+    }
+    return timeline;
+  }
+
+  function bindInspectionRouteIndices(timeline, inspectPoints) {
+    return (inspectPoints || []).map((pt, i) => {
+      let route_index = -1;
+      for (let j = 0; j < timeline.length; j += 1) {
+        const f = timeline[j];
+        if (Math.abs(f.x - pt.x) <= CONTINUITY_EPS && Math.abs(f.y - pt.y) <= CONTINUITY_EPS) {
+          route_index = j;
+          break;
+        }
+      }
+      return {
+        point_id: pt.point_id || pt.id,
+        id: pt.point_id || pt.id,
+        x: Number(pt.x),
+        y: Number(pt.y),
+        image_url: pt.image_url || `/api/inspection-image/${pt.point_id || pt.id}.jpg`,
+        segment_id: pt.segment_id || "",
+        edge_id: pt.edge_id || "",
+        orderIndex: pt.orderIndex != null ? pt.orderIndex : i,
+        route_index,
+      };
+    });
+  }
+
+  function logInspectionOrder(inspectPoints) {
+    inspectPoints.forEach((pt) => {
+      const pid = pt.point_id || pt.id;
+      console.log(`[inspection-order] ${pid} route_index=${pt.route_index}`);
+    });
+  }
+
+  function printPlaybackCheck() {
+    const points = PLAYBACK.inspectPlotPoints || [];
+    const triggered = points
+      .filter((p) => PLAYBACK.visitedIds.has(p.point_id || p.id))
+      .map((p) => p.point_id || p.id);
+    const missing = points
+      .filter((p) => !PLAYBACK.visitedIds.has(p.point_id || p.id))
+      .map((p) => p.point_id || p.id);
+    console.log(`[playback-check] triggered_points=[${triggered.join(",")}]`);
+    console.log(`[playback-check] missing_points=[${missing.join(",")}]`);
+    console.log(`[triggered points] ${triggered.length} / ${points.length}`);
+  }
+
+  /** 播放路线：严格按 __MISSION_ROUTE_SEQUENCE（dashboard.segments 原始顺序） */
+  function buildTimelineFromMissionRouteSequence() {
+    const seq = window.__MISSION_ROUTE_SEQUENCE;
+    if (!Array.isArray(seq) || !seq.length) {
+      alert("播放路径未初始化");
+      return [];
+    }
+
+    const timeline = seq.map((f, i) => {
+      const routePointIds = Array.isArray(f.routePointIds)
+        ? f.routePointIds.slice()
+        : f.routePointId
+          ? [f.routePointId]
+          : [];
+      return {
+        type: "move",
+        x: Number(f.x),
+        y: Number(f.y),
+        segment_id: f.segment_id || "",
+        segment_type: f.segment_type || f.type || "",
+        edge_id: f.edge_id || "",
+        routePointIds,
+        routePointId: routePointIds.length === 1 ? routePointIds[0] : null,
+        routeIndex: i,
+      };
+    });
+
+    const first = timeline[0];
+    if (
+      !first ||
+      !Number.isFinite(first.x) ||
+      !Number.isFinite(first.y)
+    ) {
+      alert("播放路径未初始化");
+      return [];
+    }
+
+    return timeline;
   }
 
   window.resetPlayback = function (result) {
@@ -1112,20 +1561,31 @@
     stopStreamLoop();
     clearPhaseTimers();
     PLAYBACK.status = "idle";
+    PLAYBACK.running = false;
+    PLAYBACK.paused = false;
+    PLAYBACK.t = 0;
     PLAYBACK.index = 0;
     PLAYBACK.currentPoint = null;
     PLAYBACK.currentPointId = null;
     PLAYBACK.visitedIds = new Set();
     PLAYBACK.visitedCoords = new Map();
+    PLAYBACK.activatedInspectSegments = new Set();
     PLAYBACK.timeline = [];
+    PLAYBACK.inspectPlotPoints = [];
     PLAYBACK.totalInspectCount = 0;
     PLAYBACK.startTimestamp = 0;
     PLAYBACK.streamFrozen = false;
+    PLAYBACK.holdInspectSnapshot = false;
     clearInspectCard();
 
     if (result) {
-      buildTimelineFromResult(result);
-      PLAYBACK.streamImages = buildStreamPool(result);
+      PLAYBACK.dwellMs = getDwellMs();
+      PLAYBACK.speed = getSpeed();
+      if (ENABLE_INSPECTION_IMAGE) {
+        PLAYBACK.streamImages = buildStreamPool(result);
+      } else {
+        PLAYBACK.streamImages = [];
+      }
       PLAYBACK.streamIndex = 0;
       PLAYBACK.uavPos = null;
     } else {
@@ -1152,49 +1612,64 @@
     }
   };
 
-  window.startInspectionPlayback = function (options = {}) {
-    const result = getMissionForPlayback();
-    if (!result) {
-      alert("请先生成/加载任务");
-      return;
-    }
+  window.startInspectionPlayback = function () {
+    if (PLAYBACK.status === "playing" || PLAYBACK._startLock) return;
+    PLAYBACK._startLock = true;
 
     stopTimer();
     stopStreamLoop();
-    buildTimelineFromResult(result);
+    clearPhaseTimers();
 
-    if (!PLAYBACK.timeline.length) {
-      alert("当前任务无可播放轨迹");
+    PLAYBACK.timeline = [];
+    PLAYBACK.index = 0;
+    PLAYBACK.t = 0;
+    PLAYBACK.running = false;
+    PLAYBACK.paused = false;
+    PLAYBACK.inspectPlotPoints = [];
+
+    const result = getMissionForPlayback();
+    if (!result) {
+      console.warn("[startInspectionPlayback] no mission");
+      PLAYBACK._startLock = false;
       return;
     }
 
-    PLAYBACK.index = 0;
-    PLAYBACK.visitedIds = new Set();
-    PLAYBACK.visitedCoords = new Map();
-    PLAYBACK.uavPos = initialUavPosition(result);
-    PLAYBACK.currentPoint = null;
-    PLAYBACK.currentPointId = null;
+    const timeline = buildTimelineFromMissionRouteSequence();
+    if (!timeline || !timeline.length) {
+      PLAYBACK._startLock = false;
+      return;
+    }
+
+    PLAYBACK.timeline = timeline;
+    PLAYBACK.inspectPlotPoints =
+      window.__INSPECTION_POINT_BINDINGS ||
+      window.__DRAWN_ROUTE_DEBUG?.inspect_points ||
+      [];
+    PLAYBACK.running = true;
+    PLAYBACK.paused = false;
     PLAYBACK.status = "playing";
-    notifyPlaybackPhase("playing");
     PLAYBACK.speed = getSpeed();
+    PLAYBACK.dwellMs = getDwellMs();
     PLAYBACK.startTimestamp = Date.now();
     PLAYBACK.streamFrozen = false;
-    PLAYBACK.streamImages = buildStreamPool(result);
-    PLAYBACK.streamIndex = 0;
+    PLAYBACK.holdInspectSnapshot = false;
+    PLAYBACK.totalInspectCount = PLAYBACK.inspectPlotPoints.length;
+    PLAYBACK.visitedIds = new Set();
+    PLAYBACK.visitedCoords = new Map();
+    PLAYBACK.activatedInspectSegments = new Set();
+    PLAYBACK.uavPos = { x: timeline[0].x, y: timeline[0].y };
+    PLAYBACK.currentPoint = null;
+    PLAYBACK.currentPointId = null;
 
+    notifyPlaybackPhase("playing");
+    setMissionState("EXECUTING");
     clearInspectCard();
-    ensureInspectCardVisible();
-    setMissionState("TAKEOFF");
     pushEvent("任务开始执行");
-    setStreamImage(CRUISE_STREAM_IMAGES[0], "实时图传已启动");
-    updateTelemetryFromPlayback("TAKEOFF");
-    scheduleStreamLoop();
+    updateTelemetryFromPlayback("EXECUTING");
     setPlaybackUi();
     updateAllPlotPlayback();
-
-    requestAnimationFrame(() => {
-      tickPlayback();
-    });
+    tickPlayback();
+    PLAYBACK._startLock = false;
   };
 
   window.pauseInspectionPlayback = function () {
@@ -1203,6 +1678,8 @@
     stopStreamLoop();
     clearPhaseTimers();
     PLAYBACK.status = "paused";
+    PLAYBACK.running = false;
+    PLAYBACK.paused = true;
     notifyPlaybackPhase("paused");
     setMissionState("PAUSED");
     updateTelemetryFromPlayback("PAUSED");
@@ -1213,6 +1690,8 @@
   window.resumeInspectionPlayback = function () {
     if (PLAYBACK.status !== "paused") return;
     PLAYBACK.status = "playing";
+    PLAYBACK.running = true;
+    PLAYBACK.paused = false;
     notifyPlaybackPhase("playing");
     PLAYBACK.speed = getSpeed();
     setMissionState("CRUISING");
@@ -1228,7 +1707,12 @@
   };
 
   document.addEventListener("DOMContentLoaded", () => {
-    $("playbackStartBtn")?.addEventListener("click", () => window.startInspectionPlayback());
+    ["", "Fs"].forEach((suffix) => ensureInspectDualSlotsMounted(suffix));
+    removeDuplicateInspectPanels();
+    $("playbackStartBtn")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      window.startInspectionPlayback();
+    });
     $("playbackPauseBtn")?.addEventListener("click", () => window.pauseInspectionPlayback());
     $("playbackResumeBtn")?.addEventListener("click", () => window.resumeInspectionPlayback());
     $("playbackResetBtn")?.addEventListener("click", () => window.resetInspectionPlayback());

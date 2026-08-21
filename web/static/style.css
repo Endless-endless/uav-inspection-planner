@@ -151,6 +151,8 @@ body {
   align-items: stretch;
   flex: 1;
   min-height: 0;
+  overflow-x: hidden;
+  min-width: 0;
 }
 
 .map-inspect-row:has(.inspect-info-card:not(.hidden)) {
@@ -181,7 +183,9 @@ body {
   border-radius: 12px;
   padding: 0.8rem 0.9rem;
   min-width: 0;
+  max-width: 100%;
   max-height: 620px;
+  overflow-x: hidden;
   overflow-y: auto;
   box-shadow: 0 12px 26px rgba(0, 0, 0, 0.38), inset 0 0 0 1px rgba(56, 189, 248, 0.07);
   transition: transform 0.18s ease, box-shadow 0.18s ease;
@@ -721,12 +725,38 @@ body {
   overflow: hidden;
 }
 
+/* HTML <img> 底图 + Plotly 透明叠层（不依赖 layout.images） */
+.map-plot-stack {
+  position: relative;
+}
+
+.map-basemap-img {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  z-index: 0;
+  pointer-events: none;
+  user-select: none;
+}
+
+.plotly-map-layer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+}
+
 .plot-stage-fs .plot-area-fs {
   width: 100%;
   height: 100%;
   min-height: 0;
   border: 1px solid rgba(71, 85, 105, 0.55);
-  background: rgba(15, 23, 42, 0.36);
+  background: transparent;
 }
 
 .inspect-float .inspect-img-wrap img {
@@ -1471,4 +1501,164 @@ body.fullscreen-active .modal-header span:first-child {
   .cards-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+
+/* 右侧飞行状态：精简单图面板（隐藏旧双图/冗余行） */
+.inspect-ui-hidden-legacy {
+  display: none !important;
+}
+
+.inspect-ui-hidden-legacy.inspect-stream-panel,
+#inspectStreamPanel.inspect-ui-hidden-legacy,
+#inspectStreamPanelFs.inspect-ui-hidden-legacy {
+  display: none !important;
+}
+
+.inspect-panel-compact {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.inspect-section-h {
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: #e2e8f0;
+  margin-top: 0.15rem;
+}
+
+.inspect-section-h--sub {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #94a3b8;
+  margin-top: 0.5rem;
+}
+
+.inspect-flight-status-line {
+  font-size: 0.88rem;
+  color: #7dd3fc;
+  min-height: 1.25em;
+}
+
+.inspect-live-image-wrap {
+  max-width: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.inspect-compact-meta {
+  margin-top: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.78rem;
+  color: #cbd5e1;
+}
+
+.inspect-compact-meta-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  line-height: 1.35;
+}
+
+.inspect-compact-k {
+  color: #94a3b8;
+  flex: 0 0 auto;
+}
+
+.inspect-compact-v {
+  text-align: right;
+  word-break: break-all;
+}
+
+.inspect-live-placeholder--show {
+  display: block !important;
+}
+
+.inspect-card-caption.inspect-live-placeholder {
+  display: none;
+  font-size: 0.82rem;
+  color: #94a3b8;
+  text-align: center;
+  margin-top: 0.25rem;
+}
+
+/* 禁止在卡片内显示动态插入的重复图传面板 */
+.inspect-info-card > #inspectImagePanel,
+.inspect-info-card > #inspectImagePanelFs,
+.inspect-info-card .inspect-image-panel:not(.inspect-img-wrap .inspect-image-panel) {
+  display: none !important;
+}
+
+.inspect-info-card .inspect-img-wrap img {
+  display: block;
+  width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+  border-radius: 8px;
+  background: #0f172a;
+}
+
+/* 巡检快照主图 */
+.inspect-flight-img {
+  width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+  border-radius: 8px;
+  background: #0f172a;
+}
+
+/* 右侧飞行状态卡片 · 播放流 / 巡检快照（legacy，已隐藏） */
+.inspect-stream-slot,
+.inspect-stream-panel {
+  max-width: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+  margin-top: 0.25rem;
+  margin-bottom: 0.35rem;
+}
+
+.inspect-stream-img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  max-height: 140px;
+  object-fit: contain;
+  border-radius: 8px;
+  background: #0f172a;
+  box-sizing: border-box;
+}
+
+.inspect-image-panel {
+  margin-top: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.inspect-snapshot-panel {
+  max-width: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.inspect-snapshot-panel .inspect-snapshot-img,
+img.inspect-flight-img.inspect-snapshot-img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  max-height: 320px;
+  object-fit: contain;
+  border-radius: 8px;
+  background: #0f172a;
+  box-sizing: border-box;
+}
+
+.inspect-image-panel .inspect-card-caption,
+.inspect-card-caption {
+  font-size: 0.72rem;
+  color: #94a3b8;
+  margin-top: 0.35rem;
+  min-height: 1.2em;
 }

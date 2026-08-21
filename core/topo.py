@@ -26,7 +26,9 @@
 
 本次实现不包含：
 - 曲率极大值切分（已取消）
-- T型连接/junction合并（Phase 1.2再做）
+
+跨线连通（最小版本）：
+- merge_cross_line_junctions：端点-端点吸附、端点到其它线路折线的投影吸附（与 merge_duplicate_nodes 的 25px 聚类独立）
 """
 
 from dataclasses import dataclass, field
@@ -53,7 +55,7 @@ ANGLE_WINDOW = 10      # 角度去重窗口大小（骨架点数）
 class TopoNode:
     """拓扑节点"""
     id: str                          # 唯一标识
-    kind: str                        # endpoint / split
+    kind: str                        # endpoint / split / junction
     pos2d: Tuple[float, float]       # (x, y)
     pos3d: Tuple[float, float, float] # (x, y, z)
     deg: int                         # 度数（连接的边数）
@@ -75,6 +77,9 @@ class TopoEdge:
     line_id: str                     # 所属线路ID
     polyline: List[Tuple[float, float]] # 2D几何（从u到v的骨架段）
     len2d: float                     # 长度
+    pixel_polyline: List[Tuple[float, float]] = field(default_factory=list)
+    original_polyline: List[Tuple[float, float]] = field(default_factory=list)
+    image_polyline: List[Tuple[float, float]] = field(default_factory=list)
     pts_idx: List[int] = field(default_factory=list)  # 该边对应的巡检点索引
     meta: Dict = field(default_factory=dict)
 
@@ -596,6 +601,263 @@ def merge_duplicate_nodes(nodes: List[TopoNode],
     return merged_nodes, old_to_new_id
 
 
+# =====================================================
+# 跨 line_id junction（最小版本）
+# =====================================================
+
+
+class _UnionFind:
+    def __init__(self, n: int):
+        self.p = list(range(n))
+
+    def find(self, x: int) -> int:
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[ra] = rb
+
+
+def _same_line_opposite_endpoints_conflict(n1: TopoNode, n2: TopoNode) -> bool:
+    """同一条线起点与终点不可合并（与 merge_duplicate_nodes 一致）。"""
+    if n1.kind != "endpoint" or n2.kind != "endpoint":
+        return False
+    if not (set(n1.line_ids) & set(n2.line_ids)):
+        return False
+    return n1.pt_indices != n2.pt_indices
+
+
+def _closest_point_on_polyline(
+    poly: List[Tuple[int, int]], px: float, py: float
+) -> Tuple[Tuple[float, float], float]:
+    """折线上与 (px,py) 最近的点及欧氏距离。"""
+    if len(poly) < 2:
+        if poly:
+            dx = px - float(poly[0][0])
+            dy = py - float(poly[0][1])
+            return (float(poly[0][0]), float(poly[0][1])), float((dx * dx + dy * dy) ** 0.5)
+        return (px, py), float("inf")
+    best_d = float("inf")
+    best_q = (px, py)
+    for i in range(len(poly) - 1):
+        ax, ay = float(poly[i][0]), float(poly[i][1])
+        bx, by = float(poly[i + 1][0]), float(poly[i + 1][1])
+        abx, aby = bx - ax, by - ay
+        apx, apy = px - ax, py - ay
+        ab2 = abx * abx + aby * aby + 1e-12
+        t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
+        qx = ax + t * abx
+        qy = ay + t * aby
+        dx, dy = px - qx, py - qy
+        d = float((dx * dx + dy * dy) ** 0.5)
+        if d < best_d:
+            best_d, best_q = d, (qx, qy)
+    return best_q, best_d
+
+
+def merge_cross_line_junctions(
+    nodes: List[TopoNode],
+    lines,
+    endpoint_pair_tol: float = 200.0,
+    proj_tol: float = 150.0,
+    vertex_tol: float = 40.0,
+) -> Tuple[List[TopoNode], Dict[str, str]]:
+    """
+    跨 line_id 合并：端点-端点吸附、端点到其它线路折线的投影/近邻吸附。
+
+    与 merge_duplicate_nodes（默认 25px）独立，使用更大的几何阈值，便于相邻线路在图上连通。
+
+    Returns:
+        (merged_nodes, id_map): id_map 将输入中的每个节点 id 映射到输出图中的节点 id。
+    """
+    print(
+        f"[跨线junction] 开始: endpoint_pair_tol={endpoint_pair_tol}px, "
+        f"proj_tol={proj_tol}px, vertex_tol={vertex_tol}px"
+    )
+
+    id_map: Dict[str, str] = {n.id: n.id for n in nodes}
+    if len(nodes) <= 1:
+        return list(nodes), id_map
+
+    line_by_id = {ln.id: ln for ln in lines}
+    n = len(nodes)
+    uf = _UnionFind(n)
+
+    # (1) 端点-端点（跨线或异位置；禁止同线起终点）
+    for i in range(n):
+        ni = nodes[i]
+        if ni.kind != "endpoint":
+            continue
+        for j in range(i + 1, n):
+            nj = nodes[j]
+            if nj.kind != "endpoint":
+                continue
+            if _same_line_opposite_endpoints_conflict(ni, nj):
+                continue
+            dist = float(euclidean(ni.pos2d, nj.pos2d))
+            if dist <= endpoint_pair_tol:
+                uf.union(i, j)
+
+    # (2) 端点 -> 其它线路折线投影，吸附到该线上最近的拓扑节点
+    for i, ni in enumerate(nodes):
+        if ni.kind != "endpoint":
+            continue
+        own_lines = set(ni.line_ids)
+        px, py = float(ni.pos2d[0]), float(ni.pos2d[1])
+        for lid, line in line_by_id.items():
+            if lid in own_lines:
+                continue
+            poly = line.ordered_pixels
+            if len(poly) < 2:
+                continue
+            q, d_line = _closest_point_on_polyline(poly, px, py)
+            if d_line > proj_tol:
+                continue
+            best_j = -1
+            best_qd = float("inf")
+            for j, nj in enumerate(nodes):
+                if lid not in nj.line_ids:
+                    continue
+                qd = float(euclidean(nj.pos2d, q))
+                if qd < best_qd:
+                    best_qd, best_j = qd, j
+            if best_j < 0:
+                continue
+            nj = nodes[best_j]
+            d_direct = float(euclidean(ni.pos2d, nj.pos2d))
+            if best_qd <= vertex_tol or d_direct <= proj_tol:
+                uf.union(i, best_j)
+
+    # 收集簇
+    clusters: Dict[int, List[int]] = {}
+    for i in range(n):
+        r = uf.find(i)
+        clusters.setdefault(r, []).append(i)
+
+    kind_priority = {"junction": 4, "split": 2, "endpoint": 1}
+    merged_out: List[TopoNode] = []
+    jid = 0
+
+    for _, idxs in sorted(clusters.items(), key=lambda kv: min(kv[1])):
+        idxs = sorted(idxs, key=lambda ii: nodes[ii].id)
+        cluster = [nodes[ii] for ii in idxs]
+        if len(cluster) == 1:
+            nn = cluster[0]
+            merged_out.append(nn)
+            id_map[nn.id] = nn.id
+            continue
+
+        avg_x = sum(x.pos2d[0] for x in cluster) / len(cluster)
+        avg_y = sum(x.pos2d[1] for x in cluster) / len(cluster)
+        avg_z = sum(x.pos3d[2] for x in cluster) / len(cluster)
+
+        merged_line_ids: List[str] = []
+        for x in cluster:
+            for lid in x.line_ids:
+                if lid not in merged_line_ids:
+                    merged_line_ids.append(lid)
+
+        merged_pt_indices: Dict[str, List] = {}
+        for x in cluster:
+            for lid, pt_idx in x.pt_indices.items():
+                if lid not in merged_pt_indices:
+                    merged_pt_indices[lid] = []
+                if isinstance(pt_idx, list):
+                    for t in pt_idx:
+                        if t not in merged_pt_indices[lid]:
+                            merged_pt_indices[lid].append(t)
+                else:
+                    if pt_idx not in merged_pt_indices[lid]:
+                        merged_pt_indices[lid].append(pt_idx)
+        for lid in list(merged_pt_indices.keys()):
+            if len(merged_pt_indices[lid]) == 1:
+                merged_pt_indices[lid] = merged_pt_indices[lid][0]
+
+        merged_kind = max((x.kind for x in cluster), key=lambda k: kind_priority.get(k, 0))
+        if len(merged_line_ids) > 1:
+            merged_kind = "junction"
+
+        new_id = f"junction_{jid}"
+        jid += 1
+
+        merged_node = TopoNode(
+            id=new_id,
+            kind=merged_kind,
+            pos2d=(avg_x, avg_y),
+            pos3d=(avg_x, avg_y, avg_z),
+            deg=0,
+            line_ids=merged_line_ids,
+            pt_indices=merged_pt_indices,
+        )
+        for x in cluster:
+            if hasattr(x, "angle_change") and x.angle_change > 0:
+                merged_node.angle_change = max(merged_node.angle_change, x.angle_change)
+            if getattr(x, "split_reason", None):
+                if not merged_node.split_reason or merged_node.split_reason == "length":
+                    merged_node.split_reason = x.split_reason
+
+        # 推断日志 reason / distance
+        line_set = sorted(merged_line_ids)
+        dmin = float(
+            min(
+                euclidean(cluster[a].pos2d, cluster[b].pos2d)
+                for a in range(len(cluster))
+                for b in range(a + 1, len(cluster))
+            )
+        )
+        all_endpoint = all(x.kind == "endpoint" for x in cluster)
+        if all_endpoint:
+            reason = "endpoint_snap"
+        elif any(x.kind != "endpoint" for x in cluster):
+            reason = "projection_snap"
+        else:
+            reason = "junction_merge"
+
+        d_polyline = None
+        if reason == "projection_snap":
+            d_polyline = float("inf")
+            for x in cluster:
+                if x.kind != "endpoint":
+                    continue
+                own = set(x.line_ids)
+                px, py = float(x.pos2d[0]), float(x.pos2d[1])
+                for lid, ln in line_by_id.items():
+                    if lid in own:
+                        continue
+                    poly = ln.ordered_pixels
+                    if len(poly) < 2:
+                        continue
+                    _, dln = _closest_point_on_polyline(poly, px, py)
+                    d_polyline = min(d_polyline, dln)
+            if d_polyline == float("inf"):
+                d_polyline = None
+
+        merged_node.meta["junction_reason"] = reason
+        merged_node.meta["junction_d_min"] = round(dmin, 3)
+        if d_polyline is not None:
+            merged_node.meta["junction_d_polyline"] = round(float(d_polyline), 3)
+
+        extra = ""
+        if d_polyline is not None:
+            extra = f" d_polyline={d_polyline:.2f}px"
+
+        print(
+            f"  [topo/junction] merged id={new_id} reason={reason} distance={dmin:.2f}px{extra} "
+            f"line_ids={line_set} members={[x.id for x in cluster]}"
+        )
+
+        merged_out.append(merged_node)
+        for x in cluster:
+            id_map[x.id] = new_id
+
+    print(f"[跨线junction] 完成: {len(nodes)} -> {len(merged_out)} 个节点")
+    return merged_out, id_map
+
+
 def update_edges_after_merge(edges: List[TopoEdge],
                               old_to_new_id: Dict[str, str]) -> List[TopoEdge]:
     """
@@ -622,13 +884,23 @@ def update_edges_after_merge(edges: List[TopoEdge],
             removed_count += 1
             continue
 
+        px = list(
+            edge.pixel_polyline
+            or edge.original_polyline
+            or edge.image_polyline
+            or edge.polyline
+            or []
+        )
         # 创建更新后的边
         updated_edge = TopoEdge(
             id=edge.id,
             u=new_u,
             v=new_v,
             line_id=edge.line_id,
-            polyline=edge.polyline,
+            polyline=px,
+            pixel_polyline=list(px),
+            original_polyline=list(px),
+            image_polyline=list(px),
             len2d=edge.len2d,
             pts_idx=edge.pts_idx,
             is_straight=edge.is_straight,
@@ -737,12 +1009,16 @@ def split_line_to_edges(line, nodes_on_line: List[TopoNode],
                             max_dev = max(max_dev, dev)
                         is_straight = max_dev < 5.0
 
+                px = [(float(p[0]), float(p[1])) for p in edge_polyline]
                 edge = TopoEdge(
                     id=f"{line.id}_edge_0",
                     u=u_node.id,
                     v=v_node.id,
                     line_id=line.id,
-                    polyline=edge_polyline,
+                    polyline=px,
+                    pixel_polyline=list(px),
+                    original_polyline=list(px),
+                    image_polyline=list(px),
                     len2d=edge_len,
                     is_straight=is_straight,
                     split_reason=None
@@ -817,12 +1093,16 @@ def split_line_to_edges(line, nodes_on_line: List[TopoNode],
         if v_node.kind == "split":
             split_reason = v_node.split_reason
 
+        px = [(float(p[0]), float(p[1])) for p in edge_polyline]
         edge = TopoEdge(
             id=f"{line.id}_edge_{i}",
             u=u_node.id,
             v=v_node.id,
             line_id=line.id,
-            polyline=edge_polyline,
+            polyline=px,
+            pixel_polyline=list(px),
+            original_polyline=list(px),
+            image_polyline=list(px),
             len2d=edge_len,
             is_straight=is_straight,
             split_reason=split_reason

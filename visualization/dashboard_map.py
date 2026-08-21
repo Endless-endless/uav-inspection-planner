@@ -1,9 +1,7 @@
 """
-Web Dashboard 真实地图底图配置（第九阶段）
+Web Dashboard 真实地图底图配置。
 
-与 demo/generate_interactive_main_view.py 一致：
-- 底图 data/test.png
-- Plotly layout.images，y 轴向下（range [height, 0]）
+底图通过 Plotly layout.images 叠加，y 轴向下（range [height, 0]）。
 """
 
 from __future__ import annotations
@@ -34,11 +32,12 @@ def get_background_map_config(
     """
     返回 Dashboard 可用的底图元数据（不含 base64，由前端通过 URL 加载）。
 
-    layout.images 参数与 generate_interactive_main_view 对齐。
+    layout.images 参数与 Dashboard Plotly 底图一致。
     """
     map_path = resolve_map_path(root, map_rel)
+    rel_norm = str(map_rel).replace("\\", "/")
     if image_url is None:
-        image_url = f"/api/map/background?path={map_rel}"
+        image_url = f"/{rel_norm}" if rel_norm.startswith("data/") else f"/api/map/background?path={map_rel}"
     if not map_path.exists():
         return {
             "available": False,
