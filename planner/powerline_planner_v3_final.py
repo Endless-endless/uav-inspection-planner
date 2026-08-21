@@ -2768,76 +2768,6 @@ class PowerlinePlannerV3:
 
         return self.g_path_2d, self.g_path_3d
 
-    def step10_prepare_vis(self):
-        """
-        STEP 10: 准备可视化数据
-
-        将阶段2结果转换为可视化系统可接受的格式。
-        """
-        print("[STEP 10] 准备可视化数据...")
-
-        if not self.g_path_3d:
-            print("[WARN] 尚未构建全局路径，请先调用 step9_build_g_path()")
-            return
-
-        from core.vis_adapter import adapt_stage2_to_vis
-
-        self.vis_pts, self.vis_tasks, self.vis_stats, self.anim_path_3d = \
-            adapt_stage2_to_vis(self)
-
-        print(f"  [可视化] 巡检点: {len(self.vis_pts)}")
-        print(f"  [可视化] 任务段: {len(self.vis_tasks)}")
-        print(f"  [可视化] 动画路径: {len(self.anim_path_3d)} 点")
-
-        return self.vis_pts, self.vis_tasks, self.vis_stats, self.anim_path_3d
-
-    def step11_export_stage2_demo(self, output_html="result/mission_stage2_demo.html"):
-        """
-        STEP 11: 导出Stage2 HTML演示
-
-        生成阶段2任务优化的3D交互式HTML演示文件。
-
-        Args:
-            output_html: 输出HTML文件路径
-        """
-        print("[STEP 11] 导出Stage2 HTML演示...")
-
-        if not self.anim_path_3d:
-            print("[WARN] 尚未准备可视化数据，请先调用 step10_prepare_vis()")
-            return
-
-        from core.visualization_enhanced import create_stage2_mission_view
-        import os
-
-        # 确保输出目录存在
-        os.makedirs(os.path.dirname(output_html) or '.', exist_ok=True)
-
-        # 获取地形（使用平滑地形用于显示）
-        terrain = self.height_map_smooth if hasattr(self, 'height_map_smooth') else None
-
-        # 获取图像对象（用于底图显示）
-        image_obj = self.image if hasattr(self, 'image') else None
-
-        # 生成HTML
-        html = create_stage2_mission_view(
-            anim_path_3d=self.anim_path_3d,
-            vis_pts=self.vis_pts,
-            vis_tasks=self.vis_tasks,
-            vis_stats=self.vis_stats,
-            terrain=terrain,
-            image_obj=image_obj,
-            image_path=self.image_path
-        )
-
-        # 保存文件
-        with open(output_html, 'w', encoding='utf-8') as f:
-            f.write(html)
-
-        print(f"  [保存] {output_html}")
-
-        return output_html
-
-
     # =====================================================
     # 拓扑层方法（新增 - Phase 1）
     # =====================================================
@@ -3799,14 +3729,6 @@ def plan_powerline_mission_v2(
     planner.step7_build_tasks()
     planner.step8_opt_mission(start_pos=start_pos, wind=wind)
     planner.step9_build_g_path(start_pos=start_pos)
-
-    # 可选：导出Stage2 HTML演示
-    if export_html:
-        print("\n" + "=" * 70)
-        print("生成Stage2可视化演示...")
-        print("=" * 70)
-        planner.step10_prepare_vis()
-        planner.step11_export_stage2_demo(output_html=html_output_path)
 
     print("\n" + "=" * 70)
     print("任务规划完成！")

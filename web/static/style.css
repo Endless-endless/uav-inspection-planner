@@ -1584,7 +1584,23 @@ body.fullscreen-active .modal-header span:first-child {
   margin-top: 0.25rem;
 }
 
-/* 巡检快照主图（与 .inspect-snapshot-img 并存，保证有容器即可见） */
+/* 禁止在卡片内显示动态插入的重复图传面板 */
+.inspect-info-card > #inspectImagePanel,
+.inspect-info-card > #inspectImagePanelFs,
+.inspect-info-card .inspect-image-panel:not(.inspect-img-wrap .inspect-image-panel) {
+  display: none !important;
+}
+
+.inspect-info-card .inspect-img-wrap img {
+  display: block;
+  width: 100%;
+  max-height: 320px;
+  object-fit: contain;
+  border-radius: 8px;
+  background: #0f172a;
+}
+
+/* 巡检快照主图 */
 .inspect-flight-img {
   width: 100%;
   max-height: 320px;
@@ -1593,7 +1609,7 @@ body.fullscreen-active .modal-header span:first-child {
   background: #0f172a;
 }
 
-/* 右侧飞行状态卡片 · 播放流 / 巡检快照（双 img，互不覆盖） */
+/* 右侧飞行状态卡片 · 播放流 / 巡检快照（legacy，已隐藏） */
 .inspect-stream-slot,
 .inspect-stream-panel {
   max-width: 100%;

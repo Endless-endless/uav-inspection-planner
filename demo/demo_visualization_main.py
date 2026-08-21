@@ -67,7 +67,6 @@ def main(
     files_to_clean = [
         "result/latest/mission_output.json",
         "result/latest/mission_output_before_replan.json",
-        "result/latest/main_view_interactive.html"
     ]
 
     cleaned_count = 0
@@ -245,139 +244,9 @@ def main(
 
     print(f"[完成] JSON 已导出: {json_path}")
     print()
-
-    # =====================================================
-    # Phase 3: 构建 3D 路径
-    # =====================================================
-    print()
-    print("Phase 3: 构建 3D 路径...")
-    print("-"*70)
-
-    # 将 2D 路径转换为 3D（使用地形高度）
-    path_3d = []
-    for point_2d in mission.full_path:
-        x, y = point_2d
-        # 从地形获取高度，或使用默认飞行高度
-        h_idx, w_idx = int(y), int(x)
-        if 0 <= h_idx < planner.height and 0 <= w_idx < planner.width:
-            z = planner.terrain_3d[h_idx, w_idx, 2]
-        else:
-            z = planner.flight_height
-        path_3d.append((x, y, z))
-
-    print(f"[完成] 3D 路径点: {len(path_3d)} 个")
-    print()
-
-    # =====================================================
-    # Phase 4: 生成交互式主展示页
-    # =====================================================
-    print()
-    print("Phase 4: 生成交互式主展示页（基于 Plotly layout.images）...")
-    print("-"*70)
-
-    try:
-        from demo.generate_interactive_main_view import create_interactive_main_view
-
-        # 生成交互式主展示页，传递当前天气信息
-        html_path = create_interactive_main_view(
-            map_image_path=image_path,
-            mission_json_path=json_path,
-            output_html_path='result/latest/main_view_interactive.html',
-            weather=weather_info  # 直接使用当前 weather_scene 对应的天气字典
-        )
-
-        print(f"[完成] 交互式主展示页已生成: {html_path}")
-        print()
-
-    except Exception as e:
-        print(f"[WARN] 交互式主展示页生成失败: {e}")
-        print(f"  请检查: {type(e).__name__}")
-        print()
-        return planner
-
-    # =====================================================
-    # Phase 5: 生成2D地图叠加页（基于 data/test.png）
-    # =====================================================
-    print()
-    print("Phase 5: 生成2D地图叠加页（基于 data/test.png）...")
-    print("-"*70)
-
-    try:
-        from visualization.map_overlay import plot_path_on_real_map, plot_path_on_real_map_with_coords
-
-        # 使用 data/test.png 作为底图
-        map_image_path = image_path
-        if os.path.exists(map_image_path):
-            # 标准版（基于 data/test.png）
-            plot_path_on_real_map(
-                map_image_path=map_image_path,
-                path=path_3d,
-                resolution=1.0,
-                output_path="result/latest/map_overlay_test.png",
-                start_marker=True,
-                end_marker=True,
-                path_color='blue',  # 使用蓝色以突出路径
-                path_width=3.0,     # 加粗路径线
-                dpi=150
-            )
-
-            # 带坐标版（基于 data/test.png）
-            plot_path_on_real_map_with_coords(
-                map_image_path=map_image_path,
-                path=path_3d,
-                b_min=(0, 0, 0),
-                resolution=1.0,
-                output_path="result/latest/map_overlay_test_with_coords.png",
-                show_coords=True
-            )
-
-            print("[完成] 2D地图叠加页已生成（基于 data/test.png）")
-            print()
-        else:
-            print(f"[跳过] 地图文件不存在: {map_image_path}")
-            print()
-
-    except Exception as e:
-        print(f"[WARN] 2D地图叠加生成失败: {e}")
-        print(f"  错误详情: {type(e).__name__}")
-        print()
-
-    # =====================================================
-    # 完成
-    # =====================================================
-    print("="*70)
-    print("处理完成！已生成全新的初始任务版本")
-    print("="*70)
-    print()
-    print("[重要说明]")
-    print("  本次运行已生成全新的初始任务版本，未使用任何重规划结果。")
-    print("  如需重规划，请使用交互式主展示页中的起点输入功能，或启动重规划服务：")
-    print("    python scripts/replan_service.py")
-    print()
-    print("[输出文件]")
-    print("  - result/latest/mission_output.json (标准任务 JSON - 初始版本)")
-    print("  - result/latest/main_view_interactive.html (主展示页 - 基于 data/test.png 地图底图)")
-    print("  - result/latest/map_overlay_test.png (2D地图叠加 - 基于 data/test.png)")
-    print("  - result/latest/map_overlay_test_with_coords.png (2D地图叠加 - 带坐标)")
-    print("  - result/latest/01-08*.png (各阶段结果)")
-    print()
-    print("[交互式主展示页说明]")
-    print("  - 在浏览器中打开 main_view_interactive.html")
-    print("  - 基于 data/test.png 真实地图的交互式展示")
-    print("  - 显示：真实地图 + 蓝色路径 + inspection points")
-    print("  - 交互功能：")
-    print("    * 鼠标 hover 路径查看路径点信息")
-    print("    * 鼠标 hover inspection points 查看点详情")
-    print("    * 点击图例显示/隐藏 sample points")
-    print("    * 使用工具栏缩放、平移、选择区域")
-    print()
-    print("[辅助页面]")
-    print("  - 导航页: python demo/demo_ui_animation.py")
-    print("    (输入坐标，找到最近工点并更新执行路径)")
-    print()
-    print("[底图用途]")
-    print("  - data/test.png: 主展示页底图（统一数据源）")
-    print()
+    print("=" * 70)
+    print("图像主线任务生成完成（Dashboard 使用 result/latest/mission_output.json）")
+    print("=" * 70)
 
     return planner
 

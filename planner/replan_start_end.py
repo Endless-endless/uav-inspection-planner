@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from weather.weather_cost import compute_edge_weather_penalty
 
 from core.topo import TopoGraph
 from core.topo_plan import generate_connection_segment_along_topo
@@ -24,6 +23,12 @@ from planner.mission_result_builder import (
     normalize_inspection_point_source,
 )
 from planner.topo_dijkstra import generate_connection_segment_with_planner
+
+
+def compute_edge_weather_penalty(geometry, zones, **kwargs) -> Dict[str, Any]:
+    """天气惩罚已移除；重规划连接代价仅基于几何。"""
+    return {"total_penalty": 0.0}
+
 
 IMAGE_WIDTH = 916
 IMAGE_HEIGHT = 960

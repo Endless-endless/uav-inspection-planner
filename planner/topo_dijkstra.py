@@ -20,7 +20,11 @@ from core.topo_plan import (
     _project_point_to_polyline_distance,
     _slice_polyline_by_distance,
 )
-from weather.weather_cost import compute_edge_weather_penalty
+
+
+def compute_edge_weather_penalty(*_args, **_kwargs) -> float:
+    """天气惩罚已移除；连接代价仅基于几何长度。"""
+    return 0.0
 
 
 def edge_cost(edge: TopoEdge, cost_config: Optional[Dict[str, Any]] = None) -> float:

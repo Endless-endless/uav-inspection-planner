@@ -7,10 +7,9 @@
   /** 关闭图传/快照/右侧巡检卡片相关 DOM，避免干扰主播放链路 */
   const ENABLE_INSPECTION_IMAGE = true;
 
-  const MOVE_STEP_PX = 10;
-  const MOVE_FRAME_MS = 20;
-  const POINT_TRIGGER_DIST = 8;
-  const CONTINUITY_EPS = 5;
+  const MOVE_FRAME_MS = 120;
+  const CONTINUITY_EPS = 1e-3;
+  const TICK_LOG_EVERY = 50;
   const STREAM_INTERVAL_MIN = 300;
   const STREAM_INTERVAL_MAX = 1000;
   const MAX_EVENT_ITEMS = 10;
@@ -79,6 +78,10 @@
     running: false,
     paused: false,
     t: 0,
+    /** 巡检点 + route_index（仅图传，不参与路线） */
+    inspectPlotPoints: [],
+    /** 当前帧 route_index */
+    currentRouteIndex: 0,
   };
 
   function getMissionForPlayback() {
@@ -94,8 +97,10 @@
   }
 
   function notifyPlaybackPhase(status) {
-    if (window.AppPhaseManager?.setPlaybackStatus) {
-      AppPhaseManager.setPlaybackStatus(status);
+    if (typeof window.setTaskControlPhase === "function") {
+      if (status === "playing") window.setTaskControlPhase("playing");
+      else if (status === "paused") window.setTaskControlPhase("paused");
+      else if (status === "idle") window.setTaskControlPhase("idle");
     }
   }
 
@@ -473,7 +478,7 @@
     PLAYBACK.streamCurrentUrl = url || STREAM_FALLBACKS[0];
     ["", "Fs"].forEach((p) => {
       ensureInspectDualSlotsMounted(p);
-      const img = $(`inspectCardImg${p}`);
+      const img = getCanonicalInspectImg(p);
       if (!img) return;
       img.onerror = () => {
         img.src = STREAM_FALLBACKS[(PLAYBACK.streamIndex + 1) % STREAM_FALLBACKS.length];
@@ -700,87 +705,75 @@
     else parent.appendChild(node);
   }
 
+  function getCanonicalInspectImg(suffix) {
+    const p = suffix || "";
+    const mount =
+      p === "Fs"
+        ? document.getElementById("inspectInfoCardFs")
+        : document.getElementById("inspectInfoCard");
+    if (!mount) return document.getElementById(`inspectCardImg${p}`);
+    const wrapImg = mount.querySelector(".inspect-img-wrap img");
+    if (wrapImg) return wrapImg;
+    return document.getElementById(`inspectCardImg${p}`);
+  }
+
+  /** 移除动态插入的重复图传面板，只保留 index.html 内 .inspect-img-wrap 中的单图 */
+  function removeDuplicateInspectPanels(mount) {
+    if (!mount) return;
+    const canonical = mount.querySelector(".inspect-img-wrap img");
+    mount.querySelectorAll("#inspectImagePanel, #inspectImagePanelFs").forEach((panel) => {
+      if (!panel.closest(".inspect-img-wrap")) panel.remove();
+    });
+    const imgs = mount.querySelectorAll("img#inspectCardImg, img#inspectCardImgFs, img.inspect-flight-img");
+    imgs.forEach((img) => {
+      if (canonical && img !== canonical && !canonical.parentElement?.contains(img)) {
+        img.remove();
+      }
+    });
+  }
+
   /**
-   * 在飞行状态卡片内挂载「实时图传」单图区域（inspectCardImg），隐藏旧版双图结构。
+   * 保证右侧飞行状态卡片内存在唯一图传 img（复用 index.html #inspectCardImg，不 append 新节点）。
    */
   function ensureInspectDualSlotsMounted(suffix) {
     const p = suffix || "";
-    const snapPanelId = p === "Fs" ? "inspectImagePanelFs" : "inspectImagePanel";
-    const snapImgId = `inspectCardImg${p}`;
-    const capId = p === "Fs" ? "inspectCardCaptionFs" : "inspectCardCaption";
-
-    let mount = null;
-    if (p === "Fs") {
-      mount = document.getElementById("inspectInfoCardFs") || findFlightStatusMountEl(true);
-    }
-    if (!mount) mount = findFlightStatusMountEl(false);
+    let mount =
+      p === "Fs"
+        ? document.getElementById("inspectInfoCardFs")
+        : document.getElementById("inspectInfoCard");
     if (!mount) {
+      if (p) return false;
       ensureInspectInfoCardShellIfMissing();
       mount = document.getElementById("inspectInfoCard");
     }
     if (!mount) return false;
 
+    removeDuplicateInspectPanels(mount);
     hideLegacyInspectStreamUI(mount, p);
 
-    const tri = mount.querySelector(".triangle-marker");
-    const anchor =
-      tri ||
-      mount.querySelector("[data-inspect-image-anchor]") ||
-      mount.querySelector(".flight-status-body") ||
-      mount.firstElementChild;
-
-    let snapPanel = $(snapPanelId);
-    if (!snapPanel) {
-      snapPanel = document.createElement("div");
-      snapPanel.id = snapPanelId;
-      snapPanel.className = "inspect-image-panel inspect-snapshot-panel inspect-live-image-wrap";
-      const img = document.createElement("img");
-      img.id = snapImgId;
-      img.className = "inspect-flight-img inspect-snapshot-img";
-      img.alt = "实时图传";
-      const capEl = document.createElement("div");
-      capEl.id = capId;
-      capEl.className = "inspect-card-caption inspect-live-placeholder inspect-live-placeholder--show";
-      capEl.textContent = "暂无巡检图片";
-      snapPanel.appendChild(img);
-      snapPanel.appendChild(capEl);
-      insertAfter(mount, snapPanel, anchor);
-    } else {
-      let imgEl = $(snapImgId);
-      let capEl = $(capId);
-      if (!imgEl) {
-        imgEl = document.createElement("img");
-        imgEl.id = snapImgId;
-        imgEl.className = "inspect-flight-img inspect-snapshot-img";
-        imgEl.alt = "实时图传";
-        snapPanel.insertBefore(imgEl, snapPanel.firstChild);
-      }
-      if (!capEl) {
-        capEl = document.createElement("div");
-        capEl.id = capId;
-        capEl.className = "inspect-card-caption inspect-live-placeholder inspect-live-placeholder--show";
-        capEl.textContent = "暂无巡检图片";
-        snapPanel.appendChild(capEl);
-      }
-      snapPanel.classList.add("inspect-live-image-wrap");
+    const img = getCanonicalInspectImg(p);
+    if (img) {
+      const wantId = p === "Fs" ? "inspectCardImgFs" : "inspectCardImg";
+      if (img.id !== wantId) img.id = wantId;
+      img.classList.add("inspect-flight-img");
     }
 
     ensureInspectCompactMetaBlock(mount, p);
-    return Boolean($(snapPanelId) && $(snapImgId));
+    return Boolean(img);
   }
 
   function ensureInspectImagePanelMounted(suffix) {
     return ensureInspectDualSlotsMounted(suffix);
   }
 
-  /** 保证巡检快照 img 存在 */
   function ensureInspectFlightImgElement(suffix) {
-    const p = suffix || "";
-    const imgId = `inspectCardImg${p}`;
-    let img = document.getElementById(imgId);
-    if (img) return img;
-    ensureInspectDualSlotsMounted(p);
-    return document.getElementById(imgId);
+    ensureInspectDualSlotsMounted(suffix || "");
+    return getCanonicalInspectImg(suffix || "");
+  }
+
+  function createInspectImgInRightPanel() {
+    ensureInspectDualSlotsMounted("");
+    return getCanonicalInspectImg("") || document.getElementById("inspectCardImg");
   }
 
   function ensureInspectInfoCardShellIfMissing() {
@@ -796,10 +789,8 @@
       <div class="inspect-panel-compact">
         <div class="inspect-section-h">飞行状态</div>
         <div id="inspectCardUavStatus" class="inspect-flight-status-line">待命</div>
-        <div class="inspect-section-h inspect-section-h--sub">实时图传</div>
-        <div id="inspectImagePanel" class="inspect-image-panel inspect-snapshot-panel inspect-live-image-wrap">
-          <img id="inspectCardImg" class="inspect-flight-img inspect-snapshot-img" alt="实时图传" />
-          <div id="inspectCardCaption" class="inspect-card-caption inspect-live-placeholder inspect-live-placeholder--show">暂无巡检图片</div>
+        <div class="inspect-img-wrap inspect-img-wrap-slim">
+          <img id="inspectCardImg" class="inspect-flight-img" src="/static/inspection_placeholder.svg" alt="实时图传" />
         </div>
         <div class="inspect-compact-meta" data-inspect-compact-meta="main">
           <div class="inspect-compact-meta-row"><span class="inspect-compact-k">当前巡检点</span><span class="inspect-compact-v" id="inspectMetaCurrentPoint">—</span></div>
@@ -820,21 +811,6 @@
         <ul id="inspectEventList" class="inspect-ui-hidden-legacy" aria-hidden="true"></ul>
       </div>`;
     document.body.appendChild(wrap);
-  }
-
-  function createInspectImgInRightPanel() {
-    ensureInspectInfoCardShellIfMissing();
-    ensureInspectDualSlotsMounted("");
-    let img = document.getElementById("inspectCardImg");
-    if (img) return img;
-    const panel = document.getElementById("inspectImagePanel");
-    if (!panel) return null;
-    img = document.createElement("img");
-    img.id = "inspectCardImg";
-    img.className = "inspect-flight-img inspect-snapshot-img";
-    img.alt = "巡检图像";
-    panel.insertBefore(img, panel.firstChild);
-    return img;
   }
 
   window.showInspectionImage = function (point, opts) {
@@ -883,9 +859,9 @@
       imgEl.src = url;
     };
 
-    const main = document.getElementById("inspectCardImg") || createInspectImgInRightPanel();
+    const main = getCanonicalInspectImg("") || document.getElementById("inspectCardImg");
     applyToImg(main, "");
-    const fsImg = document.getElementById("inspectCardImgFs");
+    const fsImg = getCanonicalInspectImg("Fs");
     if (fsImg) applyToImg(fsImg, "Fs");
 
     if (opts.logAs === "current_point") {
@@ -1363,14 +1339,7 @@
   }
 
   function markAllInspectionPointsVisited() {
-    const mission = getMissionForPlayback();
-    (mission?.inspection_points || []).forEach((p) => {
-      const pid = p.id || p.point_id;
-      if (pid) {
-        PLAYBACK.visitedIds.add(pid);
-        PLAYBACK.visitedCoords.set(pid, { x: p.x, y: p.y });
-      }
-    });
+    updateAllPlotPlayback();
   }
 
   function tickPlayback() {
@@ -1386,6 +1355,7 @@
       PLAYBACK.holdInspectSnapshot = false;
       PLAYBACK.streamFrozen = false;
       markAllInspectionPointsVisited();
+      printPlaybackCheck();
       setMissionState("COMPLETED");
       updateTelemetryFromPlayback("COMPLETED");
       pushEvent("任务执行完成");
@@ -1404,158 +1374,186 @@
     }
 
     const ev = PLAYBACK.timeline[PLAYBACK.index];
+    const frameIndex = PLAYBACK.index;
     PLAYBACK.index += 1;
-
-    if (ev.type === "inspect") {
-      activateInspectSegmentForAllPoints(ev.segment_id || "", ev.edge_id || "");
-      const inspPoint = ev.point || ev.inspection_point;
-      PLAYBACK.uavPos = { x: inspPoint.x, y: inspPoint.y };
-      PLAYBACK.currentPoint = { x: inspPoint.x, y: inspPoint.y };
-      PLAYBACK.currentPointId = inspPoint.id || inspPoint.point_id;
-      if (typeof window.showInspectionImage === "function") {
-        window.showInspectionImage(inspPoint, { logAs: "current_point" });
-      }
-      updateAllPlotPlayback();
-      if (ENABLE_INSPECTION_IMAGE) {
-        showInspectCard(inspPoint, ev.inspect_index, PLAYBACK.totalInspectCount, {
-          skipInspectionImage: true,
-        });
-      }
-      stopTimer();
-      const dwell = (ev.dwell_ms || getDwellMs()) / getSpeed();
-      PLAYBACK.timer = setTimeout(onInspectComplete, dwell);
-      setPlaybackUi();
-      return;
+    PLAYBACK.uavPos = { x: ev.x, y: ev.y };
+    PLAYBACK.currentRouteIndex = ev.routeIndex != null ? ev.routeIndex : frameIndex;
+    PLAYBACK.currentPoint = null;
+    PLAYBACK.currentPointId = null;
+    checkInspectTriggersAtFrame(ev, frameIndex);
+    const tickPointIds = getFramePointIds(ev);
+    if (frameIndex % TICK_LOG_EVERY === 0 || tickPointIds.length) {
+      console.log(
+        `[tick] frame=${frameIndex} segment=${ev.segment_id || ""} point=${tickPointIds.join(",")}`
+      );
     }
-
-    if (ev.type === "move") {
-      PLAYBACK.uavPos = { x: ev.x, y: ev.y };
-      PLAYBACK.currentPoint = null;
-      PLAYBACK.currentPointId = null;
-      setMissionState("EXECUTING");
-      updateTelemetryFromPlayback("EXECUTING");
-      updateAllPlotPlayback();
-      setPlaybackUi();
-      scheduleNext(MOVE_FRAME_MS / getSpeed());
-      return;
-    }
-
+    setMissionState("EXECUTING");
+    updateTelemetryFromPlayback("EXECUTING");
+    updateAllPlotPlayback();
     setPlaybackUi();
-    scheduleNext(8 / getSpeed());
+    scheduleNext(MOVE_FRAME_MS / getSpeed());
   }
 
-  function mergeInspectionStopsIntoPlotlyMoves(moveFrames, result) {
-    const pts = Array.isArray(result?.inspection_points) ? result.inspection_points : [];
-    if (!pts.length || !moveFrames.length) return moveFrames;
-
-    const stalls = [];
-    pts.forEach((rawPt, seq) => {
-      const x = Number(rawPt.x);
-      const y = Number(rawPt.y);
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-      let bestI = 0;
-      let bestD = Infinity;
-      for (let i = 0; i < moveFrames.length; i += 1) {
-        const d = Math.hypot(moveFrames[i].x - x, moveFrames[i].y - y);
-        if (d < bestD) {
-          bestD = d;
-          bestI = i;
-        }
-      }
-      stalls.push({ at: bestI, bestD, point: { ...rawPt, x, y }, seq });
-    });
-    stalls.sort((a, b) => a.at - b.at || a.seq - b.seq);
-
-    const byAt = new Map();
-    stalls.forEach((st) => {
-      const list = byAt.get(st.at) || [];
-      list.push(st);
-      byAt.set(st.at, list);
-    });
-    const sortedAts = [...byAt.keys()].sort((a, b) => a - b);
-
-    const out = [];
-    let mi = 0;
-    let inspectSeq = 0;
-    for (let ai = 0; ai < sortedAts.length; ai += 1) {
-      const at = sortedAts[ai];
-      while (mi < moveFrames.length && mi <= at) {
-        out.push(moveFrames[mi]);
-        mi += 1;
-      }
-      const group = byAt.get(at) || [];
-      group.sort((a, b) => a.seq - b.seq);
-      for (let gi = 0; gi < group.length; gi += 1) {
-        const st = group[gi];
-        inspectSeq += 1;
-        out.push({
-          type: "inspect",
-          point: st.point,
-          dwell_ms: getDwellMs(),
-          inspect_index: inspectSeq,
-          edge_id: st.point.edge_id,
-          segment_id: st.point.segment_id,
-        });
-      }
-    }
-    while (mi < moveFrames.length) {
-      out.push(moveFrames[mi]);
-      mi += 1;
-    }
-    return out;
+  function getFramePointIds(frame) {
+    if (Array.isArray(frame.routePointIds)) return frame.routePointIds;
+    if (frame.routePointId) return [frame.routePointId];
+    return [];
   }
 
-  function buildTimelineFromResult(result) {
+  function triggerInspectionPoint(pointId) {
+    if (!pointId || PLAYBACK.visitedIds.has(pointId)) return;
+
+    const points = PLAYBACK.inspectPlotPoints || [];
+    const pt = points.find((p) => (p.point_id || p.id) === pointId);
+    if (!pt) return;
+
+    PLAYBACK.visitedIds.add(pointId);
+    PLAYBACK.currentPointId = pointId;
+    PLAYBACK.currentPoint = pt;
+    if (typeof window.showInspectionImage === "function") {
+      window.showInspectionImage(pt, { logAs: "route-point" });
+    }
+    if (ENABLE_INSPECTION_IMAGE) {
+      const total = PLAYBACK.totalInspectCount || points.length;
+      showInspectCard(
+        pt,
+        pt.orderIndex >= 0 ? pt.orderIndex + 1 : PLAYBACK.visitedIds.size,
+        total,
+        { skipInspectionImage: true }
+      );
+    }
+  }
+
+  function checkInspectTriggersAtFrame(ev, frameIndex) {
+    const ids = getFramePointIds(ev);
+    ids.forEach((pointId) => {
+      triggerInspectionPoint(pointId);
+    });
+  }
+
+  function getPlotlyMapElement() {
     const candidates = [
       document.getElementById("mapPlot"),
       document.getElementById("mapPlotFs"),
       document.querySelector(".js-plotly-plot"),
     ].filter(Boolean);
-    let plot = null;
-    for (let c = 0; c < candidates.length; c += 1) {
-      const el = candidates[c];
-      if (el && el.data && el.data.some((t) => t && t.name === "巡检路径")) {
-        plot = el;
-        break;
+    for (let i = 0; i < candidates.length; i += 1) {
+      const el = candidates[i];
+      if (el?.data?.some((t) => t && (t.name === "巡检路径" || t.name === "连接路径"))) {
+        return el;
       }
     }
-    if (!plot) {
-      plot =
-        document.getElementById("mapPlot") ||
-        document.getElementById("mapPlotFs") ||
-        document.querySelector(".js-plotly-plot");
-    }
+    return (
+      document.getElementById("mapPlot") ||
+      document.getElementById("mapPlotFs") ||
+      document.querySelector(".js-plotly-plot")
+    );
+  }
 
-    if (!plot || !plot.data) {
-      console.warn("[timeline] no plot data");
-      return [];
-    }
-
-    const trace = plot.data.find((t) => t && t.name === "巡检路径");
-    if (!trace || !Array.isArray(trace.x) || !Array.isArray(trace.y)) {
-      console.warn("[timeline] no 巡检路径 trace", plot.data.map((t) => t && t.name));
-      return [];
-    }
-
-    const plotMoves = [];
-    for (let i = 0; i < trace.x.length; i += 1) {
-      const x = Number(trace.x[i]);
-      const y = Number(trace.y[i]);
-      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-      plotMoves.push({
+  function appendVerticesInOrder(timeline, xs, ys) {
+    if (!Array.isArray(xs) || !Array.isArray(ys)) return timeline;
+    for (let i = 0; i < xs.length; i += 1) {
+      const x = xs[i];
+      const y = ys[i];
+      if (x == null || y == null || !Number.isFinite(Number(x)) || !Number.isFinite(Number(y))) {
+        continue;
+      }
+      const px = Number(x);
+      const py = Number(y);
+      const prev = timeline[timeline.length - 1];
+      if (prev && dist(prev, { x: px, y: py }) <= CONTINUITY_EPS) continue;
+      timeline.push({
         type: "move",
-        x,
-        y,
-        label: `巡检路径 ${i + 1}`,
-        progress: i / Math.max(1, trace.x.length - 1),
+        x: px,
+        y: py,
+        routeIndex: timeline.length,
       });
     }
+    return timeline;
+  }
 
-    if (!plotMoves.length) return [];
+  function bindInspectionRouteIndices(timeline, inspectPoints) {
+    return (inspectPoints || []).map((pt, i) => {
+      let route_index = -1;
+      for (let j = 0; j < timeline.length; j += 1) {
+        const f = timeline[j];
+        if (Math.abs(f.x - pt.x) <= CONTINUITY_EPS && Math.abs(f.y - pt.y) <= CONTINUITY_EPS) {
+          route_index = j;
+          break;
+        }
+      }
+      return {
+        point_id: pt.point_id || pt.id,
+        id: pt.point_id || pt.id,
+        x: Number(pt.x),
+        y: Number(pt.y),
+        image_url: pt.image_url || `/api/inspection-image/${pt.point_id || pt.id}.jpg`,
+        segment_id: pt.segment_id || "",
+        edge_id: pt.edge_id || "",
+        orderIndex: pt.orderIndex != null ? pt.orderIndex : i,
+        route_index,
+      };
+    });
+  }
 
-    PLAYBACK.dwellMs = getDwellMs();
-    PLAYBACK.speed = getSpeed();
-    return mergeInspectionStopsIntoPlotlyMoves(plotMoves, result);
+  function logInspectionOrder(inspectPoints) {
+    inspectPoints.forEach((pt) => {
+      const pid = pt.point_id || pt.id;
+      console.log(`[inspection-order] ${pid} route_index=${pt.route_index}`);
+    });
+  }
+
+  function printPlaybackCheck() {
+    const points = PLAYBACK.inspectPlotPoints || [];
+    const triggered = points
+      .filter((p) => PLAYBACK.visitedIds.has(p.point_id || p.id))
+      .map((p) => p.point_id || p.id);
+    const missing = points
+      .filter((p) => !PLAYBACK.visitedIds.has(p.point_id || p.id))
+      .map((p) => p.point_id || p.id);
+    console.log(`[playback-check] triggered_points=[${triggered.join(",")}]`);
+    console.log(`[playback-check] missing_points=[${missing.join(",")}]`);
+    console.log(`[triggered points] ${triggered.length} / ${points.length}`);
+  }
+
+  /** 播放路线：严格按 __MISSION_ROUTE_SEQUENCE（dashboard.segments 原始顺序） */
+  function buildTimelineFromMissionRouteSequence() {
+    const seq = window.__MISSION_ROUTE_SEQUENCE;
+    if (!Array.isArray(seq) || !seq.length) {
+      alert("播放路径未初始化");
+      return [];
+    }
+
+    const timeline = seq.map((f, i) => {
+      const routePointIds = Array.isArray(f.routePointIds)
+        ? f.routePointIds.slice()
+        : f.routePointId
+          ? [f.routePointId]
+          : [];
+      return {
+        type: "move",
+        x: Number(f.x),
+        y: Number(f.y),
+        segment_id: f.segment_id || "",
+        segment_type: f.segment_type || f.type || "",
+        edge_id: f.edge_id || "",
+        routePointIds,
+        routePointId: routePointIds.length === 1 ? routePointIds[0] : null,
+        routeIndex: i,
+      };
+    });
+
+    const first = timeline[0];
+    if (
+      !first ||
+      !Number.isFinite(first.x) ||
+      !Number.isFinite(first.y)
+    ) {
+      alert("播放路径未初始化");
+      return [];
+    }
+
+    return timeline;
   }
 
   window.resetPlayback = function (result) {
@@ -1573,6 +1571,7 @@
     PLAYBACK.visitedCoords = new Map();
     PLAYBACK.activatedInspectSegments = new Set();
     PLAYBACK.timeline = [];
+    PLAYBACK.inspectPlotPoints = [];
     PLAYBACK.totalInspectCount = 0;
     PLAYBACK.startTimestamp = 0;
     PLAYBACK.streamFrozen = false;
@@ -1580,8 +1579,6 @@
     clearInspectCard();
 
     if (result) {
-      PLAYBACK.timeline = buildTimelineFromResult(result) || [];
-      PLAYBACK.totalInspectCount = PLAYBACK.timeline.filter((e) => e.type === "inspect").length;
       PLAYBACK.dwellMs = getDwellMs();
       PLAYBACK.speed = getSpeed();
       if (ENABLE_INSPECTION_IMAGE) {
@@ -1616,47 +1613,51 @@
   };
 
   window.startInspectionPlayback = function () {
-    console.log("[startInspectionPlayback] entered");
-
-    const result = getMissionForPlayback();
-    if (!result) {
-      console.warn("[startInspectionPlayback] no mission");
-      return;
-    }
-
-    const timeline = buildTimelineFromResult(result);
-    console.log("[playback timeline]", timeline.length, timeline[0], timeline[timeline.length - 1]);
-
-    if (!timeline || !timeline.length) {
-      console.warn("[startInspectionPlayback] empty timeline");
-      const plot =
-        document.getElementById("mapPlot") || document.querySelector(".js-plotly-plot");
-      if (plot && plot.data) {
-        console.warn("[timeline] trace names:", plot.data.map((t) => t && t.name));
-      }
-      return;
-    }
+    if (PLAYBACK.status === "playing" || PLAYBACK._startLock) return;
+    PLAYBACK._startLock = true;
 
     stopTimer();
     stopStreamLoop();
     clearPhaseTimers();
 
-    PLAYBACK.timeline = timeline;
+    PLAYBACK.timeline = [];
     PLAYBACK.index = 0;
     PLAYBACK.t = 0;
+    PLAYBACK.running = false;
+    PLAYBACK.paused = false;
+    PLAYBACK.inspectPlotPoints = [];
+
+    const result = getMissionForPlayback();
+    if (!result) {
+      console.warn("[startInspectionPlayback] no mission");
+      PLAYBACK._startLock = false;
+      return;
+    }
+
+    const timeline = buildTimelineFromMissionRouteSequence();
+    if (!timeline || !timeline.length) {
+      PLAYBACK._startLock = false;
+      return;
+    }
+
+    PLAYBACK.timeline = timeline;
+    PLAYBACK.inspectPlotPoints =
+      window.__INSPECTION_POINT_BINDINGS ||
+      window.__DRAWN_ROUTE_DEBUG?.inspect_points ||
+      [];
     PLAYBACK.running = true;
     PLAYBACK.paused = false;
     PLAYBACK.status = "playing";
     PLAYBACK.speed = getSpeed();
+    PLAYBACK.dwellMs = getDwellMs();
     PLAYBACK.startTimestamp = Date.now();
     PLAYBACK.streamFrozen = false;
     PLAYBACK.holdInspectSnapshot = false;
-    PLAYBACK.totalInspectCount = timeline.filter((e) => e.type === "inspect").length;
+    PLAYBACK.totalInspectCount = PLAYBACK.inspectPlotPoints.length;
     PLAYBACK.visitedIds = new Set();
     PLAYBACK.visitedCoords = new Map();
     PLAYBACK.activatedInspectSegments = new Set();
-    PLAYBACK.uavPos =
-      timeline.length > 0 ? { x: timeline[0].x, y: timeline[0].y } : null;
+    PLAYBACK.uavPos = { x: timeline[0].x, y: timeline[0].y };
     PLAYBACK.currentPoint = null;
     PLAYBACK.currentPointId = null;
 
@@ -1668,6 +1669,7 @@
     setPlaybackUi();
     updateAllPlotPlayback();
     tickPlayback();
+    PLAYBACK._startLock = false;
   };
 
   window.pauseInspectionPlayback = function () {
@@ -1704,14 +1706,13 @@
     window.resetPlayback(getMissionForPlayback());
   };
 
-  document.addEventListener("click", (e) => {
-    const btn = e.target && e.target.closest && e.target.closest("#playbackStartBtn");
-    if (!btn) return;
-    console.log("[play-click] DOM handler fired");
-    window.startInspectionPlayback();
-  });
-
   document.addEventListener("DOMContentLoaded", () => {
+    ["", "Fs"].forEach((suffix) => ensureInspectDualSlotsMounted(suffix));
+    removeDuplicateInspectPanels();
+    $("playbackStartBtn")?.addEventListener("click", (e) => {
+      e.preventDefault();
+      window.startInspectionPlayback();
+    });
     $("playbackPauseBtn")?.addEventListener("click", () => window.pauseInspectionPlayback());
     $("playbackResumeBtn")?.addEventListener("click", () => window.resumeInspectionPlayback());
     $("playbackResetBtn")?.addEventListener("click", () => window.resetInspectionPlayback());
