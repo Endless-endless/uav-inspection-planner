@@ -1,339 +1,452 @@
-<div align="center">
+# UAV Powerline Inspection Mission Planner
 
-# ⚡ UAV 输电线路巡检任务规划系统
+A research prototype for **topology-aware UAV mission planning** in powerline inspection scenarios.
 
-**UAV Powerline Mission Planning System**
+The project focuses on high-level mission planning: determining **which powerline segments to inspect, in what order, and how the UAV should move between inspection segments**.
 
-*面向输电线路巡检场景的拓扑感知 UAV 任务规划*
-
-[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](requirements.txt)
-[![Stage](https://img.shields.io/badge/阶段-Unified%20Mission%20Pipeline%20v1-2ea44f?style=flat-square)](README.md)
-[![Type](https://img.shields.io/badge/类型-研究原型-555?style=flat-square)](README.md)
-[![Focus](https://img.shields.io/badge/方向-任务规划-0e639c?style=flat-square)](README.md)
-[![Topology](https://img.shields.io/badge/拓扑-感知优化-6f42c1?style=flat-square)](core/topo.py)
-[![Routing](https://img.shields.io/badge/路由-Dijkstra%20%7C%20BFS-0078d4?style=flat-square)](planner/topo_dijkstra.py)
-[![Domain](https://img.shields.io/badge/领域-UAV%20巡检-c27c0e?style=flat-square)](README.md)
-
-`任务规划` · `拓扑优化` · `Dijkstra 路由` · `UnifiedInput 管线`
-
-*高层巡检任务规划 — 非飞控 / 非 MPC 执行栈*
-
-</div>
+> This project focuses on mission-level planning rather than low-level flight control, SLAM, or MPC.
 
 ---
 
-## 目录
+## Overview
 
-- [项目概览](#项目概览)
-- [项目亮点](#项目亮点)
-- [演示预览](#-演示预览)
-- [系统架构](#-系统架构)
-- [功能特性](#-功能特性)
-- [目录结构](#-目录结构)
-- [快速开始](#-快速开始)
-- [实验结果](#-实验结果)
-- [可视化与输出](#️-可视化与输出)
-- [后续路线](#️-后续路线)
-- [免责声明](#免责声明)
-- [参考与致谢](#参考与致谢)
+Powerline inspection can be modeled as a graph-based planning problem.
 
----
+Given a representation of powerline infrastructure and inspection targets, the system constructs a topology graph, maps inspection tasks onto graph edges, and generates an ordered mission consisting of:
 
-## 项目概览
+- `inspect` segments for required inspection tasks;
+- `connect` segments for moving between inspection tasks.
 
-本仓库是一个 **UAV 输电线路巡检任务规划** 研究原型，在电网拓扑模型上组织：*巡检什么*、*以何种顺序*、*如何在区段间转移*。
+The current prototype supports both image-based and structured JSON inputs.
 
-| | 范围内 | 范围外 |
-|---|--------|--------|
-| **定位** | 任务规划、拓扑图、inspect/connect 区段 | 飞控、MPC、SLAM |
-| **产出** | Mission JSON、拓扑感知路径、HTML 可视化 | 实时自驾、适航认证 |
-
-**双输入管线**（共享同一任务栈）：
-
-| 管线 | 输入 | 入口 |
-|------|------|------|
-| 图像主线 | `data/test.png` | `demo/demo_visualization_main.py` |
-| Unified 主线 | `data/sample_*.json` | `demo/demo_unified_mission.py` |
-
----
-
-## 项目亮点
-
-| 能力 | 说明 |
-|------|------|
-| **UnifiedInput 管线** | 结构化 JSON（线路、杆塔、气象、UAV）→ 任务，无需栅格提取 |
-| **拓扑感知任务优化** | 基于 `TopoGraph` 的边访问顺序与 connect 区段规划 |
-| **Dijkstra 连接规划** | 代价最小路径 vs. 跳数最小 BFS（`connect_planner`: `bfs` \| `dijkstra`） |
-| **结构化巡检工作流** | `EdgeTask` → 分组 `inspect` / `connect` → 可导出 Mission JSON |
+```text
+Input
+  │
+  ├── Powerline Image
+  │
+  └── Structured JSON
+  │
+  ▼
+Line Representation
+  │
+  ▼
+Topology Graph
+  │
+  ▼
+Inspection Tasks
+  │
+  ▼
+Mission Construction
+  │
+  ▼
+Topology-aware Optimization
+  │
+  ▼
+Mission JSON / Visualization
+```
 
 ---
 
-## 📸 演示预览
+## Key Features
 
-> 以下为占位图；运行 demo 后可将截图放入 `media/` 目录。
+### Topology-aware Mission Planning
+
+Powerline infrastructure is represented as a graph, allowing inspection tasks and transition paths to be planned according to network topology rather than only geometric distance.
+
+### Graph-based Connection Planning
+
+The planner supports different strategies for connecting inspection segments:
+
+- **BFS** — minimizes the number of graph hops;
+- **Dijkstra** — minimizes accumulated edge cost.
+
+This makes it possible to study the difference between topological hop count and geometric/path cost.
+
+### Unified Mission Representation
+
+Inspection missions are represented as structured sequences of:
+
+```text
+inspect → connect → inspect → connect → ...
+```
+
+The resulting mission can be exported as JSON for further processing or visualization.
+
+### Visualization
+
+The system provides interactive and static visualization for:
+
+- powerline topology;
+- inspection targets;
+- planned routes;
+- mission segments;
+- intermediate planning results.
+
+---
+
+## Demo
 
 <p align="center">
-  <img src="media/demo_main.png" alt="图像主线：地图、拓扑与交互式任务视图" width="48%" />
-  <img src="media/demo_mission.png" alt="Unified 主线：Mission JSON 与 Plotly 可视化" width="48%" />
+  <img src="media/demo_main.png" width="850" alt="UAV Powerline Inspection Mission Planning Demo">
 </p>
 
-<p align="center">
-  <sub>左：图像主线（<code>demo_visualization_main.py</code>）· 右：Unified 任务（<code>demo_unified_mission_visualization.py</code>）</sub>
-</p>
+The visualization illustrates the powerline topology, inspection targets, and the generated mission route.
 
 ---
 
-## 🧠 系统架构
+## System Architecture
 
 ```mermaid
-flowchart TB
-    subgraph INPUT["输入层"]
-        PNG["PNG 地图"]
-        JSON["UnifiedInput JSON"]
-    end
-
-    PNG --> IL["IndependentLine"]
-    JSON --> AL["AdaptedLine"] --> IL
-
-    IL --> TG["TopoGraph"]
-    TG --> ET["EdgeTask"]
-    ET --> MI["Mission"]
-    MI --> OPT["拓扑感知优化"]
-    OPT --> VIS["可视化输出"]
-
-    style INPUT fill:#1a1a2e,stroke:#4a9eff,color:#e8e8e8
-    style TG fill:#16213e,stroke:#6f42c1,color:#e8e8e8
-    style OPT fill:#0f3460,stroke:#2ea44f,color:#e8e8e8
-    style VIS fill:#1a1a2e,stroke:#c27c0e,color:#e8e8e8
+flowchart LR
+    A[Image / JSON Input] --> B[Line Representation]
+    B --> C[Topology Graph]
+    C --> D[Inspection Tasks]
+    D --> E[Mission Construction]
+    E --> F[Topology-aware Optimization]
+    F --> G[Mission JSON]
+    F --> H[Visualization]
 ```
 
-**线性视图**
+Main components:
 
-```
-PNG / JSON  →  UnifiedInput / AdaptedLine  →  IndependentLine
-      →  TopoGraph  →  EdgeTask  →  Mission
-      →  Optimization  →  Visualization（JSON · HTML · PNG）
-```
-
-| 层级 | 职责 | 主要模块 |
-|------|------|----------|
-| 输入层 | JSON 校验或 PNG 线路提取 | `input/`, `planner/powerline_planner_v3_final.py` |
-| 拓扑层 | 节点、边、合并/切分 | `core/topo.py` |
-| 任务层 | 巡检点映射到拓扑边 | `core/topo_task.py`, `input/unified_task_adapter.py` |
-| 规划层 | 分组、inspect/connect、导出 | `core/topo_plan.py` |
-| 优化层 | 访问顺序、图上 connect | `planner/mission_optimizer.py`, `core/topo_global_optimizer.py` |
-| 连接规划 | BFS（跳数）vs. Dijkstra（代价） | `planner/topo_dijkstra.py` |
-| 输出层 | Mission JSON、Plotly、叠加图 | `visualization/`, `demo/generate_interactive_main_view.py` |
+| Component | Responsibility |
+|---|---|
+| `input/` | Structured input and adapters |
+| `core/` | Topology and mission representations |
+| `planner/` | Routing and mission planning |
+| `visualization/` | Mission and topology visualization |
+| `demo/` | Example workflows and experiments |
+| `data/` | Example inputs |
+| `docs/` | Additional documentation |
 
 ---
 
-## ✨ 功能特性
+## Example Results
 
-<details open>
-<summary><b>核心管线</b></summary>
+The following results are obtained from the example inputs included in this repository and are intended to illustrate planner behavior rather than serve as general performance benchmarks.
 
-- **图像主线** — PNG → 提取 → 骨架 → 独立线路 → 拓扑 → 任务  
-- **UnifiedInput 主线** — JSON 元数据 → 适配线路 → 共享拓扑栈  
-- **TopoGraph** — 节点合并/切分、边分解、邻接关系  
-- **EdgeTask** — 巡检点映射到拓扑边  
-- **Mission 生成** — 分组区段、访问顺序、JSON 导出  
+### Topology-aware Mission Ordering
 
-</details>
+For one example topology:
 
-<details open>
-<summary><b>规划与路由</b></summary>
+| Metric | Baseline | Optimized |
+|---|---:|---:|
+| Total path length | 1844.5 px | 1453.5 px |
+| Connection length | 752.4 px | 361.4 px |
+| Inspection length | 1092.1 px | 1092.1 px |
 
-- **拓扑感知优化** — 基于图的边序与 connect 区段  
-- **BFS / Dijkstra** — 跳数最小 vs. 边权代价最小  
-- **任务分析** — 基线 vs. 优化指标（`demo_mission_compare.py`）  
+The inspection distance remains unchanged while the connection distance is reduced by approximately **52%** in this example.
 
-</details>
+The result illustrates how topology-aware mission ordering can reduce unnecessary movement between inspection segments without changing the required inspection coverage.
 
-<details>
-<summary><b>可视化</b></summary>
+### BFS vs. Dijkstra
 
-- Plotly 交互式 HTML（`result/latest/`, `result/unified_mission/`）  
-- 基于 `data/test.png` 的 2D 地图叠加  
-- 管线调试分步 PNG（`result/steps/`）  
+For an example connection-planning problem:
 
-</details>
+| Planner | Graph hops | Path cost |
+|---|---:|---:|
+| BFS | 2 | 1728.2 |
+| Dijkstra | 4 | 1000.0 |
+
+BFS finds a path with fewer graph hops, while Dijkstra finds a lower-cost path under the configured edge weights.
+
+These experiments are illustrative examples and should not be interpreted as general performance benchmarks.
 
 ---
 
-## 📂 目录结构
+## Repository Structure
 
-```
+```text
 .
-├── core/                 # TopoGraph、EdgeTask、topo_plan、全局优化
-├── planner/              # 图像规划器、Dijkstra、mission_optimizer
-├── input/                # UnifiedInput 模式与适配器
-├── demo/                 # 图像 / Unified / Dijkstra 入口
-├── visualization/        # Plotly、地图叠加、matplotlib
-├── weather/              # 风况配置（图像主线）
-├── data/                 # test.png、sample_*.json
-├── result/               # 运行输出（gitignore）
-│   ├── latest/           # 图像主线
-│   ├── unified_mission/
-│   ├── dijkstra_test/
-│   └── steps/
-├── docs/                 # 设计与 JSON 说明
-├── archive/              # 已弃用模块（如 deprecated_20260519/）
-└── media/demos/          # 本地演示录像（gitignore）
+├── core/               # Topology and mission representations
+├── planner/            # Routing and mission planning
+├── input/              # Structured input adapters
+├── visualization/      # Visualization utilities
+├── demo/               # Runnable examples
+├── data/               # Example inputs
+├── docs/               # Documentation
+└── result/             # Generated outputs
 ```
 
-`result/` 及生成物默认不纳入版本库，重新运行 demo 即可生成。目录整理说明见 `CLEANUP_PLAN.md`。
+Generated results under `result/` can be reproduced by running the corresponding demo scripts.
 
 ---
 
-## 🚀 快速开始
+## Getting Started
 
-### 安装
+### Installation
+
+Clone the repository:
 
 ```bash
-git clone <repository-url>
-cd <project-root>
+git clone https://github.com/Endless-endless/uav-inspection-planner.git
+cd uav-inspection-planner
+```
+
+Install dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
-**Python 3.9+** · `numpy`, `scipy`, `Pillow`, `scikit-image`, `scikit-learn`, `matplotlib`, `plotly`
+Python **3.9+** is recommended.
 
-**输入文件**
+### Run the Image-based Pipeline
+
+```bash
+python demo/demo_visualization_main.py
+```
+
+This pipeline processes the example powerline image and generates mission planning and visualization results.
+
+### Run the Structured Mission Pipeline
+
+```bash
+python demo/demo_unified_mission.py
+```
+
+This pipeline constructs a mission from structured input data.
+
+### Run the BFS / Dijkstra Comparison
+
+```bash
+python demo/demo_dijkstra_contrast.py
+```
+
+This example compares hop-based BFS routing with cost-based Dijkstra routing.
+
+Generated outputs are stored under:
+
+```text
+result/
+```
+
+---
+
+## Input Representation
+
+The project currently supports two types of input.
+
+### Image-based Input
+
+A powerline image is processed to construct a representation of the line network before topology and mission generation.
+
+Example:
 
 ```text
 data/test.png
+```
+
+### Structured Input
+
+Structured JSON input can directly describe powerline infrastructure, inspection targets, and related mission information.
+
+Example files include:
+
+```text
 data/sample_unified_input.json
 data/sample_unified_topo_input.json
 data/sample_dijkstra_contrast_input.json
 ```
 
-### 运行
+Both input paths eventually share the topology and mission-planning components of the system.
 
-<table>
-<tr><th>轨道</th><th>命令</th><th>输出</th></tr>
-<tr>
-  <td><b>A · 图像主线</b></td>
-  <td><code>python demo/demo_visualization_main.py</code></td>
-  <td><code>result/latest/mission_output.json</code>、<code>main_view_interactive.html</code></td>
-</tr>
-<tr>
-  <td><b>B · Unified</b></td>
-  <td><code>python demo/demo_unified_mission.py</code><br/>
-      <code>python demo/demo_mission_compare.py</code></td>
-  <td><code>result/unified_mission/</code></td>
-</tr>
-<tr>
-  <td><b>C · Dijkstra</b></td>
-  <td><code>python demo/demo_dijkstra_contrast.py</code></td>
-  <td><code>result/dijkstra_test/dijkstra_contrast.json</code></td>
-</tr>
-</table>
+---
 
-<details>
-<summary>更多命令</summary>
+## Planning Pipeline
 
-```bash
-# Unified — 分步
-python demo/demo_unified_input.py
-python demo/demo_unified_topo_bridge.py
-python demo/demo_unified_edge_tasks.py
+At a high level, the system follows the pipeline:
 
-# Unified — 可视化
-python demo/demo_unified_mission_visualization.py
-
-# 图像 — 导航 UI（可选）
-python demo/demo_ui_animation.py
-
-# Dijkstra — 扩展对比
-python demo/demo_dijkstra_topo_compare.py
-python demo/demo_mission_bfs_vs_dijkstra.py
-python demo/demo_dijkstra_visualization.py
+```text
+Powerline Representation
+        │
+        ▼
+Topology Construction
+        │
+        ▼
+Inspection Task Mapping
+        │
+        ▼
+Mission Construction
+        │
+        ▼
+Inspection Ordering
+        │
+        ▼
+Connection Planning
+        │
+        ▼
+Mission Output
 ```
 
-</details>
+A mission consists primarily of two types of segments:
+
+```text
+inspect
+```
+
+for traversing required inspection segments, and
+
+```text
+connect
+```
+
+for moving between inspection segments.
+
+The optimization process attempts to reduce unnecessary connection cost while preserving the required inspection tasks.
 
 ---
 
-## 🧪 实验结果
+## Routing Strategies
 
-> 以下数据来自仓库内置样例，仅作行为说明，**非**普适性能基准。
+### BFS
 
-### 拓扑感知优化
+Breadth-first search is used as a hop-based connection planner.
 
-**配置：** `data/sample_unified_topo_input.json` · `demo/demo_mission_compare.py` · 结果：`result/unified_mission/mission_compare.json`
+Its objective is approximately:
 
-| 指标 | 基线 | 优化后 | 变化 |
-|:-----|-----:|-------:|-----:|
-| 总长度 (px) | 1844.5 | 1453.5 | **−21.2%** |
-| 连接长度 (px) | 752.4 | 361.4 | **−52.0%** |
-| **连接占比 connect_ratio** | **0.408** | **0.249** | **−39.1%**（相对） |
-| 巡检长度 (px) | 1092.1 | 1092.1 | 0% |
+```text
+minimize number of graph edges traversed
+```
 
-巡检覆盖不变；通过拓扑感知的边序重排降低 connect 开销。
+This does not necessarily correspond to the shortest geometric path.
 
-### Dijkstra vs. BFS（连接路径）
+### Dijkstra
 
-**配置：** `data/sample_dijkstra_contrast_input.json` · `demo/demo_dijkstra_contrast.py`
+Dijkstra's algorithm uses weighted graph edges.
 
-| 规划器 | 优化目标 | 跳数 | 路径代价 (2D px) | 说明 |
-|:-------|:---------|-----:|-----------------:|:-----|
-| **BFS** | 最少跳数 | 2 | 1728.2 | 跳数少，几何路径更长 |
-| **Dijkstra** | 最小边权 | 4 | 1000.0 | 路径代价约低 **42%**，跳数更多 |
+Its objective is:
 
-任务构建可在 `core/topo_global_optimizer.py` 中配置 `connect_planner`: `bfs` | `dijkstra`。
+```text
+minimize accumulated edge cost
+```
 
----
+Depending on the edge-weight definition, this can produce a route with more graph hops but lower total travel cost.
 
-## 🛰️ 可视化与输出
-
-| 产物 | 位置 | 内容 |
-|------|------|------|
-| Mission JSON | `result/latest/`, `result/unified_mission/` | 分组、`inspect`/`connect` 区段、访问顺序 |
-| Plotly HTML | `main_view_interactive.html`, `unified_mission_view.html` | 地图、路径、巡检点 |
-| 2D 叠加图 | `result/latest/map_overlay_*.png` | 路径叠加于 `data/test.png` |
-| 分析 JSON | `mission_compare.json`, `dijkstra_contrast.json` | 优化与路由指标 |
-
-JSON 字段说明：[`docs/MISSION_JSON_AND_UI_FEATURES.md`](docs/MISSION_JSON_AND_UI_FEATURES.md)
+The comparison between BFS and Dijkstra is used to explore the effect of different routing objectives on mission construction.
 
 ---
 
-## 🛣️ 后续路线
+## Outputs
 
-| 方向 | 状态 |
-|------|------|
-| 气象感知连接代价 | 规划中 |
-| 三维拓扑与地形感知区段 | 规划中 |
-| GIS / 地理坐标输入 | 规划中 |
-| [pampc](https://github.com/uzh-rpg/pampc_for_power_line) 任务导出对接 | 规划中 |
-| UAV 约束（电量、速度等） | 规划中 |
-| UnifiedInput Web 看板 | 规划中 |
+The system can generate several forms of output.
 
----
+### Mission JSON
 
-## 免责声明
+Mission data includes information such as:
 
-本项目面向电网拓扑上的 **高层任务规划与航线组织**，**不是** 实时飞控、自动驾驶或现场级安全认证系统。实际部署须另行完成验证与合规流程。
+- inspection segments;
+- connection segments;
+- mission ordering;
+- topology relationships;
+- route information.
 
----
+### Interactive Visualization
 
-## 参考与致谢
+Interactive HTML visualizations can be generated using Plotly to inspect:
 
-**底层巡线跟踪：** [uzh-rpg/pampc_for_power_line](https://github.com/uzh-rpg/pampc_for_power_line)
+- powerline topology;
+- inspection targets;
+- planned mission paths;
+- mission segments.
 
-| 层级 | 本仓库 | pampc |
-|------|--------|-------|
-| 范围 | 任务结构、拓扑图、inspect/connect 编排 | 跟踪、MPC、执行层规划 |
-| 分工 | *巡检哪些线、顺序如何、网上如何衔接* | *沿线路如何飞行* |
+### Static Visualization
 
-**延伸阅读**
-
-| 文档 | 内容 |
-|------|------|
-| [`README_CURRENT_FLOW.md`](README_CURRENT_FLOW.md) | 图像主线分步说明 |
-| [`PROJECT_STRUCTURE.md`](PROJECT_STRUCTURE.md) | 模块结构（部分略旧） |
-| [`docs/`](docs/) | JSON 格式、诊断说明 |
+Static images can also be generated for intermediate pipeline results and route overlays.
 
 ---
 
-## 许可证
+## Project Status
 
-公开发布时请补充许可条款（如 MIT、仅限研究使用等）。
+This repository is currently an **experimental research prototype**.
+
+Current work focuses on:
+
+- topology-based inspection mission representation;
+- graph-based routing;
+- mission ordering and connection-cost reduction;
+- structured mission input;
+- mission visualization.
+
+The project is intended primarily for experimentation with high-level UAV inspection mission planning.
+
+---
+
+## Future Work
+
+Possible extensions include:
+
+- geographic and GIS-based inputs;
+- 3D topology and terrain-aware planning;
+- UAV energy constraints;
+- speed and motion constraints;
+- weather-aware routing costs;
+- multi-UAV mission allocation;
+- integration with low-level trajectory planners;
+- evaluation on larger and more realistic power-grid topologies.
+
+---
+
+## Scope and Limitations
+
+This project addresses **high-level inspection mission planning**.
+
+It does **not** currently implement:
+
+- UAV flight control;
+- SLAM;
+- real-time obstacle avoidance;
+- MPC-based trajectory tracking;
+- autonomous flight execution;
+- safety-critical deployment.
+
+A complete autonomous UAV inspection system would require these components in addition to the mission-planning layer implemented here.
+
+---
+
+## Related Work
+
+For low-level powerline tracking and MPC-based trajectory planning, see:
+
+[uzh-rpg/pampc_for_power_line](https://github.com/uzh-rpg/pampc_for_power_line)
+
+The two projects operate at different levels of the UAV inspection stack:
+
+| This Repository | `pampc_for_power_line` |
+|---|---|
+| High-level mission planning | Low-level trajectory planning |
+| Inspection task ordering | Powerline tracking |
+| Graph-based routing | MPC-based execution |
+| `inspect` / `connect` mission organization | Continuous UAV trajectory control |
+
+Conceptually, the relationship can be viewed as:
+
+```text
+Mission Planning
+      │
+      │  inspection targets / route
+      ▼
+Trajectory Planning
+      │
+      ▼
+Flight Control
+```
+
+This repository primarily focuses on the first layer.
+
+---
+
+## Author
+
+**Zhijing Wu**
+
+Computer Science  
+Sichuan University
+
+GitHub: [@Endless-endless](https://github.com/Endless-endless)
+
+---
+
+## License
+
+License information will be added as the project is prepared for public release.
