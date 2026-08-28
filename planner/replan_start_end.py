@@ -357,6 +357,8 @@ def _connect_geometry_topo(
     edge_task_map: Dict[str, EdgeTask],
     cost_config: Optional[Dict[str, Any]],
     provenance_out: Optional[Dict[str, Any]] = None,
+    from_component_ids: Optional[List[int]] = None,
+    to_component_ids: Optional[List[int]] = None,
 ) -> List[Point]:
     """
     链间 connect：优先 core.topo_plan.generate_connection_segment_along_topo（与首次生成一致），
@@ -483,6 +485,12 @@ def _connect_geometry_topo(
             provenance_out.update({"connect_mode": "free_flight", "planner": "euclidean", "reason": "start_endpoint_access", "fallback_reason": None, "topo_edge_ids": []})
         elif role == "to_end":
             provenance_out.update({"connect_mode": "free_flight", "planner": "euclidean", "reason": "end_endpoint_access", "fallback_reason": None, "topo_edge_ids": []})
+        elif (
+            from_component_ids
+            and to_component_ids
+            and set(from_component_ids).isdisjoint(to_component_ids)
+        ):
+            provenance_out.update({"connect_mode": "free_flight", "planner": "euclidean", "reason": "between_components", "fallback_reason": None, "topo_edge_ids": []})
         else:
             provenance_out.update({"connect_mode": "fallback", "planner": "euclidean", "reason": "planner_failure", "fallback_reason": euclidean_reason, "topo_edge_ids": []})
     print(
@@ -1573,6 +1581,8 @@ def build_start_end_replan_mission(
                 edge_task_map=edge_task_map,
                 cost_config=cost_cfg,
                 provenance_out=connect_provenance,
+                from_component_ids=_components(prev_edge),
+                to_component_ids=_components(eid),
             )
             _cs_len = _path_length(connect_geom)
             _cs_n = len(connect_geom)
