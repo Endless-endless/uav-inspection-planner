@@ -356,6 +356,9 @@ def _connect_geometry_topo(
     topo_graph: Optional[TopoGraph],
     edge_task_map: Dict[str, EdgeTask],
     cost_config: Optional[Dict[str, Any]],
+    provenance_out: Optional[Dict[str, Any]] = None,
+    from_component_ids: Optional[List[int]] = None,
+    to_component_ids: Optional[List[int]] = None,
 ) -> List[Point]:
     """
     链间 connect：优先 core.topo_plan.generate_connection_segment_along_topo（与首次生成一致），
@@ -388,6 +391,8 @@ def _connect_geometry_topo(
             if sa is not None and sb is not None:
                 seg = _slice_polyline(poly, sa, sb)
                 if len(seg) >= 2:
+                    if provenance_out is not None:
+                        provenance_out.update({"connect_mode": "topology", "planner": "same_line_polyline", "reason": "same_line", "fallback_reason": None, "topo_edge_ids": sorted((getattr(edge_task_map[from_edge_id], "meta", None) or {}).get("chain_topo_edge_ids") or [])})
                     _log_replan_connect_return(
                         seg,
                         mode="planner_fallback",
@@ -409,6 +414,7 @@ def _connect_geometry_topo(
                     from_edge_id=from_edge_id,
                     to_edge_id=to_edge_id,
                     pixel_coord_mode=True,
+                    provenance_out=provenance_out,
                 )
                 out_along = [(float(p[0]), float(p[1])) for p in geom_along]
                 if len(out_along) > 2:
@@ -451,6 +457,7 @@ def _connect_geometry_topo(
                 use_proximity_bfs=False,
                 from_edge_id=from_edge_id,
                 to_edge_id=to_edge_id,
+                provenance_out=provenance_out,
             )
             out = [(float(p[0]), float(p[1])) for p in geom]
             if len(out) > 2:
@@ -473,6 +480,19 @@ def _connect_geometry_topo(
             euclidean_reason = f"euclidean_after_planner_exc:{exc!r}"
 
     out = _interpolate_line(point_a, point_b)
+    if provenance_out is not None:
+        if role == "from_start":
+            provenance_out.update({"connect_mode": "free_flight", "planner": "euclidean", "reason": "start_endpoint_access", "fallback_reason": None, "topo_edge_ids": []})
+        elif role == "to_end":
+            provenance_out.update({"connect_mode": "free_flight", "planner": "euclidean", "reason": "end_endpoint_access", "fallback_reason": None, "topo_edge_ids": []})
+        elif (
+            from_component_ids
+            and to_component_ids
+            and set(from_component_ids).isdisjoint(to_component_ids)
+        ):
+            provenance_out.update({"connect_mode": "free_flight", "planner": "euclidean", "reason": "between_components", "fallback_reason": None, "topo_edge_ids": []})
+        else:
+            provenance_out.update({"connect_mode": "fallback", "planner": "euclidean", "reason": "planner_failure", "fallback_reason": euclidean_reason, "topo_edge_ids": []})
     print(
         f"[replan-connect] mode=straight_fallback reason={euclidean_reason} "
         f"from_edge={fe} to_edge={te} out_pts={len(out)}"
@@ -1210,7 +1230,11 @@ def _make_connect_segment(
     from_edge_id: Optional[str],
     to_edge_id: Optional[str],
     segment_id: Optional[str] = None,
+    provenance: Optional[Dict[str, Any]] = None,
+    from_component_ids: Optional[List[int]] = None,
+    to_component_ids: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
+    prov = provenance or {}
     return {
         "segment_id": segment_id or f"seg_{seg_idx:04d}",
         "type": "connect",
@@ -1221,6 +1245,13 @@ def _make_connect_segment(
         "length": round(_path_length(geometry), 2),
         "direction": "forward",
         "geometry_2d": [[p[0], p[1]] for p in geometry],
+        "connect_mode": prov.get("connect_mode") or "unknown",
+        "planner": prov.get("planner") or "unknown",
+        "reason": prov.get("reason") or "unknown",
+        "fallback_reason": prov.get("fallback_reason"),
+        "topo_edge_ids": sorted(str(x) for x in (prov.get("topo_edge_ids") or [])),
+        "from_component_ids": sorted(set(from_component_ids or [])),
+        "to_component_ids": sorted(set(to_component_ids or [])),
     }
 
 
@@ -1236,6 +1267,7 @@ def _make_inspect_segment(
         "segment_id": f"seg_{seg_idx:04d}",
         "type": "inspect",
         "edge_id": edge_id,
+        "physical_id": edge_id,
         "from_edge_id": from_edge_id,
         "to_edge_id": edge_id,
         "length": round(_path_length(geometry), 2),
@@ -1476,11 +1508,19 @@ def build_start_end_replan_mission(
         )
 
     segments_out: List[Dict[str, Any]] = []
+    identity_registry = {
+        str(item.get("physical_id")): item
+        for item in ((base_mission.get("metadata") or {}).get("physical_task_registry") or [])
+        if item.get("physical_id")
+    }
+    def _components(edge_id: Optional[str]) -> List[int]:
+        return sorted({int(x) for x in (identity_registry.get(str(edge_id), {}).get("component_ids") or [])})
     directions: Dict[str, bool] = {}
     seg_idx = 0
     current: Point = start
     prev_edge: Optional[str] = None
 
+    connect_start_provenance: Dict[str, Any] = {}
     connect_start_geom = _connect_geometry_topo(
         start,
         first_entry,
@@ -1490,6 +1530,7 @@ def build_start_end_replan_mission(
         topo_graph=topo_graph,
         edge_task_map=edge_task_map,
         cost_config=cost_cfg,
+        provenance_out=connect_start_provenance,
     )
     _cs_len = _path_length(connect_start_geom)
     _cs_n = len(connect_start_geom)
@@ -1507,6 +1548,8 @@ def build_start_end_replan_mission(
             from_edge_id=None,
             to_edge_id=visit_order[0],
             segment_id="connect_from_start",
+            provenance={"connect_mode": "free_flight", "planner": connect_start_provenance.get("planner") or "endpoint_access", "reason": "start_endpoint_access", "fallback_reason": None, "topo_edge_ids": connect_start_provenance.get("topo_edge_ids") or []},
+            to_component_ids=_components(visit_order[0]),
         )
     )
     seg_idx += 1
@@ -1527,6 +1570,7 @@ def build_start_end_replan_mission(
         exit_pt: Point = inspect_geom[-1]
 
         if i > 0 and _dist(current, entry) > 0.5:
+            connect_provenance: Dict[str, Any] = {}
             connect_geom = _connect_geometry_topo(
                 current,
                 entry,
@@ -1536,6 +1580,9 @@ def build_start_end_replan_mission(
                 topo_graph=topo_graph,
                 edge_task_map=edge_task_map,
                 cost_config=cost_cfg,
+                provenance_out=connect_provenance,
+                from_component_ids=_components(prev_edge),
+                to_component_ids=_components(eid),
             )
             _cs_len = _path_length(connect_geom)
             _cs_n = len(connect_geom)
@@ -1552,6 +1599,9 @@ def build_start_end_replan_mission(
                     role="between_edges",
                     from_edge_id=prev_edge,
                     to_edge_id=eid,
+                    provenance=connect_provenance,
+                    from_component_ids=_components(prev_edge),
+                    to_component_ids=_components(eid),
                 )
             )
             seg_idx += 1
@@ -1570,6 +1620,7 @@ def build_start_end_replan_mission(
         current = exit_pt
         prev_edge = eid
 
+    connect_end_provenance: Dict[str, Any] = {}
     connect_end_geom = _connect_geometry_topo(
         current,
         end,
@@ -1579,6 +1630,7 @@ def build_start_end_replan_mission(
         topo_graph=topo_graph,
         edge_task_map=edge_task_map,
         cost_config=cost_cfg,
+        provenance_out=connect_end_provenance,
     )
     end_connected = _dist(connect_end_geom[-1], end) < 2.0
     _ce_len = _path_length(connect_end_geom)
@@ -1597,6 +1649,8 @@ def build_start_end_replan_mission(
             from_edge_id=prev_edge,
             to_edge_id=None,
             segment_id="connect_to_end",
+            provenance={"connect_mode": "free_flight", "planner": connect_end_provenance.get("planner") or "endpoint_access", "reason": "end_endpoint_access", "fallback_reason": None, "topo_edge_ids": connect_end_provenance.get("topo_edge_ids") or []},
+            from_component_ids=_components(prev_edge),
         )
     )
     seg_idx += 1

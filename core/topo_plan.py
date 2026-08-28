@@ -1225,6 +1225,13 @@ class MissionSegment:
     geometry: List[Tuple[float, float]] = field(default_factory=list)  # 几何路径
     length: float = 0.0                   # 长度
     direction: Literal['forward', 'reverse'] = 'forward'  # 巡检方向（inspect段专用）
+    connect_mode: Optional[str] = None
+    planner: Optional[str] = None
+    reason: Optional[str] = None
+    fallback_reason: Optional[str] = None
+    topo_edge_ids: List[str] = field(default_factory=list)
+    from_component_ids: List[int] = field(default_factory=list)
+    to_component_ids: List[int] = field(default_factory=list)
 
     def summary(self) -> str:
         """摘要信息"""
@@ -1588,6 +1595,7 @@ def generate_connection_segment_along_topo(
     completed_topo_edge_ids: Optional[Set[str]] = None,
     completed_edge_penalty: float = 450.0,
     route_connect_stats: Optional[dict] = None,
+    provenance_out: Optional[dict] = None,
     **_,
 ) -> Tuple[List[Tuple[float, float]], float]:
     """
@@ -1608,6 +1616,57 @@ def generate_connection_segment_along_topo(
         Tuple[List[Tuple[float, float]], float]: (几何路径, 长度)
     """
     from core.image_pixel_coords import edge_pixel_polyline, use_image_pixel_coords
+
+    def _record(
+        mode: str,
+        reason: str,
+        *,
+        planner: str = "along_topo",
+        fallback_reason=None,
+        topo_edge_ids=None,
+    ):
+        if provenance_out is not None:
+            stable_edge_ids = []
+            seen_edge_ids = set()
+            for edge_id in topo_edge_ids or []:
+                edge_id = str(edge_id or "")
+                if edge_id and edge_id not in seen_edge_ids:
+                    stable_edge_ids.append(edge_id)
+                    seen_edge_ids.add(edge_id)
+            provenance_out.clear()
+            provenance_out.update({
+                "connect_mode": mode,
+                "planner": planner,
+                "reason": reason,
+                "fallback_reason": fallback_reason,
+                "topo_edge_ids": stable_edge_ids,
+            })
+
+    def _task_component_ids(edge_task):
+        return {
+            int(component_id)
+            for component_id in ((getattr(edge_task, "meta", None) or {}).get("component_ids") or [])
+        }
+
+    def _task_topo_edge_ids(edge_task):
+        meta = getattr(edge_task, "meta", None) or {}
+        return [
+            str(edge_id)
+            for edge_id in (
+                getattr(edge_task, "topo_edge_ids", None)
+                or meta.get("chain_topo_edge_ids")
+                or []
+            )
+            if edge_id and str(edge_id) in topo_graph.edges
+        ]
+
+    def _node_path_edge_ids(node_path):
+        ids = []
+        for idx in range(len(node_path or []) - 1):
+            edge = _find_edge_between_nodes(node_path[idx], node_path[idx + 1])
+            if edge is not None and getattr(edge, "id", None):
+                ids.append(str(edge.id))
+        return ids
 
     if pixel_coord_mode is None:
         pixel_coord_mode = use_image_pixel_coords()
@@ -1680,6 +1739,11 @@ def generate_connection_segment_along_topo(
 
     from_edge = edge_task_map.get(from_edge_id) if from_edge_id else None
     to_edge = edge_task_map.get(to_edge_id) if to_edge_id else None
+    from_components = _task_component_ids(from_edge) if from_edge is not None else set()
+    to_components = _task_component_ids(to_edge) if to_edge is not None else set()
+    components_are_disjoint = bool(
+        from_components and to_components and from_components.isdisjoint(to_components)
+    )
 
     # inspection-target-aware: 同边连接直接切片，避免 edge endpoint 往返
     if from_edge is not None and to_edge is not None and from_edge.edge_id == to_edge.edge_id:
@@ -1697,6 +1761,7 @@ def generate_connection_segment_along_topo(
                     f"[DEBUG] segment start/end/type/length start={sliced[0]} end={sliced[-1]} "
                     f"type=connect length={_polyline_length(sliced):.2f}"
                 )
+                _record("topology", "same_line", topo_edge_ids=(getattr(from_edge, "meta", None) or {}).get("chain_topo_edge_ids") or [])
                 return sliced, _polyline_length(sliced)
 
     # inspection-target-aware: 2x2 端点锚点组合，最小化 (point->anchor + topo_path + anchor->point)
@@ -1794,6 +1859,24 @@ def generate_connection_segment_along_topo(
                 f"[DEBUG] segment start/end/type/length start={geometry[0]} end={geometry[-1]} "
                 f"type=connect length={length:.2f}"
             )
+            adopted_edge_ids = []
+            if _geom_length(best["a_geo"]) > 1e-6:
+                adopted_edge_ids.extend(_task_topo_edge_ids(from_edge))
+            adopted_edge_ids.extend(_node_path_edge_ids(best["node_path"]))
+            if _geom_length(best["b_geo"]) > 1e-6:
+                adopted_edge_ids.extend(_task_topo_edge_ids(to_edge))
+            if adopted_edge_ids:
+                _record(
+                    "topology",
+                    "same_connected_component",
+                    topo_edge_ids=adopted_edge_ids,
+                )
+            else:
+                _record(
+                    "fallback",
+                    "identity_mapping_failure",
+                    fallback_reason="anchor_path_has_no_mapped_topology_edges",
+                )
             return geometry, length
 
     # fallback: 最近节点策略（兼容旧调用方）
@@ -1803,6 +1886,7 @@ def generate_connection_segment_along_topo(
         geometry = [point_a, point_b]
         length = float(np.linalg.norm(np.array(point_b) - np.array(point_a)))
         print("[DEBUG] endpoint included reason=fallback_direct_no_nearest_node")
+        _record("fallback", "identity_mapping_failure", fallback_reason="no_nearest_topology_node")
         return geometry, length
 
     direct_distance = np.linalg.norm(np.array(point_b) - np.array(point_a))
@@ -1814,6 +1898,7 @@ def generate_connection_segment_along_topo(
         geometry = [point_a, point_b]
         length = float(np.linalg.norm(np.array(point_b) - np.array(point_a)))
         print("[DEBUG] endpoint included reason=fallback_direct_disconnected")
+        _record("free_flight", "between_components", planner="euclidean", fallback_reason=None)
         return geometry, length
 
     geometry: List[Tuple[float, float]] = [(float(point_a[0]), float(point_a[1]))]
@@ -1844,10 +1929,48 @@ def generate_connection_segment_along_topo(
             geometry = [(float(point_a[0]), float(point_a[1])), (float(point_b[0]), float(point_b[1]))]
         length = _geom_length(geometry)
         print("[DEBUG] endpoint included reason=fallback_nearest_node_pixel_polyline_only")
+        node_path_edge_ids = _node_path_edge_ids(node_path)
+        if components_are_disjoint:
+            _record(
+                "free_flight",
+                "between_components",
+                planner="proximity_hybrid" if node_path_edge_ids else "euclidean",
+                topo_edge_ids=node_path_edge_ids,
+            )
+        elif len(node_path_edge_ids) == len(node_path) - 1 and node_path_edge_ids:
+            _record(
+                "topology",
+                "same_connected_component",
+                topo_edge_ids=node_path_edge_ids,
+            )
+        else:
+            _record(
+                "fallback",
+                "planner_failure",
+                fallback_reason="proximity_path_contains_non_topology_hop",
+                topo_edge_ids=node_path_edge_ids,
+            )
         return geometry, length
 
     length = _geom_length(geometry)
     print("[DEBUG] endpoint included reason=fallback_nearest_node")
+    node_path_edge_ids = _node_path_edge_ids(node_path)
+    if components_are_disjoint:
+        _record(
+            "free_flight",
+            "between_components",
+            planner="proximity_hybrid" if node_path_edge_ids else "euclidean",
+            topo_edge_ids=node_path_edge_ids,
+        )
+    elif len(node_path_edge_ids) == len(node_path) - 1 and node_path_edge_ids:
+        _record("topology", "same_connected_component", topo_edge_ids=node_path_edge_ids)
+    else:
+        _record(
+            "fallback",
+            "planner_failure",
+            fallback_reason="proximity_path_contains_non_topology_hop",
+            topo_edge_ids=node_path_edge_ids,
+        )
     return geometry, length
 
 
@@ -4230,6 +4353,19 @@ def export_grouped_mission_to_json(
     if extra_metadata:
         metadata.update(extra_metadata)
 
+    task_registry = []
+    for task_id, task in sorted((getattr(mission, "task_by_id", None) or {}).items()):
+        meta = getattr(task, "meta", None) or {}
+        task_registry.append({
+            "physical_id": str(getattr(task, "id", None) or task_id),
+            "member_chain_ids": sorted(str(x) for x in (getattr(task, "chain_ids", None) or meta.get("member_chain_ids") or [])),
+            "topo_edge_ids": sorted(str(x) for x in (getattr(task, "topo_edge_ids", None) or meta.get("chain_topo_edge_ids") or [])),
+            "line_ids": sorted(str(x) for x in (getattr(task, "line_ids", None) or meta.get("member_line_ids") or [])),
+            "component_ids": sorted({int(x) for x in (meta.get("component_ids") or [])}),
+        })
+    if task_registry:
+        metadata["physical_task_registry"] = task_registry
+
     if metadata.get("pixel_coordinate_mode") or str(metadata.get("coordinate_mode") or "").startswith("image_pixel"):
         from core.image_pixel_coords import edge_pixel_polyline
 
@@ -4354,6 +4490,20 @@ def export_grouped_mission_to_json(
             "direction": segment.direction,
             "geometry_2d": geometry_2d
         }
+        if segment.type == "inspect" and segment.edge_id:
+            segment_data["physical_id"] = str(segment.edge_id)
+        if segment.type == "connect":
+            segment_data.update({
+                "connect_mode": getattr(segment, "connect_mode", None) or "unknown",
+                "planner": getattr(segment, "planner", None) or "unknown",
+                "reason": getattr(segment, "reason", None) or "unknown",
+                "fallback_reason": getattr(segment, "fallback_reason", None),
+                "topo_edge_ids": list(dict.fromkeys(
+                    str(x) for x in (getattr(segment, "topo_edge_ids", None) or []) if x
+                )),
+                "from_component_ids": sorted({int(x) for x in (getattr(segment, "from_component_ids", None) or [])}),
+                "to_component_ids": sorted({int(x) for x in (getattr(segment, "to_component_ids", None) or [])}),
+            })
 
         # 添加 group_id
         if segment.edge_id and segment.edge_id in mission.edge_to_group:

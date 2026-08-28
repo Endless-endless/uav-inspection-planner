@@ -1501,6 +1501,7 @@ def build_optimized_mission(
     print("="*60)
 
     mission = GroupedContinuousMission()
+    mission.task_by_id = {str(task.edge_id): task for task in edge_tasks}
 
     if line_totals is None:
         line_totals = _line_point_totals(edge_tasks)
@@ -1606,6 +1607,7 @@ def build_optimized_mission(
 
         connect_geo: List[Tuple[float, float]]
         connect_len: float
+        connect_provenance: Dict[str, Any] = {}
 
         if same_line_adjacent:
             sl_raw = _try_same_line_connect_geometry(
@@ -1618,6 +1620,16 @@ def build_optimized_mission(
             if sl_raw and len(sl_raw) >= 2:
                 connect_geo = sl_raw
                 connect_len = float(_polyline_length(sl_raw))
+                connect_provenance.update({
+                    "connect_mode": "topology",
+                    "planner": "same_line_polyline",
+                    "reason": "same_line",
+                    "fallback_reason": None,
+                    "topo_edge_ids": sorted(set(
+                        list(getattr(prev_edge_task, "topo_edge_ids", None) or [])
+                        + list(getattr(edge, "topo_edge_ids", None) or [])
+                    )),
+                })
                 route_stats["same_line_connect_count"] = (
                     int(route_stats.get("same_line_connect_count", 0)) + 1
                 )
@@ -1638,6 +1650,7 @@ def build_optimized_mission(
                         cost_config=cost_config,
                         from_edge_id=current_edge_id,
                         to_edge_id=edge_id,
+                        provenance_out=connect_provenance,
                     )
                 else:
                     connect_geo, connect_len = generate_connection_segment_along_topo(
@@ -1655,6 +1668,7 @@ def build_optimized_mission(
                         ),
                         completed_edge_penalty=450.0,
                         route_connect_stats=route_stats,
+                        provenance_out=connect_provenance,
                     )
                 print(
                     f"[same-line-connect] from={current_edge_id} to={edge_id} "
@@ -1669,6 +1683,7 @@ def build_optimized_mission(
                 cost_config=cost_config,
                 from_edge_id=current_edge_id,
                 to_edge_id=edge_id,
+                provenance_out=connect_provenance,
             )
         else:
             connect_geo, connect_len = generate_connection_segment_along_topo(
@@ -1686,6 +1701,7 @@ def build_optimized_mission(
                 ),
                 completed_edge_penalty=450.0,
                 route_connect_stats=route_stats,
+                provenance_out=connect_provenance,
             )
 
         # 插值密集路径点
@@ -1701,7 +1717,14 @@ def build_optimized_mission(
             from_edge_id=current_edge_id,
             to_edge_id=edge_id,
             geometry=connect_geo_dense,
-            length=connect_len
+            length=connect_len,
+            connect_mode=connect_provenance.get("connect_mode") or "unknown",
+            planner=connect_provenance.get("planner") or "unknown",
+            reason=connect_provenance.get("reason") or "unknown",
+            fallback_reason=connect_provenance.get("fallback_reason"),
+            topo_edge_ids=list(connect_provenance.get("topo_edge_ids") or []),
+            from_component_ids=sorted(set((getattr(prev_edge_task, "meta", None) or {}).get("component_ids") or [])),
+            to_component_ids=sorted(set((getattr(edge, "meta", None) or {}).get("component_ids") or [])),
         )
         mission.segments.append(connect_segment)
         print(
@@ -2028,6 +2051,7 @@ def plan_global_topology_optimized_mission(
         connect_planner="dijkstra",
         cost_config=None,
     )
+    mission.task_by_id = {str(task.edge_id): task for task in required_edge_tasks}
 
     print("\n" + "="*70)
     print("[全局拓扑优化] 完成")

@@ -134,6 +134,7 @@ def merge_mission_metadata_into_dashboard(
         "image_detection_stats",
         "image_inspection_overlay",
         "topo_edges_pixel",
+        "physical_task_registry",
     ):
         cur = metadata.get(key)
         missing = cur in (None, "", {}) or (
@@ -211,7 +212,7 @@ def build_mission_context(
 def _segment_to_dict(seg: Any, index: int) -> Dict[str, Any]:
     geometry = getattr(seg, "geometry", None) or []
     geom_2d = [[float(p[0]), float(p[1])] for p in geometry if len(p) >= 2]
-    return {
+    result = {
         "segment_id": f"seg_{index:04d}",
         "type": getattr(seg, "type", "unknown"),
         "edge_id": getattr(seg, "edge_id", None),
@@ -221,6 +222,14 @@ def _segment_to_dict(seg: Any, index: int) -> Dict[str, Any]:
         "direction": getattr(seg, "direction", None),
         "geometry_2d": geom_2d,
     }
+    for key in (
+        "physical_id", "connect_mode", "planner", "reason", "fallback_reason",
+        "topo_edge_ids", "from_component_ids", "to_component_ids",
+    ):
+        value = getattr(seg, key, None)
+        if value is not None:
+            result[key] = value
+    return result
 
 
 def _point_segment_distance(x: float, y: float, geometry: List[List[float]]) -> float:
@@ -530,7 +539,7 @@ def compute_geometry_bounds(
 def _segments_from_json(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     segments = []
     for i, seg in enumerate(data.get("segments", [])):
-        segments.append({
+        item = {
             "segment_id": seg.get("segment_id", f"seg_{i:04d}"),
             "type": seg.get("type"),
             "edge_id": seg.get("edge_id"),
@@ -539,7 +548,14 @@ def _segments_from_json(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "length": round(float(seg.get("length", 0)), 2),
             "direction": seg.get("direction"),
             "geometry_2d": seg.get("geometry_2d") or [],
-        })
+        }
+        for key in (
+            "physical_id", "connect_mode", "planner", "reason", "fallback_reason",
+            "topo_edge_ids", "from_component_ids", "to_component_ids",
+        ):
+            if key in seg:
+                item[key] = seg.get(key)
+        segments.append(item)
     return segments
 
 
