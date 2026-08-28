@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GridVision 无人机巡检任务控制中心</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+<body>
+  <header class="top-bar">
+    <div class="brand">
+      <span class="brand-icon" aria-hidden="true">
+        <svg viewBox="0 0 64 64" role="img">
+          <path d="M32 9l7 17 18 6-18 6-7 17-7-17-18-6 18-6 7-17z" />
+          <path d="M32 22l3.5 8.5L44 32l-8.5 1.5L32 42l-3.5-8.5L20 32l8.5-1.5L32 22z" />
+        </svg>
+      </span>
+      <div>
+        <h1>GridVision 无人机巡检任务控制中心</h1>
+        <p class="subtitle">电网拓扑巡检 · 任务调度与态势监控</p>
+      </div>
+    </div>
+    <div class="header-meta">
+      <span class="badge badge-live"><span class="dot"></span>链路在线</span>
+      <span class="badge" id="missionPhaseBadge">任务待命</span>
+      <span class="badge" id="headerSpeedBadge">1x</span>
+      <button type="button" class="btn-ghost header-fs-btn" id="fullscreenBtnHeader">全屏</button>
+      <a href="#" class="link-dl" id="headerDownload" target="_blank" rel="noopener">导出任务</a>
+    </div>
+  </header>
+
+  <!-- 内部固定参数（管线 / 调试，默认不展示） -->
+  <div class="dev-only hidden" aria-hidden="true">
+    <select id="pipelineSelect">
+      <option value="image" selected>image</option>
+      <option value="unified">unified</option>
+    </select>
+    <select id="datasetSelect" disabled></select>
+    <select id="plannerSelect" disabled>
+      <option value="legacy" selected>legacy</option>
+    </select>
+    <span id="pipelineBadge"></span>
+    <input type="checkbox" id="toggleBaseMap" checked />
+    <input type="checkbox" id="togglePoints" checked />
+    <select id="pointModeSelect">
+      <option value="hidden">hidden</option>
+      <option value="key" selected>key</option>
+      <option value="all">all</option>
+    </select>
+    <select id="dwellTimeSelect" class="hidden">
+      <option value="0.5">0.5s</option>
+      <option value="1">1s</option>
+      <option value="1.5" selected>1.5s</option>
+      <option value="3">3s</option>
+    </select>
+    <span id="sysPhase"></span>
+    <span id="sysWeather"></span>
+    <span id="sysReplan"></span>
+    <span id="sysCurrentPoint"></span>
+    <span id="sysCurrentSegment"></span>
+    <div id="statusBox"></div>
+  </div>
+
+  <main class="layout layout-console">
+    <aside class="panel panel-controls mission-console">
+      <!-- Panel 1：任务控制 -->
+      <section class="console-module console-module-primary" id="playbackPanel">
+        <h3 class="console-module-title">任务控制</h3>
+        <div class="console-state-banner" id="playbackConsoleState" aria-live="polite">待命</div>
+        <div class="playback-controls playback-controls-compact">
+          <button type="button" class="btn-primary btn-sm-play" id="playbackStartBtn">▶ 开始巡检</button>
+          <div class="btn-row btn-row-tight">
+            <button type="button" class="btn-ghost btn-sm" id="playbackPauseBtn">⏸ 暂停</button>
+            <button type="button" class="btn-ghost btn-sm" id="playbackResumeBtn">▶ 继续</button>
+            <button type="button" class="btn-ghost btn-sm" id="playbackResetBtn">⏹ 重置</button>
+          </div>
+        </div>
+        <label class="field compact field-inline">
+          <span>播放速度</span>
+          <select id="playbackSpeedSelect">
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="5">5x</option>
+          </select>
+        </label>
+        <div class="timeline-shell timeline-shell-compact">
+          <input class="timeline-scrubber" id="timelineScrubber" type="range" min="0" max="100" value="0" step="1" aria-label="任务进度" />
+          <div class="timeline-meta">
+            <span id="timelineSegment">区段 —</span>
+            <span id="timelinePercent">0%</span>
+          </div>
+          <div class="timeline-track timeline-track-mini">
+            <div class="timeline-fill" id="timelineFill"></div>
+          </div>
+        </div>
+        <div class="playback-progress" id="playbackProgress">待命</div>
+      </section>
+
+      <!-- Panel 2：任务生成 -->
+      <section class="console-module" id="taskGenPanel">
+        <h3 class="console-module-title">任务生成</h3>
+        <label class="field compact">
+          <span>巡检点来源</span>
+          <select id="inspectionPointSourceSelect">
+            <option value="spacing">自动采样</option>
+            <option value="image">图像巡检点</option>
+            <option value="manual" selected>手工标注 JSON</option>
+          </select>
+        </label>
+        <label class="field compact" id="spacingFieldWrap">
+          <span>采样间距（px）</span>
+          <input type="number" id="spacingInput" value="50" min="5" max="500" step="5" />
+        </label>
+        <label class="field compact">
+          <span>地图模式</span>
+          <select id="mapModeSelect">
+            <option value="image_overlay" selected>图像底图</option>
+            <option value="topology_only">深色拓扑</option>
+          </select>
+        </label>
+        <button type="button" class="btn-primary btn-compact" id="runBtn">生成任务</button>
+        <button type="button" class="btn-secondary hidden" id="forceRegenBtn">重新生成任务</button>
+        <details class="console-subcollapse">
+          <summary>地图图层</summary>
+          <div class="console-subcollapse-body">
+            <label class="toggle compact-toggle"><input type="checkbox" id="toggleInspect" checked /> 巡检路径</label>
+            <label class="toggle compact-toggle"><input type="checkbox" id="toggleConnect" checked /> 连接路径</label>
+            <label class="toggle compact-toggle"><input type="checkbox" id="togglePointsLayer" checked /> 巡检点</label>
+          </div>
+        </details>
+        <div class="dl-group">
+          <a href="#" id="dlMission" class="dl-link" target="_blank" rel="noopener">任务数据</a>
+        </div>
+      </section>
+
+      <!-- Panel 3：路径规划（起终点重规划） -->
+      <section class="console-module" id="pathPlanPanel">
+        <h3 class="console-module-title">路径规划</h3>
+        <div class="coord-grid coord-grid-compact">
+          <label class="field compact">
+            <span>起点 X</span>
+            <input type="number" id="replanStartX" value="801" step="1" />
+          </label>
+          <label class="field compact">
+            <span>起点 Y</span>
+            <input type="number" id="replanStartY" value="410" step="1" />
+          </label>
+          <label class="field compact">
+            <span>终点 X</span>
+            <input type="number" id="replanEndX" value="751" step="1" />
+          </label>
+          <label class="field compact">
+            <span>终点 Y</span>
+            <input type="number" id="replanEndY" value="892" step="1" />
+          </label>
+        </div>
+        <button type="button" class="btn-secondary btn-compact" id="runReplanBtn">应用起终点 / 重新规划路径</button>
+      </section>
+    </aside>
+
+    <section class="panel panel-map mission-map-panel">
+      <div class="map-toolbar map-toolbar-compact">
+        <div>
+          <span class="eyebrow">巡检任务地图</span>
+          <h2>任务地图 <span class="map-hint" id="mapModeHint">—</span></h2>
+        </div>
+        <span class="pick-hint hidden" id="pickHint"></span>
+        <button type="button" class="btn-ghost" id="fullscreenBtn">全屏地图</button>
+        <button type="button" class="btn-ghost hidden" id="toolsFullscreenBtn">全屏</button>
+      </div>
+      <div class="map-inspect-row">
+        <div class="plot-stage">
+          <div id="missionStatusHud" class="mission-status-hud mission-status-hud--normal" aria-live="polite">
+            <span class="mission-status-hud__k">态势</span>
+            <span class="mission-status-hud__v" id="missionStatusHudText">NORMAL</span>
+          </div>
+          <div class="map-plot-stack plot-area overlay-mode" id="mapPlotStack">
+            <img
+              id="mapBasemapImg"
+              class="map-basemap-img hidden"
+              alt=""
+              decoding="async"
+              crossorigin="anonymous"
+            />
+            <div id="mapPlot" class="plotly-map-layer"></div>
+          </div>
+          <div id="predictiveWarningHud" class="predictive-warning-hud hidden" aria-live="polite"></div>
+        </div>
+        <aside class="inspect-info-card inspect-info-card-slim" id="inspectInfoCard" aria-live="polite">
+          <div class="inspect-card-header">
+            <div>
+              <span class="eyebrow">飞行状态</span>
+              <h3>巡检执行</h3>
+            </div>
+            <span class="inspect-status idle" id="inspectCardStatus">待命</span>
+          </div>
+          <div class="inspect-card-body">
+            <div class="inspect-content inspect-content-slim">
+              <div class="inspect-img-wrap inspect-img-wrap-slim">
+                <img id="inspectCardImg" src="/static/inspection_placeholder.svg" alt="巡检画面" />
+                <div class="live-hud live-hud-slim">
+                  <span class="hud-pill"><b id="inspectHudSpeed">--</b> m/s</span>
+                  <span class="hud-pill"><b id="inspectHudAlt">--</b> m</span>
+                  <span class="hud-pill hud-pill--aux"><span class="sr-only">电量</span><b id="inspectHudBattery">--</b></span>
+                </div>
+                <div class="scanline scanline--off" aria-hidden="true"></div>
+                <p class="inspect-img-hint" id="inspectCardImgHint"></p>
+              </div>
+              <dl class="inspect-meta-slim">
+                <dt>状态</dt><dd id="inspectCardUavStatus">待命</dd>
+                <dt>当前点位</dt><dd id="inspectCardId">—</dd>
+                <dt>风险等级</dt><dd id="inspectCardRisk">—</dd>
+              </dl>
+              <div class="mission-progress mission-progress-slim mission-progress--compact">
+                <span>进度</span>
+                <b id="inspectCardProgressBarText">--</b>
+                <div><i></i></div>
+              </div>
+              <span class="dev-only hidden" id="inspectCardProgress"></span>
+              <span class="dev-only hidden" id="inspectCardSegment"></span>
+              <span class="dev-only hidden" id="inspectCardType"></span>
+              <span class="dev-only hidden" id="inspectCardPriority"></span>
+              <span class="dev-only hidden" id="inspectCardCoord"></span>
+              <span class="dev-only hidden" id="inspectCardTime"></span>
+              <span class="dev-only hidden" id="inspectHudFps"></span>
+              <span class="dev-only hidden" id="inspectHudSignal"></span>
+              <span class="dev-only hidden" id="inspectTelemAlt"></span>
+              <span class="dev-only hidden" id="inspectTelemSignal"></span>
+              <span class="dev-only hidden" id="inspectTelemBattery"></span>
+              <span class="dev-only hidden" id="inspectTelemMode"></span>
+              <ul class="dev-only hidden" id="inspectEventList"></ul>
+            </div>
+          </div>
+        </aside>
+      </div>
+      <div class="map-metrics-tiered">
+        <div class="metrics-tier-label">核心指标</div>
+        <div class="cards cards-metrics cards-metrics-primary" id="statCardsPrimary"></div>
+        <div class="metrics-tier-label metrics-tier-label-secondary">运行监测</div>
+        <div class="cards cards-metrics cards-metrics-secondary" id="statCardsSecondary"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="mapFullscreenModal" class="modal hidden" aria-hidden="true">
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+    <div class="modal-panel">
+      <div class="modal-header">
+        <span>GridVision 指挥中心 · 全屏任务地图</span>
+        <button type="button" class="btn-ghost" id="closeFullscreenBtn">关闭</button>
+      </div>
+      <div class="modal-map-wrap">
+        <div class="plot-stage plot-stage-fs">
+          <div id="missionStatusHudFs" class="mission-status-hud mission-status-hud--normal mission-status-hud--fs" aria-live="polite">
+            <span class="mission-status-hud__k">态势</span>
+            <span class="mission-status-hud__v" id="missionStatusHudTextFs">NORMAL</span>
+          </div>
+          <div class="map-plot-stack plot-area plot-area-fs" id="mapPlotStackFs">
+            <img
+              id="mapBasemapImgFs"
+              class="map-basemap-img hidden"
+              alt=""
+              decoding="async"
+              crossorigin="anonymous"
+            />
+            <div id="mapPlotFs" class="plotly-map-layer"></div>
+          </div>
+          <div id="predictiveWarningHudFs" class="predictive-warning-hud hidden" aria-live="polite"></div>
+        </div>
+        <aside class="inspect-info-card inspect-float inspect-info-card-slim hidden" id="inspectInfoCardFs" aria-live="polite">
+          <div class="inspect-card-header">
+            <div>
+              <span class="eyebrow">飞行状态</span>
+              <h3>巡检执行</h3>
+            </div>
+            <span class="inspect-status idle" id="inspectCardStatusFs">待命</span>
+          </div>
+          <div class="inspect-card-body">
+            <div class="inspect-content inspect-content-slim">
+              <div class="inspect-img-wrap inspect-img-wrap-slim">
+                <img id="inspectCardImgFs" src="/static/inspection_placeholder.svg" alt="巡检画面" />
+                <div class="live-hud live-hud-slim">
+                  <span class="hud-pill"><b id="inspectHudSpeedFs">--</b> m/s</span>
+                  <span class="hud-pill"><b id="inspectHudAltFs">--</b> m</span>
+                  <span class="hud-pill hud-pill--aux"><span class="sr-only">电量</span><b id="inspectHudBatteryFs">--</b></span>
+                </div>
+                <div class="scanline scanline--off" aria-hidden="true"></div>
+                <p class="inspect-img-hint" id="inspectCardImgHintFs"></p>
+              </div>
+              <dl class="inspect-meta-slim">
+                <dt>状态</dt><dd id="inspectCardUavStatusFs">待命</dd>
+                <dt>当前点位</dt><dd id="inspectCardIdFs">—</dd>
+                <dt>风险等级</dt><dd id="inspectCardRiskFs">—</dd>
+              </dl>
+              <div class="mission-progress mission-progress-slim mission-progress--compact">
+                <span>进度</span>
+                <b id="inspectCardProgressBarTextFs">--</b>
+                <div><i></i></div>
+              </div>
+              <span class="dev-only hidden" id="inspectCardProgressFs"></span>
+              <span class="dev-only hidden" id="inspectCardSegmentFs"></span>
+              <span class="dev-only hidden" id="inspectCardTypeFs"></span>
+              <span class="dev-only hidden" id="inspectCardPriorityFs"></span>
+              <span class="dev-only hidden" id="inspectCardCoordFs"></span>
+              <span class="dev-only hidden" id="inspectCardTimeFs"></span>
+              <span class="dev-only hidden" id="inspectHudFpsFs"></span>
+              <span class="dev-only hidden" id="inspectHudSignalFs"></span>
+              <span class="dev-only hidden" id="inspectTelemAltFs"></span>
+              <span class="dev-only hidden" id="inspectTelemSignalFs"></span>
+              <span class="dev-only hidden" id="inspectTelemBatteryFs"></span>
+              <span class="dev-only hidden" id="inspectTelemModeFs"></span>
+              <ul class="dev-only hidden" id="inspectEventListFs"></ul>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/mission_store.js"></script>
+  <script src="/static/app.js"></script>
+  <script src="/static/playback.js"></script>
+</body>
+</html>

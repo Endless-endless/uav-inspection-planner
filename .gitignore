@@ -25,6 +25,9 @@ result/
 # Generated visualization
 figures/
 *.html
+
+# Keep source HTML
+!web/index.html
 !docs/**/*.html
 
 # Demo media (local only)
