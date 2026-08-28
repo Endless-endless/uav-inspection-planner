@@ -310,6 +310,7 @@ def generate_connection_segment_with_planner(
     use_proximity_bfs: bool = True,
     from_edge_id: Optional[str] = None,
     to_edge_id: Optional[str] = None,
+    provenance_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Tuple[float, float]], float]:
     """
     沿拓扑图生成连接段；connect_planner: 'bfs' | 'dijkstra'。
@@ -332,6 +333,25 @@ def generate_connection_segment_with_planner(
         if len(geom) < 2:
             return 0.0
         return float(sum(np.linalg.norm(np.array(geom[i + 1]) - np.array(geom[i])) for i in range(len(geom) - 1)))
+
+    def _record(mode: str, reason: str, *, planner=None, fallback_reason=None, topo_edge_ids=None):
+        if provenance_out is not None:
+            provenance_out.clear()
+            provenance_out.update({
+                "connect_mode": mode,
+                "planner": planner or connect_planner.lower(),
+                "reason": reason,
+                "fallback_reason": fallback_reason,
+                "topo_edge_ids": sorted({str(x) for x in (topo_edge_ids or []) if x}),
+            })
+
+    def _node_path_edge_ids(path):
+        ids = []
+        for idx in range(len(path or []) - 1):
+            edge = _find_edge_between(topo_graph, path[idx], path[idx + 1])
+            if edge is not None and getattr(edge, "id", None):
+                ids.append(str(edge.id))
+        return ids
 
     def _point_to_anchor(edge_task, point_xy: Tuple[float, float], anchor_node: str):
         poly = list(getattr(edge_task, "polyline", None) or [])
@@ -367,6 +387,7 @@ def generate_connection_segment_with_planner(
             sb = _project_point_to_polyline_distance(point_b, poly)
             if sa is not None and sb is not None:
                 sliced = _slice_polyline_by_distance(poly, sa, sb)
+                _record("topology", "same_line", topo_edge_ids=(getattr(from_edge, "meta", None) or {}).get("chain_topo_edge_ids") or [])
                 return sliced, _polyline_length(sliced)
 
     # 端点锚点组合（dijkstra/bfs 按 connect_planner 选）
@@ -413,6 +434,7 @@ def generate_connection_segment_with_planner(
                         "a_geo": a_info["point_to_anchor"],
                         "middle_geo": middle_geo,
                         "b_geo": _anchor_to_point(to_edge, point_b, b_anchor) or [point_b],
+                        "node_path": node_path,
                     }
 
         if best is not None:
@@ -426,6 +448,7 @@ def generate_connection_segment_with_planner(
                 geometry.insert(0, (float(point_a[0]), float(point_a[1])))
             if np.linalg.norm(np.array(geometry[-1]) - np.array(point_b)) > 1e-6:
                 geometry.append((float(point_b[0]), float(point_b[1])))
+            _record("topology", "same_connected_component", topo_edge_ids=_node_path_edge_ids(best["node_path"]))
             return geometry, _geom_length(geometry)
 
     node_a = find_nearest_topo_node(point_a, topo_graph)
@@ -434,6 +457,7 @@ def generate_connection_segment_with_planner(
     if node_a is None or node_b is None:
         geometry = [point_a, point_b]
         length = float(np.linalg.norm(np.array(point_b) - np.array(point_a)))
+        _record("fallback", "identity_mapping_failure", fallback_reason="no_nearest_topology_node")
         return geometry, length
 
     node_path: List[str] = []
@@ -463,6 +487,9 @@ def generate_connection_segment_with_planner(
     if not node_path:
         geometry = [point_a, point_b]
         length = float(np.linalg.norm(np.array(point_b) - np.array(point_a)))
+        _record("free_flight", "between_components", planner=planner_used)
         return geometry, length
 
-    return expand_node_path_to_geometry(point_a, point_b, node_path, topo_graph)
+    geometry, length = expand_node_path_to_geometry(point_a, point_b, node_path, topo_graph)
+    _record("topology", "same_connected_component", planner=planner_used, topo_edge_ids=_node_path_edge_ids(node_path))
+    return geometry, length

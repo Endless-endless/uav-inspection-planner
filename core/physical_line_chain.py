@@ -437,6 +437,20 @@ def build_physical_line_chains(
     连通分量即为 PhysicalLineChain。折线拼接仅用于生成展示 polyline，失败时保留 component 并使用 junction fallback。
     """
     tasks = [t for t in chain_edge_tasks if (getattr(t, "num_points", 0) or 0) > 0]
+    node_component: Dict[str, int] = {}
+    component_id = 0
+    for start_node in sorted(topo_graph.nodes):
+        if start_node in node_component:
+            continue
+        stack = [start_node]
+        node_component[start_node] = component_id
+        while stack:
+            node = stack.pop()
+            for neighbor in sorted(topo_graph.adj.get(node, [])):
+                if neighbor not in node_component:
+                    node_component[neighbor] = component_id
+                    stack.append(neighbor)
+        component_id += 1
     tasks_by_id: Dict[str, EdgeTask] = {t.edge_id: t for t in tasks}
     ids = sorted(tasks_by_id.keys())
 
@@ -510,6 +524,12 @@ def build_physical_line_chains(
             "chain_topo_edge_ids": teids,
             "component_size": len(comp_set),
             "build_mode": build_mode,
+            "component_ids": sorted({
+                node_component[node]
+                for task in mem
+                for node in (getattr(task, "u", None), getattr(task, "v", None))
+                if node in node_component
+            }),
         }
         vl = _voltage_level(mem[0])
         if vl is not None:
