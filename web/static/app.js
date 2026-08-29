@@ -2930,7 +2930,13 @@ function prefillReplanFormFromMission(mission) {
   }
 }
 
+let replanRequestInFlight = false;
+
 async function runStartEndReplan() {
+  if (replanRequestInFlight) {
+    setStatus("正在重规划，请等待当前请求完成…", "running");
+    return;
+  }
   if (!isImagePipeline()) {
     setStatus("起终点重规划仅支持图像管线", "err");
     return;
@@ -2950,8 +2956,13 @@ async function runStartEndReplan() {
     end_y: check.end_y,
   };
 
-  $("runReplanBtn").disabled = true;
-  purgeDashboardMapPlots();
+  const replanButton = $("runReplanBtn");
+  const previousButtonText = replanButton?.textContent || "应用起终点 / 重新规划路径";
+  replanRequestInFlight = true;
+  if (replanButton) {
+    replanButton.disabled = true;
+    replanButton.textContent = "正在重规划…";
+  }
   setTaskControlPhase("replanning");
   setStatus("正在按起终点重新规划路径…", "running");
 
@@ -2994,7 +3005,11 @@ async function runStartEndReplan() {
     setStatus(`重规划错误: ${err.message}`, "err");
     console.error(err);
   } finally {
-    $("runReplanBtn").disabled = false;
+    replanRequestInFlight = false;
+    if (replanButton) {
+      replanButton.disabled = false;
+      replanButton.textContent = previousButtonText;
+    }
   }
 }
 
