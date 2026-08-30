@@ -1829,21 +1829,52 @@ function projectPointOnPolyline(px, py, geom) {
     const denom = dx * dx + dy * dy;
     let t = 0;
     let d = 0;
+    let qx = ax;
+    let qy = ay;
     if (denom <= 1e-18) {
       d = Math.hypot(px - ax, py - ay);
     } else {
       t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / denom));
-      const qx = ax + t * dx;
-      const qy = ay + t * dy;
+      qx = ax + t * dx;
+      qy = ay + t * dy;
       d = Math.hypot(px - qx, py - qy);
     }
     const s = arcBase + t * Math.hypot(dx, dy);
-    if (!best || s < best.arcS - 1e-9 || (Math.abs(s - best.arcS) <= 1e-9 && j < best.edgeIndex)) {
-      best = { edgeIndex: j, t, arcS: s, d };
+    if (
+      !best ||
+      d < best.d - 1e-9 ||
+      (Math.abs(d - best.d) <= 1e-9 &&
+        (s < best.arcS - 1e-9 ||
+          (Math.abs(s - best.arcS) <= 1e-9 && j < best.edgeIndex)))
+    ) {
+      best = { edgeIndex: j, t, arcS: s, d, x: qx, y: qy };
     }
     arcBase += Math.hypot(dx, dy);
   }
   return best;
+}
+
+function preferredPlaybackPointXY(point, fallback) {
+  const snapped = point?.snapped_coord;
+  const sx = point?.snapped_x ?? (Array.isArray(snapped) ? snapped[0] : null);
+  const sy = point?.snapped_y ?? (Array.isArray(snapped) ? snapped[1] : null);
+  const x = Number(sx);
+  const y = Number(sy);
+  if (sx != null && sy != null && Number.isFinite(x) && Number.isFinite(y)) return { x, y };
+  return { x: Number(fallback.x), y: Number(fallback.y) };
+}
+
+function projectPlaybackPointToSegment(point, fallback, seg) {
+  const preferred = preferredPlaybackPointXY(point, fallback);
+  const projection = projectPointOnPolyline(
+    preferred.x,
+    preferred.y,
+    seg?.geometry_2d || []
+  );
+  if (projection && Number.isFinite(projection.x) && Number.isFinite(projection.y)) {
+    return { x: projection.x, y: projection.y };
+  }
+  return preferred;
 }
 
 function findVertexMatchIndex(pt, geom, eps) {
@@ -1950,8 +1981,8 @@ function expandInspectSegmentByArc(seg, pointsOnSeg, segmentId) {
     }
 
     items.push({
-      x: pt.x,
-      y: pt.y,
+      x: proj.x,
+      y: proj.y,
       arc: proj.arcS,
       t: proj.t,
       kind: "inspection",
@@ -1962,8 +1993,8 @@ function expandInspectSegmentByArc(seg, pointsOnSeg, segmentId) {
     insertMeta.push({
       point_id: pt.point_id,
       arc: proj.arcS,
-      x: pt.x,
-      y: pt.y,
+      x: proj.x,
+      y: proj.y,
     });
   });
 
@@ -2041,13 +2072,14 @@ function buildMissionRouteSequence(mission, rowsWithXY) {
   (rowsWithXY || []).forEach((r, i) => {
     const p = r.point || {};
     const pointId = String(p.point_id || p.id || i + 1).trim();
+    const preferred = preferredPlaybackPointXY(p, r);
     let boundSeg = String(p.segment_id || "").trim();
     if (!boundSeg) {
       for (const seg of segments) {
         if (isSkippableMissionDebugSegment(seg) || seg.type !== "inspect") continue;
         const geom = seg.geometry_2d || [];
         if (geom.length < 2) continue;
-        if (pointToPolylineDist(r.x, r.y, geom) <= ON_GEOM_EPS) {
+        if (pointToPolylineDist(preferred.x, preferred.y, geom) <= ON_GEOM_EPS) {
           boundSeg = String(seg.segment_id || "");
           break;
         }
@@ -2057,18 +2089,22 @@ function buildMissionRouteSequence(mission, rowsWithXY) {
       let bestD = Infinity;
       for (const seg of segments) {
         if (isSkippableMissionDebugSegment(seg) || seg.type !== "inspect") continue;
-        const d = pointToPolylineDist(r.x, r.y, seg.geometry_2d || []);
+        const d = pointToPolylineDist(preferred.x, preferred.y, seg.geometry_2d || []);
         if (d < bestD) {
           bestD = d;
           boundSeg = String(seg.segment_id || "");
         }
       }
     }
+    const boundSegment = segments.find(
+      (seg) => String(seg.segment_id || "") === boundSeg && seg.type === "inspect"
+    );
+    const routeXY = projectPlaybackPointToSegment(p, r, boundSegment);
     inspectPoints.push({
       point_id: pointId,
       id: pointId,
-      x: r.x,
-      y: r.y,
+      x: routeXY.x,
+      y: routeXY.y,
       image_url:
         (typeof p.image_url === "string" && p.image_url.trim()) ||
         `/api/inspection-image/${pointId}.jpg`,

@@ -62,12 +62,15 @@ class PowerlinePlannerV3:
     def __init__(self, image_path, flight_height=30, smooth_window=5,
                  use_spline=False, add_flight_fluctuation=True,
                  wind_direction=0, wind_speed=5,
-                 weather_scene="calm", weather_profile=None):
+                 weather_scene="calm", weather_profile=None,
+                 point_image_path=None, image_alignment=None):
         """
         初始化规划器
 
         Args:
-            image_path: 电网图片路径
+            image_path: 电网线路图片路径；旧单图调用仍同时用于巡检点检测
+            point_image_path: 可选巡检点图片路径；未提供时回退到 image_path
+            image_alignment: registry 显式声明的线路图内存对齐规则
             flight_height: 飞行高度（米）
             smooth_window: 滑动平均窗口大小
             use_spline: 是否使用样条平滑
@@ -78,6 +81,9 @@ class PowerlinePlannerV3:
             weather_profile: 天气配置字典（优先使用，如果提供则忽略 weather_scene）
         """
         self.image_path = image_path
+        self.point_image_path = point_image_path or image_path
+        self.image_alignment = dict(image_alignment or {})
+        self.image_alignment_metadata = {}
         self.flight_height = flight_height
         self.smooth_window = smooth_window
         self.use_spline = use_spline
@@ -139,6 +145,7 @@ class PowerlinePlannerV3:
         self.image_inspection_overlay = []
         self.clean_map_path = None
         self.image_detection_stats = {}
+        self.point_detection_red_mask = None
         self.inspection_detector_config = None
         self.primary_line_id = None  # 主线路ID（最长线路）
 
@@ -181,11 +188,91 @@ class PowerlinePlannerV3:
     # 基础功能（继承自V2）
     # =====================================================
 
+    @staticmethod
+    def _size_pair(value, field_name):
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"alignment.{field_name} 必须是 [width, height]")
+        return int(value[0]), int(value[1])
+
+    def _load_aligned_line_image(self):
+        """Load the line image and apply only an explicit registry alignment."""
+        original = Image.open(self.image_path).convert("RGB")
+        original_size = original.size
+        cfg = self.image_alignment
+        if not cfg:
+            self.image_alignment_metadata = {
+                "mode": "none",
+                "original_line_size": list(original_size),
+                "aligned_line_size": list(original_size),
+                "coordinate_origin_unchanged": True,
+            }
+            return original
+
+        if cfg.get("mode") != "crop" or cfg.get("anchor") != "top_left":
+            raise ValueError("仅支持 alignment mode=crop 且 anchor=top_left")
+        expected_line = self._size_pair(cfg.get("expected_line_size"), "expected_line_size")
+        expected_point = self._size_pair(cfg.get("expected_point_size"), "expected_point_size")
+        if original_size != expected_line:
+            raise ValueError(
+                "线路图原始尺寸与 alignment.expected_line_size 不一致: "
+                f"actual={original_size[0]}x{original_size[1]}, "
+                f"expected={expected_line[0]}x{expected_line[1]}"
+            )
+        crop_right = int(cfg.get("crop_right", 0) or 0)
+        if crop_right <= 0 or crop_right >= original_size[0]:
+            raise ValueError("alignment.crop_right 必须是有效正整数")
+        aligned_size = (original_size[0] - crop_right, original_size[1])
+        if aligned_size != expected_point:
+            raise ValueError(
+                "alignment 裁剪结果与 expected_point_size 不一致: "
+                f"aligned={aligned_size[0]}x{aligned_size[1]}, "
+                f"expected={expected_point[0]}x{expected_point[1]}"
+            )
+
+        from core.real_map_cv import extract_real_map_red_mask
+
+        original_rgb = np.array(original)
+        original_red_mask = extract_real_map_red_mask(original_rgb)
+        crop_x = aligned_size[0]
+        cropped_red_pixels = int(np.sum(original_red_mask[:, crop_x:] > 0))
+        if erosion is not None and skeletonize is not None:
+            eroded = erosion(original_red_mask > 0, footprint=np.ones((2, 2), dtype=bool))
+            original_skeleton = skeletonize(eroded)
+        else:
+            original_skeleton = original_red_mask > 0
+        cropped_skeleton_pixels = int(np.sum(original_skeleton[:, crop_x:] > 0))
+        if cropped_red_pixels or cropped_skeleton_pixels:
+            raise ValueError(
+                "alignment 将截断红线: "
+                f"cropped_red_pixels={cropped_red_pixels}, "
+                f"cropped_skeleton_pixels={cropped_skeleton_pixels}, x>={crop_x}"
+            )
+
+        self.image_alignment_metadata = {
+            "mode": "crop",
+            "anchor": "top_left",
+            "crop_right": crop_right,
+            "original_line_size": list(original_size),
+            "point_image_size": list(expected_point),
+            "aligned_line_size": list(aligned_size),
+            "coordinate_origin_unchanged": True,
+            "cropped_region_red_mask_pixels": cropped_red_pixels,
+            "cropped_region_skeleton_pixels": cropped_skeleton_pixels,
+            "cropped_region_task_endpoint_count": 0,
+        }
+        print(
+            "  [双图对齐] top_left crop "
+            f"line={original_size[0]}x{original_size[1]} -> "
+            f"{aligned_size[0]}x{aligned_size[1]}, crop_right={crop_right}, "
+            "origin unchanged"
+        )
+        return original.crop((0, 0, aligned_size[0], aligned_size[1]))
+
     def step1_extract_redline_hsv(self):
         """STEP 1: 使用HSV提取红色线路"""
         print("[STEP 1] 使用HSV提取红色线路...")
 
-        self.image = Image.open(self.image_path).convert("RGB")
+        self.image = self._load_aligned_line_image()
         self.width, self.height = self.image.size
         print(f"  图片尺寸: {self.width}x{self.height}")
 
@@ -2441,7 +2528,7 @@ class PowerlinePlannerV3:
         return apply_manual_dataset_to_planner(self, manual_json_path)
 
     def step5_detect_image_inspection_points(self, detector_config=None):
-        """Detect inspection points from the input image (green circles on real map)."""
+        """Detect inspection points from the explicit point image."""
         print("[STEP 5] 检测图像巡检点...")
         from core.inspection_point_detector import (
             detect_black_inspection_points_with_stats,
@@ -2449,12 +2536,37 @@ class PowerlinePlannerV3:
             resolve_detector_config,
         )
 
-        cfg = resolve_detector_config(self.image_path, detector_config)
+        point_image = Image.open(self.point_image_path).convert("RGB")
+        point_width, point_height = point_image.size
+        if self.image_alignment:
+            expected_point = self._size_pair(
+                self.image_alignment.get("expected_point_size"), "expected_point_size"
+            )
+            if (point_width, point_height) != expected_point:
+                raise ValueError(
+                    "巡检点图原始尺寸与 alignment.expected_point_size 不一致: "
+                    f"actual={point_width}x{point_height}, "
+                    f"expected={expected_point[0]}x{expected_point[1]}"
+                )
+        if self.width and self.height and (point_width, point_height) != (self.width, self.height):
+            raise ValueError(
+                "线路图与巡检点图尺寸不一致: "
+                f"line={self.width}x{self.height}, point={point_width}x{point_height}"
+            )
+
+        cfg = resolve_detector_config(self.point_image_path, detector_config)
         self.inspection_detector_config = cfg
-        red_mask = self.mask if getattr(self, "mask", None) is not None else None
+        same_input = os.path.abspath(str(self.point_image_path)) == os.path.abspath(str(self.image_path))
+        if same_input and not self.image_alignment:
+            point_red_mask = self.mask if getattr(self, "mask", None) is not None else None
+        else:
+            from core.real_map_cv import extract_real_map_red_mask
+
+            point_red_mask = extract_real_map_red_mask(np.array(point_image))
+        self.point_detection_red_mask = point_red_mask
         self.image_inspection_detections, self.image_detection_stats = (
             detect_black_inspection_points_with_stats(
-                self.image_path, config=cfg, red_mask=red_mask
+                self.point_image_path, config=cfg, red_mask=point_red_mask
             )
         )
         try:
@@ -2464,9 +2576,9 @@ class PowerlinePlannerV3:
                 save_green_mask,
             )
 
-            if is_real_map_detection_image(self.image_path):
-                rgb_u8 = np.array(self.image.convert("RGB"))
-                green_mask = extract_real_map_green_mask(rgb_u8, red_mask=red_mask)
+            if is_real_map_detection_image(self.point_image_path):
+                rgb_u8 = np.array(point_image)
+                green_mask = extract_real_map_green_mask(rgb_u8, red_mask=point_red_mask)
                 save_green_mask(green_mask)
         except Exception as exc:
             print(f"[WARN] 真实地图绿色点 mask 调试输出失败: {exc}")
@@ -2477,12 +2589,12 @@ class PowerlinePlannerV3:
         try:
             from core.real_map_cv import is_real_map_detection_image
 
-            real_map_same_image = is_real_map_detection_image(self.image_path)
+            real_map_same_image = is_real_map_detection_image(self.point_image_path)
         except ImportError:
             real_map_same_image = False
 
         if real_map_same_image:
-            self.clean_map_path = str(self.image_path).replace("\\", "/")
+            self.clean_map_path = str(self.point_image_path).replace("\\", "/")
             print(f"[图像底图] 真实地图同源标注图: {self.clean_map_path}")
         elif os.environ.get("UAV_DISPLAY_MAP", "").strip() and os.path.isfile(
             os.environ.get("UAV_DISPLAY_MAP", "").strip()
@@ -2493,7 +2605,7 @@ class PowerlinePlannerV3:
         else:
             try:
                 self.clean_map_path = generate_clean_map(
-                    self.image_path,
+                    self.point_image_path,
                     detections=self.image_inspection_detections,
                     config=cfg,
                 )
@@ -2551,29 +2663,26 @@ class PowerlinePlannerV3:
         save_inspection_points_visualization(
             self.independent_lines,
             self.line_inspection_points_by_line,
-            self.image_path,
+            self.point_image_path,
             "result/step5_line_inspection_points.png",
         )
         try:
             from core.real_map_cv import (
                 extract_real_map_green_mask,
-                extract_real_map_red_mask,
                 is_real_map_detection_image,
                 save_real_map_detection_debug,
             )
 
-            if is_real_map_detection_image(self.image_path):
-                rgb_u8 = np.array(self.image.convert("RGB"))
-                red_mask = self.mask if getattr(self, "mask", None) is not None else None
-                if red_mask is None:
-                    red_mask = extract_real_map_red_mask(rgb_u8)
+            if is_real_map_detection_image(self.point_image_path):
+                rgb_u8 = np.array(Image.open(self.point_image_path).convert("RGB"))
+                red_mask = self.point_detection_red_mask
                 green_mask = extract_real_map_green_mask(rgb_u8, red_mask=red_mask)
                 polylines = [
                     list(getattr(line, "ordered_pixels", None) or getattr(line, "polyline", []) or [])
                     for line in (self.independent_lines or [])
                 ]
                 save_real_map_detection_debug(
-                    self.image_path,
+                    self.point_image_path,
                     red_mask,
                     green_mask,
                     self.image_inspection_detections,

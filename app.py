@@ -45,6 +45,10 @@ from planner.replan_start_end import (
     validate_image_coords,
 )
 from visualization.dashboard_map import get_background_map_config, resolve_map_path
+from perception.clients.defect_detection import DefectDetectionClient
+from perception.clients.video_recognition import VideoRecognitionClient
+from perception.router import PerceptionAPI
+from perception.store import PerceptionJobStore
 
 WEB_DIR = ROOT / "web"
 STATIC_DIR = WEB_DIR / "static"
@@ -83,6 +87,23 @@ if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 if DATA_DIR.is_dir():
     app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data_files")
+
+_perception_video_client = VideoRecognitionClient()
+_perception_defect_client = DefectDetectionClient()
+_perception_api = PerceptionAPI(
+    store=PerceptionJobStore(),
+    video_client=_perception_video_client,
+    defect_client=_perception_defect_client,
+    mission_file=LATEST_MISSION_PATH,
+)
+app.include_router(_perception_api.router)
+
+
+@app.on_event("shutdown")
+async def _shutdown_perception_dependencies():
+    await _perception_api.aclose()
+    await _perception_video_client.aclose()
+    await _perception_defect_client.aclose()
 
 
 @app.on_event("startup")
@@ -216,6 +237,8 @@ def _mission_generation_config(mission_data: Optional[Dict[str, Any]] = None) ->
     return {
         "inspection_point_source": source,
         "image_path": image_path,
+        "line_image": str(meta.get("line_image") or image_path),
+        "point_image": str(meta.get("point_image") or image_path),
         "display_map_image": display_map,
         "dataset_type": dataset_type,
     }
@@ -230,6 +253,9 @@ def _run_image_demo_main(
     *,
     inspection_point_source: str = "spacing",
     image_path: str = DEFAULT_MAP_PATH,
+    line_image_path: Optional[str] = None,
+    point_image_path: Optional[str] = None,
+    image_alignment: Optional[Dict[str, Any]] = None,
     display_map_path: Optional[str] = None,
     dataset_profile: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -238,6 +264,12 @@ def _run_image_demo_main(
 
     os.environ["UAV_INSPECTION_SOURCE"] = inspection_point_source
     os.environ["UAV_IMAGE_PATH"] = image_path
+    os.environ["UAV_LINE_IMAGE_PATH"] = line_image_path or image_path
+    os.environ["UAV_POINT_IMAGE_PATH"] = point_image_path or image_path
+    if image_alignment:
+        os.environ["UAV_IMAGE_ALIGNMENT"] = json.dumps(image_alignment)
+    else:
+        os.environ.pop("UAV_IMAGE_ALIGNMENT", None)
     if display_map_path:
         os.environ["UAV_DISPLAY_MAP"] = display_map_path
     else:
@@ -253,6 +285,9 @@ def _run_image_demo_main(
         demo_main(
             image_path=image_path,
             inspection_point_source=inspection_point_source,
+            line_image_path=line_image_path,
+            point_image_path=point_image_path,
+            image_alignment=image_alignment,
         )
         return
     except Exception as import_err:
@@ -264,6 +299,12 @@ def _run_image_demo_main(
         env = os.environ.copy()
         env["UAV_INSPECTION_SOURCE"] = inspection_point_source
         env["UAV_IMAGE_PATH"] = image_path
+        env["UAV_LINE_IMAGE_PATH"] = line_image_path or image_path
+        env["UAV_POINT_IMAGE_PATH"] = point_image_path or image_path
+        if image_alignment:
+            env["UAV_IMAGE_ALIGNMENT"] = json.dumps(image_alignment)
+        else:
+            env.pop("UAV_IMAGE_ALIGNMENT", None)
         if display_map_path:
             env["UAV_DISPLAY_MAP"] = display_map_path
         elif "UAV_DISPLAY_MAP" in env:
@@ -293,6 +334,8 @@ def ensure_image_pipeline_outputs(
     *,
     inspection_point_source: str = "spacing",
     image_path: str = DEFAULT_MAP_PATH,
+    line_image_path: Optional[str] = None,
+    point_image_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     确保 result/latest/mission_output.json 存在。
@@ -302,6 +345,22 @@ def ensure_image_pipeline_outputs(
 
     mission_rel = "result/latest/mission_output.json"
     image_path = _resolve_image_path(image_path)
+    profile = resolve_image_dataset_profile(image_path)
+    candidates = {
+        str(profile.get(key) or "").replace("\\", "/")
+        for key in ("dataset", "line_image", "point_image")
+    }
+    registry_match = image_path.replace("\\", "/") in candidates
+    if line_image_path is None:
+        line_image_path = (
+            str(profile.get("line_image") or image_path) if registry_match else image_path
+        )
+    if point_image_path is None:
+        point_image_path = (
+            str(profile.get("point_image") or image_path) if registry_match else image_path
+        )
+    line_image_path = _resolve_image_path(line_image_path)
+    point_image_path = _resolve_image_path(point_image_path)
 
     existing_config: Dict[str, str] = {}
     if LATEST_MISSION_PATH.exists():
@@ -311,11 +370,12 @@ def ensure_image_pipeline_outputs(
         except Exception:
             existing_config = {}
 
-    profile = resolve_image_dataset_profile(image_path)
     display_map = resolve_display_map_path(profile)
     config_changed = (
         existing_config.get("inspection_point_source") != inspection_point_source
         or existing_config.get("image_path") != image_path
+        or existing_config.get("line_image") != line_image_path
+        or existing_config.get("point_image") != point_image_path
         or (
             display_map
             and existing_config.get("display_map_image") != display_map
@@ -355,6 +415,9 @@ def ensure_image_pipeline_outputs(
             _run_image_demo_main(
                 inspection_point_source=inspection_point_source,
                 image_path=image_path,
+                line_image_path=line_image_path,
+                point_image_path=point_image_path,
+                image_alignment=profile.get("alignment"),
                 display_map_path=display_map,
                 dataset_profile=profile,
             )
@@ -472,6 +535,12 @@ async def _plan_image_pipeline(
     detection_path = _resolve_image_path(
         resolve_detection_image_path(profile, inspection_point_source)
     )
+    line_image_path = _resolve_image_path(
+        str(profile.get("line_image") or detection_path)
+    )
+    point_image_path = _resolve_image_path(
+        str(profile.get("point_image") or detection_path)
+    )
     display_map = resolve_display_map_path(profile)
     if display_map:
         display_map = _resolve_image_path(display_map)
@@ -479,6 +548,8 @@ async def _plan_image_pipeline(
         force=False,
         inspection_point_source=inspection_point_source,
         image_path=detection_path,
+        line_image_path=line_image_path,
+        point_image_path=point_image_path,
     )
     if not gen.get("ok"):
         raise HTTPException(status_code=500, detail=gen.get("message", "Image pipeline generation failed"))

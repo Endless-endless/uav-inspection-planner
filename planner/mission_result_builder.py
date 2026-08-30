@@ -24,6 +24,15 @@ def _normalize_dashboard_inspection_point_id(pt: Dict[str, Any], index: int) -> 
     m = re.match(r"^IP_(\d+)$", raw, re.IGNORECASE)
     if m:
         return f"IP_{int(m.group(1)):04d}"
+    image_point = (
+        str(pt.get("point_type") or "").lower() == "image_detected"
+        or str(pt.get("source_reason") or "").lower().startswith("image_")
+        or bool(pt.get("detection_valid"))
+    )
+    if image_point:
+        raise ValueError(
+            "Image inspection point identity_missing: point_id/id is required"
+        )
     return f"IP_{index + 1:04d}"
 
 
@@ -131,6 +140,7 @@ def merge_mission_metadata_into_dashboard(
         "pixel_coordinate_mode",
         "image_width",
         "image_height",
+        "image_alignment",
         "image_detection_stats",
         "image_inspection_overlay",
         "topo_edges_pixel",
@@ -612,6 +622,7 @@ def enrich_inspection_points_for_dashboard(
     ]
 
     enriched: List[Dict[str, Any]] = []
+    identity_locations: Dict[str, Tuple[float, float]] = {}
     meta_exclude = {
         "x",
         "y",
@@ -639,6 +650,19 @@ def enrich_inspection_points_for_dashboard(
         eid = pt.get("edge_id")
         sid = pt.get("segment_id") or (edge_map.get(eid) if eid else None)
         normalized_pid = _normalize_dashboard_inspection_point_id(pt, i)
+        identity_xy = (
+            float(pt.get("raw_x", pt["x"])),
+            float(pt.get("raw_y", pt["y"])),
+        )
+        previous_xy = identity_locations.get(normalized_pid)
+        if previous_xy is not None and previous_xy != identity_xy:
+            raise ValueError(
+                f"Duplicate inspection point_id {normalized_pid} maps to "
+                f"different raw coordinates: {previous_xy} vs {identity_xy}"
+            )
+        if previous_xy is not None:
+            continue
+        identity_locations[normalized_pid] = identity_xy
         ip_file = f"{normalized_pid}.jpg"
         rel_path = (INSPECTION_IMAGE_REL_DIR / ip_file).as_posix()
         image_url = f"/api/inspection-image/{ip_file}"

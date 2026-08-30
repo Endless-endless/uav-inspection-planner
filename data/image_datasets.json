@@ -16,6 +16,20 @@
 
       "point_image": "data/chengdu_real_point.png",
 
+      "alignment": {
+
+        "mode": "crop",
+
+        "anchor": "top_left",
+
+        "crop_right": 2,
+
+        "expected_line_size": [1417, 1258],
+
+        "expected_point_size": [1415, 1258]
+
+      },
+
       "dataset_type": "real_satellite"
 
     },

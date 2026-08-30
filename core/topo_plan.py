@@ -21,9 +21,37 @@ Phase 1特点：
 from typing import List, Dict, Tuple, Optional, Set
 import numpy as np
 from collections import deque
+import re
 
 from core.topo import TopoGraph, TopoNode
 from core.topo_task import EdgeTask
+
+
+def _stable_export_point_id(point, *, image_point: bool, legacy_counter: int) -> str:
+    """Return the source identity; image points must never be visit-order IDs."""
+    if isinstance(point, dict):
+        raw_id = (
+            point.get("original_point_id")
+            or point.get("point_id")
+            or point.get("id")
+        )
+    else:
+        raw_id = (
+            getattr(point, "original_point_id", None)
+            or getattr(point, "point_id", None)
+            or getattr(point, "id", None)
+        )
+    raw_id = str(raw_id or "").strip()
+    if raw_id:
+        match = re.fullmatch(r"IP_(\d+)", raw_id, re.IGNORECASE)
+        return f"IP_{int(match.group(1)):04d}" if match else raw_id
+    if image_point:
+        raise ValueError(
+            "Image inspection point identity_missing: source point_id/id is required"
+        )
+    # Legacy spacing points did not always carry an identity. Preserve that
+    # compatibility without allowing it to mask missing image evidence IDs.
+    return f"IP_{legacy_counter:05d}"
 
 
 # =====================================================
@@ -4530,6 +4558,7 @@ def export_grouped_mission_to_json(
     # 6. Inspection Points - 优先使用 mission 任务对象，保证 PL visit_order 的点归属为 PL_xxx。
     inspection_points_data = []
     point_id_counter = 0
+    exported_point_locations = {}
     # 为每个 edge 获取其巡检点
     edge_to_inspection_points = {}  # {edge_id: [points]}
 
@@ -4578,7 +4607,6 @@ def export_grouped_mission_to_json(
 
         for point in points:
             point_id_counter += 1
-            visit_order_counter += 1
 
             # 处理 LineInspectionPoint 对象或字典
             if hasattr(point, 'pixel_position'):
@@ -4613,6 +4641,35 @@ def export_grouped_mission_to_json(
             if not isinstance(pixel_pos, (tuple, list)) or len(pixel_pos) < 2:
                 continue
 
+            image_point = (
+                str(point_type or "").lower() == "image_detected"
+                or str(source_reason or "").lower().startswith("image_")
+                or bool(isinstance(detection_result, dict) and detection_result.get("raw_coord"))
+            )
+            stable_point_id = _stable_export_point_id(
+                point,
+                image_point=image_point,
+                legacy_counter=point_id_counter,
+            )
+            raw_for_identity = (
+                (detection_result or {}).get("raw_coord")
+                if isinstance(detection_result, dict)
+                else None
+            ) or pixel_pos
+            identity_xy = (round(float(raw_for_identity[0]), 6), round(float(raw_for_identity[1]), 6))
+            previous_xy = exported_point_locations.get(stable_point_id)
+            if previous_xy is not None:
+                if previous_xy != identity_xy:
+                    raise ValueError(
+                        f"Duplicate inspection point_id {stable_point_id} maps to "
+                        f"different raw coordinates: {previous_xy} vs {identity_xy}"
+                    )
+                # The same physical evidence may be referenced by more than one
+                # task object, but Mission inspection_points contains one identity row.
+                continue
+            exported_point_locations[stable_point_id] = identity_xy
+            visit_order_counter += 1
+
             # 获取 3D 位置
             if pos_3d is None and terrain_3d is not None:
                 x, y = pixel_pos
@@ -4629,7 +4686,7 @@ def export_grouped_mission_to_json(
                     group_id = mission.edge_to_group.get(edge_id)
 
             point_data = {
-                "point_id": f"IP_{point_id_counter:05d}",
+                "point_id": stable_point_id,
                 "edge_id": str(point_edge_id),
                 "group_id": group_id,
                 "line_id": line_id,

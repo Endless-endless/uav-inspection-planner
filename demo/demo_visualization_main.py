@@ -30,9 +30,11 @@ UAV 电网巡检 - 主展示页入口（交互式版本）
 
 import sys
 import os
-from typing import Optional
+import json
+from typing import Dict, Optional
 
 import numpy as np
+from PIL import Image
 
 # 添加项目路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,6 +47,9 @@ def main(
     image_path: str = "data/test.png",
     inspection_point_source: str = "spacing",
     inspection_spacing: float = 100.0,
+    line_image_path: Optional[str] = None,
+    point_image_path: Optional[str] = None,
+    image_alignment: Optional[Dict] = None,
 ):
     """
     主函数：生成主展示页
@@ -98,13 +103,25 @@ def main(
     # 设置天气场景（可选：calm, crosswind, headwind_strong, tailwind_efficient, gusty_high_risk）
     weather_scene = "calm"  # 默认：微风
 
+    line_image_path = line_image_path or image_path
+    point_image_path = point_image_path or image_path
+    line_size = Image.open(line_image_path).size
+    point_size = Image.open(point_image_path).size
+    if line_size != point_size and not image_alignment:
+        raise ValueError(
+            "线路图与巡检点图尺寸不一致: "
+            f"line={line_size[0]}x{line_size[1]}, point={point_size[0]}x{point_size[1]}"
+        )
+
     display_map = os.environ.get("UAV_DISPLAY_MAP", "").strip()
     dataset_type = os.environ.get("UAV_DATASET_TYPE", "").strip()
-    if dataset_type == "real_satellite" or "chengdu_real_point" in image_path.replace("\\", "/"):
+    if dataset_type == "real_satellite" or "chengdu_real" in point_image_path.replace("\\", "/"):
         os.environ["UAV_IMAGE_PIXEL_COORDS"] = "1"
 
     planner = PowerlinePlannerV3(
-        image_path=image_path,
+        image_path=line_image_path,
+        point_image_path=point_image_path,
+        image_alignment=image_alignment,
         flight_height=30,
         weather_scene=weather_scene
     )
@@ -206,21 +223,21 @@ def main(
         weather_info_for_export = weather_info
 
     dataset_type = os.environ.get("UAV_DATASET_TYPE", "").strip() or None
-    is_real_map = dataset_type == "real_satellite" or "chengdu_real" in image_path.replace("\\", "/")
+    is_real_map = dataset_type == "real_satellite" or "chengdu_real" in point_image_path.replace("\\", "/")
     if is_real_map:
-        from core.real_map_cv import REAL_MAP_CANONICAL_IMAGE
-
-        image_path = REAL_MAP_CANONICAL_IMAGE
-        clean_map = REAL_MAP_CANONICAL_IMAGE
-        display_map = REAL_MAP_CANONICAL_IMAGE
+        map_image = point_image_path
+        clean_map = point_image_path
+        display_map = point_image_path
     else:
         display_map = os.environ.get("UAV_DISPLAY_MAP", "").strip() or None
-        clean_map = display_map or getattr(planner, "clean_map_path", None) or image_path
+        clean_map = display_map or getattr(planner, "clean_map_path", None) or point_image_path
         display_map = display_map or clean_map
+        map_image = point_image_path
     extra_meta = {
         "inspection_point_source": planner.inspection_point_source,
-        "map_image": image_path,
-        "point_image": image_path,
+        "map_image": map_image,
+        "line_image": line_image_path,
+        "point_image": point_image_path,
         "clean_map_image": clean_map,
         "display_map_image": display_map,
         "coordinate_mode": "image_pixel_fixed",
@@ -229,6 +246,7 @@ def main(
         "image_height": getattr(planner, "height", None),
         "image_inspection_overlay": planner.image_inspection_overlay,
         "image_detection_stats": getattr(planner, "image_detection_stats", {}),
+        "image_alignment": dict(planner.image_alignment_metadata or {}),
     }
     if dataset_type:
         extra_meta["dataset_type"] = dataset_type
@@ -253,10 +271,17 @@ def main(
 
 if __name__ == "__main__":
     image_path = os.environ.get("UAV_IMAGE_PATH", "data/test.png")
+    line_image_path = os.environ.get("UAV_LINE_IMAGE_PATH", "").strip() or image_path
+    point_image_path = os.environ.get("UAV_POINT_IMAGE_PATH", "").strip() or image_path
+    image_alignment_raw = os.environ.get("UAV_IMAGE_ALIGNMENT", "").strip()
+    image_alignment = json.loads(image_alignment_raw) if image_alignment_raw else None
     inspection_point_source = os.environ.get("UAV_INSPECTION_SOURCE", "spacing")
     inspection_spacing = float(os.environ.get("UAV_INSPECTION_SPACING", "100"))
     planner = main(
         image_path=image_path,
+        line_image_path=line_image_path,
+        point_image_path=point_image_path,
+        image_alignment=image_alignment,
         inspection_point_source=inspection_point_source,
         inspection_spacing=inspection_spacing,
     )
