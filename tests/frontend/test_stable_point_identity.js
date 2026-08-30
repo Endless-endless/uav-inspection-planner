@@ -24,14 +24,14 @@ vm.runInContext(
 
 const points = [
   {
-    point_id: "IP_0007", raw_x: 1139.42, raw_y: 521.37,
+    point_id: "IP_00007", raw_x: 1139.42, raw_y: 521.37,
     snapped_x: 10, snapped_y: 0, segment_id: "inspect_left",
-    edge_id: "PL_000", image_url: "/api/inspection-image/IP_0007.jpg",
+    edge_id: "PL_000", image_url: "/api/inspection-image/IP_00007.jpg",
   },
   {
-    point_id: "IP_0012", raw_x: 1293.46, raw_y: 855.54,
+    point_id: "IP_00012", raw_x: 1293.46, raw_y: 855.54,
     snapped_x: 90, snapped_y: 0, segment_id: "inspect_right",
-    edge_id: "PL_005", image_url: "/api/inspection-image/IP_0012.jpg",
+    edge_id: "PL_005", image_url: "/api/inspection-image/IP_00012.jpg",
   },
 ];
 
@@ -65,8 +65,8 @@ for (const point of points) {
   assert.equal(framesB[point.point_id].length, 1);
   assert.equal(point.image_url, `/api/inspection-image/${point.point_id}.jpg`);
 }
-assert.notEqual(framesA.IP_0012[0], framesB.IP_0012[0]);
-assert.equal(points[0].point_id, "IP_0007");
-assert.equal(points[1].point_id, "IP_0012");
+assert.notEqual(framesA.IP_00012[0], framesB.IP_00012[0]);
+assert.equal(points[0].point_id, "IP_00007");
+assert.equal(points[1].point_id, "IP_00012");
 
 console.log("stable point identity frontend test passed");

@@ -738,25 +738,32 @@ function updateDownloadLinks(outputFiles, pipeline) {
 
   if (pipeline === "image") {
     const snap = outputFiles?.mission_snapshot || "latest_image_mission_snapshot.json";
-    $("headerDownload").href = base + snap;
-    $("dlMission").href = base + snap;
-    $("dlAnalysis").classList.add("hidden");
-    $("dlCompare").classList.add("hidden");
+    const headerDownload = $("headerDownload");
+    const missionDownload = $("dlMission");
+    if (headerDownload) headerDownload.href = base + snap;
+    if (missionDownload) missionDownload.href = base + snap;
+    $("dlAnalysis")?.classList.add("hidden");
+    $("dlCompare")?.classList.add("hidden");
     $("dlLegacyHtml")?.classList.add("hidden");
     return;
   }
 
   $("dlLegacyHtml")?.classList.add("hidden");
   const mission = outputFiles?.mission || "latest_mission.json";
-  $("headerDownload").href = base + mission;
-  $("dlMission").href = base + mission;
-  $("dlAnalysis").href = base + (outputFiles?.analysis || "latest_analysis.json");
-  $("dlAnalysis").classList.remove("hidden");
+  const headerDownload = $("headerDownload");
+  const missionDownload = $("dlMission");
+  const analysisDownload = $("dlAnalysis");
+  if (headerDownload) headerDownload.href = base + mission;
+  if (missionDownload) missionDownload.href = base + mission;
+  if (analysisDownload) {
+    analysisDownload.href = base + (outputFiles?.analysis || "latest_analysis.json");
+    analysisDownload.classList.remove("hidden");
+  }
   const cmp = $("dlCompare");
-  if (outputFiles?.compare) {
+  if (cmp && outputFiles?.compare) {
     cmp.href = base + outputFiles.compare;
     cmp.classList.remove("hidden");
-  } else {
+  } else if (cmp) {
     cmp.classList.add("hidden");
   }
 }

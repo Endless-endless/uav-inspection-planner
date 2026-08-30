@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -17,13 +16,13 @@ INSPECTION_IMAGE_REL_DIR = Path("figures") / "inspection_images"
 
 def _normalize_dashboard_inspection_point_id(pt: Dict[str, Any], index: int) -> str:
     """
-    Dashboard 稳定图片 id：已有 IP_nnnn 则规范化零填充；否则按顺序分配 IP_0001…
-    不把 L_/point_ 等用作 figures/inspection_images 下的文件名键。
+    Dashboard 巡检点 id：已有 Mission 身份必须原样透传。
+
+    旧的非图像点无 id 时仍保留按顺序分配的兼容行为；图像点缺少身份则明确报错。
     """
     raw = str(pt.get("point_id") or pt.get("id") or "").strip()
-    m = re.match(r"^IP_(\d+)$", raw, re.IGNORECASE)
-    if m:
-        return f"IP_{int(m.group(1)):04d}"
+    if raw:
+        return raw
     image_point = (
         str(pt.get("point_type") or "").lower() == "image_detected"
         or str(pt.get("source_reason") or "").lower().startswith("image_")
