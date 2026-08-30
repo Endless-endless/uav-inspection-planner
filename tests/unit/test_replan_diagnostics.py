@@ -31,3 +31,31 @@ def test_replan_failure_does_not_mutate_baseline(monkeypatch, baseline_copy):
     with pytest.raises(Exception):
         app._replan_dashboard_from_start_end(mission_data=baseline_copy, start_xy=[801, 410], end_xy=[751, 892], inspection_point_source="image", detection_path="data/chengdu_real_point.png", display_map="data/chengdu_real_point.png", map_rel_for_dashboard="data/chengdu_real_point.png")
     assert baseline_copy == before
+
+
+def test_replan_dashboard_registers_and_exposes_b_identity(monkeypatch, baseline_copy):
+    import app
+    from perception.mission_identity import MissionSnapshot
+    from perception.mission_registry import RuntimeMissionRegistry
+
+    mission_b = copy.deepcopy(baseline_copy)
+    mission_b.setdefault("metadata", {})["phase7b_test_variant"] = "B"
+    registry = RuntimeMissionRegistry()
+    monkeypatch.setattr(app, "_runtime_mission_registry", registry)
+    monkeypatch.setattr(app, "build_start_end_replan_mission", lambda *_a, **_k: mission_b)
+
+    dashboard_b = app._replan_dashboard_from_start_end(
+        mission_data=baseline_copy,
+        start_xy=[801, 410],
+        end_xy=[751, 892],
+        inspection_point_source="image",
+        detection_path="data/chengdu_real_point.png",
+        display_map="data/chengdu_real_point.png",
+        map_rel_for_dashboard="data/chengdu_real_point.png",
+    )
+    expected_b = MissionSnapshot.from_dict(mission_b)
+
+    assert dashboard_b["metadata"]["mission_id"] == expected_b.mission_id
+    assert dashboard_b["metadata"]["mission_sha256"] == expected_b.mission_sha256
+    assert registry.get(expected_b.mission_id, expected_b.mission_sha256).mission == mission_b
+    assert expected_b.mission_sha256 != MissionSnapshot.from_dict(baseline_copy).mission_sha256

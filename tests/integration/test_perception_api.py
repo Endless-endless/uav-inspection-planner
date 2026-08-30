@@ -13,6 +13,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from perception.clients.defect_detection import DefectDetectionClient
+from perception.mission_identity import MissionSnapshot
+from perception.mission_registry import RuntimeMissionRegistry
 from perception.models import PerceptionWorkflowResult, WorkflowError
 from perception.router import PerceptionAPI
 from perception.store import PerceptionJobStore
@@ -62,6 +64,7 @@ class ControlledOrchestrator:
             return PerceptionWorkflowResult(
                 status="failed",
                 mission_id=kwargs["mission_snapshot"].mission_id,
+                mission_sha256=kwargs["mission_snapshot"].mission_sha256,
                 inspection_point_id=kwargs["inspection_point_id"],
                 video_job_id="VR_JOB_1",
                 video_id=kwargs.get("video_id"),
@@ -71,6 +74,7 @@ class ControlledOrchestrator:
             return PerceptionWorkflowResult(
                 status="completed_with_errors",
                 mission_id=kwargs["mission_snapshot"].mission_id,
+                mission_sha256=kwargs["mission_snapshot"].mission_sha256,
                 inspection_point_id=kwargs["inspection_point_id"],
                 video_job_id="VR_JOB_1",
                 video_id=kwargs.get("video_id"),
@@ -81,6 +85,7 @@ class ControlledOrchestrator:
         return PerceptionWorkflowResult(
             status="completed",
             mission_id=kwargs["mission_snapshot"].mission_id,
+            mission_sha256=kwargs["mission_snapshot"].mission_sha256,
             inspection_point_id=kwargs["inspection_point_id"],
             video_job_id="VR_JOB_1",
             video_id=kwargs.get("video_id"),
@@ -88,19 +93,18 @@ class ControlledOrchestrator:
         )
 
 
+TEST_MISSION = {
+    "inspection_points": [
+        {"point_id": "IP_00001"},
+        {"point_id": "IP_00012"},
+    ],
+    "image_inspection_overlay": [{"id": "IP_0012"}],
+}
+TEST_SNAPSHOT = MissionSnapshot.from_dict(TEST_MISSION)
+
+
 def write_mission(path: Path) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "inspection_points": [
-                    {"point_id": "IP_00001"},
-                    {"point_id": "IP_00012"},
-                ],
-                "image_inspection_overlay": [{"id": "IP_0012"}],
-            }
-        ),
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(TEST_MISSION), encoding="utf-8")
 
 
 def make_app(
@@ -113,12 +117,15 @@ def make_app(
     mission_file = tmp_path / "mission.json"
     if mission_exists:
         write_mission(mission_file)
+    registry = RuntimeMissionRegistry()
+    if mission_exists:
+        registry.register(TEST_MISSION)
     controlled = factory or ControlledOrchestratorFactory()
     api = PerceptionAPI(
         store=PerceptionJobStore(),
         video_client=UnusedClient(),
         defect_client=defect_client or UnusedClient(),
-        mission_file=mission_file,
+        mission_registry=registry,
         temp_dir=tmp_path / "uploads",
         orchestrator_factory=controlled,
     )
@@ -132,11 +139,22 @@ def make_app(
     return test_app, api, controlled
 
 
-def post_job(client: TestClient, point_id: str = "IP_00012"):
+def post_job(
+    client: TestClient,
+    point_id: str = "IP_00012",
+    *,
+    mission_id: str = TEST_SNAPSHOT.mission_id,
+    mission_sha256: str = TEST_SNAPSHOT.mission_sha256,
+):
     return client.post(
         "/api/v1/perception/jobs",
         files={"video": ("flight.mp4", b"video-bytes", "video/mp4")},
-        data={"inspection_point_id": point_id, "video_id": "VIDEO_1"},
+        data={
+            "inspection_point_id": point_id,
+            "mission_id": mission_id,
+            "mission_sha256": mission_sha256,
+            "video_id": "VIDEO_1",
+        },
     )
 
 
@@ -173,6 +191,8 @@ def test_post_returns_202_then_running_completed_and_cleans_upload(
         assert running["status"] == "running"
         assert running["stage"] == "video_running"
         assert running["video_job_id"] == "VR_JOB_1"
+        assert running["mission_id"] == TEST_SNAPSHOT.mission_id
+        assert running["mission_sha256"] == TEST_SNAPSHOT.mission_sha256
         not_ready = client.get(
             f"/api/v1/perception/jobs/{workflow_job_id}/result"
         )
@@ -191,6 +211,7 @@ def test_post_returns_202_then_running_completed_and_cleans_upload(
         assert result.status_code == 200
         assert result.json()["status"] == "completed"
         assert result.json()["target_frame_count"] == 1
+        assert result.json()["mission_sha256"] == TEST_SNAPSHOT.mission_sha256
         assert not staged_path.exists()
 
 
@@ -206,15 +227,63 @@ def test_non_authoritative_overlay_id_is_rejected_before_background_work(
         assert not (tmp_path / "uploads").exists()
 
 
-def test_missing_mission_is_structured_503(tmp_path: Path) -> None:
+def test_missing_mission_binding_is_structured_409(tmp_path: Path) -> None:
     app, _api, _factory = make_app(tmp_path, mission_exists=False)
     with TestClient(app) as client:
         response = post_job(client)
-        assert response.status_code == 503
+        assert response.status_code == 409
         assert response.json()["detail"] == {
-            "code": "mission_unavailable",
-            "message": "current Mission is unavailable",
+            "code": "mission_snapshot_unavailable",
+            "message": "the submitted Mission snapshot is unavailable in this process",
         }
+
+
+def test_mission_hash_mismatch_is_structured_409(tmp_path: Path) -> None:
+    app, _api, factory = make_app(tmp_path)
+    with TestClient(app) as client:
+        response = post_job(client, mission_sha256="0" * 64)
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "mission_identity_mismatch"
+        assert not factory.started.is_set()
+
+
+def test_missing_required_mission_binding_is_rejected_without_fallback(
+    tmp_path: Path,
+) -> None:
+    app, _api, factory = make_app(tmp_path)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/perception/jobs",
+            files={"video": ("flight.mp4", b"video-bytes", "video/mp4")},
+            data={"inspection_point_id": "IP_00012"},
+        )
+        assert response.status_code == 422
+        assert not factory.started.is_set()
+
+
+def test_browser_b_binding_selects_b_even_when_a_has_the_same_point_ids(
+    tmp_path: Path,
+) -> None:
+    app, api, factory = make_app(tmp_path)
+    mission_b = {
+        **TEST_MISSION,
+        "markers": {"start": {"x": 99, "y": 88}},
+    }
+    snapshot_b = api._mission_registry.register(mission_b)
+    assert snapshot_b.authoritative_inspection_point_ids == TEST_SNAPSHOT.authoritative_inspection_point_ids
+    assert snapshot_b.mission_sha256 != TEST_SNAPSHOT.mission_sha256
+
+    with TestClient(app) as client:
+        response = post_job(
+            client,
+            mission_id=snapshot_b.mission_id,
+            mission_sha256=snapshot_b.mission_sha256,
+        )
+        assert response.status_code == 202
+        assert factory.started.wait(1)
+        assert factory.calls[0]["mission_snapshot"].mission_sha256 == snapshot_b.mission_sha256
+        assert factory.calls[0]["mission_snapshot"].mission_sha256 != TEST_SNAPSHOT.mission_sha256
+        factory.release.set()
 
 
 def test_unknown_job_is_404(tmp_path: Path) -> None:
@@ -413,6 +482,7 @@ def test_result_normalizes_8003_relative_annotation_url_at_api_boundary(
     app, api, _factory = make_app(tmp_path)
     job = api.store.create(
         mission_id="M_RUNTIME",
+        mission_sha256="a" * 64,
         inspection_point_id="IP_00012",
     )
     api.store.store_result(
@@ -420,6 +490,7 @@ def test_result_normalizes_8003_relative_annotation_url_at_api_boundary(
         {
             "status": "completed",
             "mission_id": "M_RUNTIME",
+            "mission_sha256": "a" * 64,
             "inspection_point_id": "IP_00012",
             "target_frame_count": 1,
             "frames": [

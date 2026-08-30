@@ -24,6 +24,7 @@ class PerceptionJobStore:
         self,
         *,
         mission_id: str,
+        mission_sha256: str,
         inspection_point_id: str,
         video_id: str | None = None,
     ) -> dict[str, Any]:
@@ -35,6 +36,7 @@ class PerceptionJobStore:
             "stage": "queued",
             "progress": 0,
             "mission_id": mission_id,
+            "mission_sha256": mission_sha256,
             "inspection_point_id": inspection_point_id,
             "video_id": video_id,
             "video_job_id": None,

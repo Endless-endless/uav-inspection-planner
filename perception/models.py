@@ -44,6 +44,7 @@ class FrameResult:
 class PerceptionWorkflowResult:
     status: str
     mission_id: str
+    mission_sha256: str
     inspection_point_id: str
     video_job_id: str | None = None
     video_id: str | None = None
@@ -55,6 +56,7 @@ class PerceptionWorkflowResult:
         return {
             "status": self.status,
             "mission_id": self.mission_id,
+            "mission_sha256": self.mission_sha256,
             "inspection_point_id": self.inspection_point_id,
             "video_job_id": self.video_job_id,
             "video_id": self.video_id,

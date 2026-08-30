@@ -140,7 +140,7 @@ def test_mission_without_id_gets_runtime_id_and_sha(tmp_path: Path) -> None:
     mission_file = tmp_path / "mission.json"
     mission_file.write_text(json.dumps(mission_data()), encoding="utf-8")
     snapshot = MissionSnapshot.from_file(mission_file)
-    assert snapshot.mission_id.startswith("mission_rt_")
+    assert snapshot.mission_id == f"mission_{snapshot.mission_sha256[:24]}"
     assert len(snapshot.mission_sha256) == 64
     assert snapshot.authoritative_inspection_point_ids == {
         "IP_00001",

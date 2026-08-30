@@ -84,6 +84,15 @@
     );
   }
 
+  function getCurrentMissionBinding() {
+    const metadata = window.MissionStore?.getMission?.()?.metadata || {};
+    return {
+      missionId: typeof metadata.mission_id === "string" ? metadata.mission_id : "",
+      missionSha256:
+        typeof metadata.mission_sha256 === "string" ? metadata.mission_sha256 : "",
+    };
+  }
+
   function responseError(payload, fallback) {
     const detail = payload?.detail;
     if (detail && typeof detail === "object") {
@@ -137,8 +146,11 @@
       this.generation = 0;
     }
 
-    async start({ video, inspectionPointId, videoId }) {
+    async start({ video, inspectionPointId, missionId, missionSha256, videoId }) {
       if (this.startInFlight) throw new Error("识别请求正在提交，请稍候");
+      if (!missionId || !missionSha256) {
+        throw new Error("当前 Mission 缺少可验证的运行时身份，请重新加载任务");
+      }
       this.cancelPolling();
       this.generation += 1;
       const generation = this.generation;
@@ -148,6 +160,8 @@
         const form = this.formDataFactory();
         form.append("video", video);
         form.append("inspection_point_id", inspectionPointId);
+        form.append("mission_id", missionId);
+        form.append("mission_sha256", missionSha256);
         if (videoId) form.append("video_id", videoId);
         const response = await this.fetchImpl("/api/v1/perception/jobs", {
           method: "POST",
@@ -441,6 +455,7 @@
         const inspectionPointId = root.querySelector("[data-perception-point]")?.value || "";
         const video = root.querySelector("[data-perception-video]")?.files?.[0];
         const videoId = root.querySelector("[data-perception-video-id]")?.value?.trim() || "";
+        const { missionId, missionSha256 } = getCurrentMissionBinding();
         if (!inspectionPointId) {
           showControllerError(new Error("请选择当前 Mission 中的巡检点"));
           return;
@@ -450,7 +465,13 @@
           return;
         }
         try {
-          await controller.start({ video, inspectionPointId, videoId });
+          await controller.start({
+            video,
+            inspectionPointId,
+            missionId,
+            missionSha256,
+            videoId,
+          });
         } catch (_) {
           // Controller has already rendered a structured user-facing error.
         }
@@ -486,6 +507,7 @@
     PerceptionWorkflowController,
     accessibleAnnotatedUrl,
     getAuthoritativeInspectionPoints,
+    getCurrentMissionBinding,
     renderPerceptionResult,
     terminalStates: TERMINAL_STATES,
   };

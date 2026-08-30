@@ -24,6 +24,11 @@ from perception.clients import (
 from perception.clients.defect_detection import DefectDetectionClient
 from perception.clients.video_recognition import VideoRecognitionClient
 from perception.mission_identity import MissionIdentityError, MissionSnapshot
+from perception.mission_registry import (
+    RuntimeMissionIdentityMismatchError,
+    RuntimeMissionRegistry,
+    RuntimeMissionUnavailableError,
+)
 from perception.orchestrator import PerceptionOrchestrator
 from perception.store import PerceptionJobNotFoundError, PerceptionJobStore
 
@@ -59,7 +64,7 @@ class PerceptionAPI:
         store: PerceptionJobStore,
         video_client: VideoRecognitionClient,
         defect_client: DefectDetectionClient,
-        mission_file: str | Path,
+        mission_registry: RuntimeMissionRegistry,
         temp_dir: str | Path | None = None,
         orchestrator_factory: OrchestratorFactory = PerceptionOrchestrator,
         task_scheduler: TaskScheduler | None = None,
@@ -67,7 +72,7 @@ class PerceptionAPI:
         self.store = store
         self._video_client = video_client
         self._defect_client = defect_client
-        self._mission_file = Path(mission_file)
+        self._mission_registry = mission_registry
         self._temp_dir = (
             Path(temp_dir)
             if temp_dir
@@ -91,9 +96,11 @@ class PerceptionAPI:
         async def create_job(
             video: UploadFile = File(...),
             inspection_point_id: str = Form(...),
+            mission_id: str = Form(...),
+            mission_sha256: str = Form(...),
             video_id: str | None = Form(None),
         ) -> dict[str, Any]:
-            snapshot = self._load_snapshot()
+            snapshot = self._load_snapshot(mission_id, mission_sha256)
             try:
                 snapshot.require_inspection_point(inspection_point_id)
             except MissionIdentityError as exc:
@@ -133,6 +140,7 @@ class PerceptionAPI:
 
             job = self.store.create(
                 mission_id=snapshot.mission_id,
+                mission_sha256=snapshot.mission_sha256,
                 inspection_point_id=inspection_point_id,
                 video_id=video_id,
             )
@@ -159,7 +167,12 @@ class PerceptionAPI:
                     "background_task_start_failed",
                     "perception background task could not be started",
                 ) from exc
-            return {"workflow_job_id": workflow_job_id, "status": "queued"}
+            return {
+                "workflow_job_id": workflow_job_id,
+                "status": "queued",
+                "mission_id": snapshot.mission_id,
+                "mission_sha256": snapshot.mission_sha256,
+            }
 
         @self.router.get("/jobs/{workflow_job_id}")
         async def get_job(workflow_job_id: str) -> dict[str, Any]:
@@ -244,16 +257,22 @@ class PerceptionAPI:
                 },
             )
 
-    def _load_snapshot(self) -> MissionSnapshot:
+    def _load_snapshot(
+        self, mission_id: str, mission_sha256: str
+    ) -> MissionSnapshot:
         try:
-            return MissionSnapshot.from_file(self._mission_file)
-        except FileNotFoundError as exc:
+            return self._mission_registry.get(mission_id, mission_sha256)
+        except RuntimeMissionUnavailableError as exc:
             raise self._http_error(
-                503, "mission_unavailable", "current Mission is unavailable"
+                409,
+                "mission_snapshot_unavailable",
+                "the submitted Mission snapshot is unavailable in this process",
             ) from exc
-        except (MissionIdentityError, OSError) as exc:
+        except RuntimeMissionIdentityMismatchError as exc:
             raise self._http_error(
-                503, "mission_invalid", "current Mission cannot be loaded"
+                409,
+                "mission_identity_mismatch",
+                "mission_id and mission_sha256 do not identify the same Mission",
             ) from exc
 
     async def _run_workflow(
@@ -356,6 +375,7 @@ class PerceptionAPI:
             "workflow_job_id": job["workflow_job_id"],
             "status": job["status"],
             "mission_id": job["mission_id"],
+            "mission_sha256": job["mission_sha256"],
             "inspection_point_id": job["inspection_point_id"],
             "video_id": job.get("video_id"),
             "video_job_id": job.get("video_job_id"),

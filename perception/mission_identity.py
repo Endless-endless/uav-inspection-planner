@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -65,7 +64,7 @@ class MissionSnapshot:
             raise MissionIdentityError(f"invalid Mission JSON: {path}") from exc
         return cls._build(
             mission,
-            mission_sha256=hashlib.sha256(raw).hexdigest(),
+            mission_sha256=cls.canonical_sha256(mission),
             runtime_mission_id=runtime_mission_id,
             source_path=path,
         )
@@ -77,12 +76,9 @@ class MissionSnapshot:
         *,
         runtime_mission_id: str | None = None,
     ) -> "MissionSnapshot":
-        canonical = json.dumps(
-            mission, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
         return cls._build(
             mission,
-            mission_sha256=hashlib.sha256(canonical).hexdigest(),
+            mission_sha256=cls.canonical_sha256(mission),
             runtime_mission_id=runtime_mission_id,
             source_path=None,
         )
@@ -127,7 +123,7 @@ class MissionSnapshot:
             else cls._existing_mission_id(mission)
         )
         if mission_id is None:
-            mission_id = f"mission_rt_{uuid.uuid4().hex}"
+            mission_id = f"mission_{mission_sha256[:24]}"
         if not isinstance(mission_id, str) or not mission_id:
             raise MissionIdentityError("runtime mission_id must be a non-empty string")
 
@@ -152,6 +148,13 @@ class MissionSnapshot:
             if isinstance(metadata_id, str) and metadata_id:
                 return metadata_id
         return None
+
+    @staticmethod
+    def canonical_sha256(mission: Mapping[str, Any]) -> str:
+        canonical = json.dumps(
+            mission, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
 
 
 __all__ = ["MissionIdentity", "MissionIdentityError", "MissionSnapshot"]

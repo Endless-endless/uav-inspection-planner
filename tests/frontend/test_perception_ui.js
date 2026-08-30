@@ -10,6 +10,8 @@ const source = fs.readFileSync(
   path.join(root, "web", "static", "inspection_evidence.js"),
   "utf8"
 );
+const MISSION_ID = "mission_test_binding";
+const MISSION_SHA256 = "a".repeat(64);
 
 class FakeElement {
   constructor(tag) {
@@ -79,7 +81,10 @@ const window = {
       return [{ point_id: "IP_00012" }, { point_id: "IP_00007" }];
     },
     getMission() {
-      return { image_inspection_overlay: [{ id: "IP_0012" }] };
+      return {
+        metadata: { mission_id: MISSION_ID, mission_sha256: MISSION_SHA256 },
+        image_inspection_overlay: [{ id: "IP_0012" }],
+      };
     },
     subscribeMission() {},
   },
@@ -175,11 +180,15 @@ async function testPostPayloadTerminalPollingAndResult() {
   await controller.start({
     video,
     inspectionPointId: "IP_00012",
+    missionId: MISSION_ID,
+    missionSha256: MISSION_SHA256,
     videoId: "VIDEO_1",
   });
   assert.deepEqual(form.fields, [
     ["video", video],
     ["inspection_point_id", "IP_00012"],
+    ["mission_id", MISSION_ID],
+    ["mission_sha256", MISSION_SHA256],
     ["video_id", "VIDEO_1"],
   ]);
   assert.equal(timer.timers.size, 1);
@@ -215,7 +224,10 @@ async function testNoDuplicateTimerAndFailedError() {
     formDataFactory: () => new FakeFormData(),
     onError: (error) => errors.push(error.message),
   });
-  await controller.start({ video: {}, inspectionPointId: "IP_00012", videoId: "" });
+  await controller.start({
+    video: {}, inspectionPointId: "IP_00012",
+    missionId: MISSION_ID, missionSha256: MISSION_SHA256, videoId: "",
+  });
   assert.equal(timer.timers.size, 1);
   await controller.pollNow();
   assert.equal(timer.timers.size, 1, "rescheduling must replace the old timer");
@@ -238,7 +250,10 @@ async function testUploadFailureRestoresController() {
     onError: (error) => errors.push(error.message),
   });
   await assert.rejects(
-    controller.start({ video: {}, inspectionPointId: "IP_00012", videoId: "" }),
+    controller.start({
+      video: {}, inspectionPointId: "IP_00012",
+      missionId: MISSION_ID, missionSha256: MISSION_SHA256, videoId: "",
+    }),
     /当前 Mission 不可用/
   );
   assert.equal(controller.active, false);

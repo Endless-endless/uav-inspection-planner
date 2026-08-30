@@ -47,6 +47,8 @@ from planner.replan_start_end import (
 from visualization.dashboard_map import get_background_map_config, resolve_map_path
 from perception.clients.defect_detection import DefectDetectionClient
 from perception.clients.video_recognition import VideoRecognitionClient
+from perception.mission_identity import MissionSnapshot
+from perception.mission_registry import RuntimeMissionRegistry
 from perception.router import PerceptionAPI
 from perception.store import PerceptionJobStore
 
@@ -68,6 +70,7 @@ DEMO_VISUALIZATION_SCRIPT = ROOT / "demo" / "demo_visualization_main.py"
 _image_gen_lock = threading.Lock()
 _image_generating = False
 _current_mission_context: Dict[str, Any] = {}
+_runtime_mission_registry = RuntimeMissionRegistry()
 
 app = FastAPI(
     title="无人机电网巡检任务控制中心",
@@ -94,7 +97,7 @@ _perception_api = PerceptionAPI(
     store=PerceptionJobStore(),
     video_client=_perception_video_client,
     defect_client=_perception_defect_client,
-    mission_file=LATEST_MISSION_PATH,
+    mission_registry=_runtime_mission_registry,
 )
 app.include_router(_perception_api.router)
 
@@ -104,6 +107,14 @@ async def _shutdown_perception_dependencies():
     await _perception_api.aclose()
     await _perception_video_client.aclose()
     await _perception_defect_client.aclose()
+
+
+def _attach_runtime_mission_identity(
+    dashboard: Dict[str, Any], snapshot: MissionSnapshot
+) -> None:
+    metadata = dashboard.setdefault("metadata", {})
+    metadata["mission_id"] = snapshot.mission_id
+    metadata["mission_sha256"] = snapshot.mission_sha256
 
 
 @app.on_event("startup")
@@ -477,6 +488,7 @@ def _replan_dashboard_from_start_end(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Replan failed: {e}") from e
 
+    runtime_snapshot = _runtime_mission_registry.register(new_mission)
     meta = new_mission.get("metadata") or {}
     map_rel = str(
         meta.get("clean_map_image")
@@ -505,6 +517,7 @@ def _replan_dashboard_from_start_end(
         },
         root=ROOT,
     )
+    _attach_runtime_mission_identity(dashboard, runtime_snapshot)
     apply_custom_markers(
         dashboard,
         start=(float(start_xy[0]), float(start_xy[1])),
@@ -563,10 +576,14 @@ async def _plan_image_pipeline(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    snapshot = OUTPUT_DIR / "latest_image_mission_snapshot.json"
+    snapshot_path = OUTPUT_DIR / "latest_image_mission_snapshot.json"
     with LATEST_MISSION_PATH.open("r", encoding="utf-8") as f:
         mission_data = json.load(f)
-    save_json(snapshot, mission_data)
+    save_json(snapshot_path, mission_data)
+    runtime_snapshot = _runtime_mission_registry.register(
+        mission_data, make_current=start_xy is None or end_xy is None
+    )
+    _attach_runtime_mission_identity(dashboard, runtime_snapshot)
 
     if start_xy is not None and end_xy is not None:
         dashboard = _replan_dashboard_from_start_end(

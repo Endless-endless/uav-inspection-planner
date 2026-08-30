@@ -91,6 +91,7 @@ class PerceptionOrchestrator:
             return self._result(
                 status="failed",
                 mission_id=mission_id,
+                mission_sha256=mission_snapshot.mission_sha256,
                 inspection_point_id=inspection_point_id,
                 video_job_id=video_job_id,
                 video_id=resolved_video_id,
@@ -106,6 +107,7 @@ class PerceptionOrchestrator:
             return self._result(
                 status="failed",
                 mission_id=mission_id,
+                mission_sha256=mission_snapshot.mission_sha256,
                 inspection_point_id=inspection_point_id,
                 video_job_id=video_job_id,
                 video_id=resolved_video_id,
@@ -121,6 +123,7 @@ class PerceptionOrchestrator:
             return self._result(
                 status="failed",
                 mission_id=mission_id,
+                mission_sha256=mission_snapshot.mission_sha256,
                 inspection_point_id=inspection_point_id,
                 video_job_id=video_job_id,
                 video_id=resolved_video_id,
@@ -238,6 +241,7 @@ class PerceptionOrchestrator:
         return self._result(
             status=final_status,
             mission_id=mission_id,
+            mission_sha256=mission_snapshot.mission_sha256,
             inspection_point_id=inspection_point_id,
             video_job_id=video_job_id,
             video_id=resolved_video_id,
