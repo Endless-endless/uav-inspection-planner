@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>GridVision 无人机巡检任务控制中心</title>
   <link rel="stylesheet" href="/static/style.css" />
-  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <script src="/static/vendor/plotly-2.27.0.min.js"></script>
 </head>
 <body>
   <header class="top-bar">
@@ -22,7 +22,7 @@
       </div>
     </div>
     <div class="header-meta">
-      <span class="badge badge-live"><span class="dot"></span>链路在线</span>
+      <span class="badge badge-live"><span class="dot"></span>本地演示</span>
       <span class="badge" id="missionPhaseBadge">任务待命</span>
       <span class="badge" id="headerSpeedBadge">1x</span>
       <button type="button" class="btn-ghost header-fs-btn" id="fullscreenBtnHeader">全屏</button>
@@ -201,7 +201,7 @@
               <div class="evidence-tabs" role="tablist" aria-label="巡检感知类型">
                 <button type="button" role="tab" aria-selected="true" data-evidence-tab="replay">回放</button>
                 <button type="button" role="tab" aria-selected="false" data-evidence-tab="video">目标识别</button>
-                <button type="button" role="tab" aria-selected="false" data-evidence-tab="defect">缺陷检测</button>
+                <button type="button" role="tab" aria-selected="false" data-evidence-tab="defect">识别与缺陷结果</button>
               </div>
               <div class="evidence-panel" data-evidence-panel="replay">
                 <div class="evidence-replay-heading"><span class="evidence-demo-badge">演示数据</span></div>
@@ -218,13 +218,13 @@
               </div>
               <div class="evidence-panel evidence-empty" data-evidence-panel="video" hidden>
                 <strong>目标识别</strong>
-                <span>等待视频识别接口</span>
-                <p>识别结果将在模块接入后显示</p>
+                <span>等待提交视频任务</span>
+                <p>完成后展示目标关键帧与缺陷检测结果</p>
               </div>
               <div class="evidence-panel evidence-empty" data-evidence-panel="defect" hidden>
-                <strong>缺陷检测</strong>
-                <span>等待缺陷检测接口</span>
-                <p>缺陷图片与检测摘要将在模块接入后显示</p>
+                <strong>识别与缺陷结果</strong>
+                <span>等待感知任务完成</span>
+                <p>完成后展示目标关键帧与缺陷检测结果</p>
               </div>
               <div class="evidence-flight-section">
                 <div class="evidence-flight-title">仿真飞行信息</div>
@@ -234,7 +234,7 @@
                 <dt>风险等级</dt><dd id="inspectCardRisk">—</dd>
               </dl>
               <div class="mission-progress mission-progress-slim mission-progress--compact">
-                <span>进度</span>
+                <span>仿真航线回放进度</span>
                 <b id="inspectCardProgressBarText">--</b>
                 <div><i></i></div>
               </div>
@@ -303,7 +303,7 @@
               <div class="evidence-tabs" role="tablist" aria-label="巡检感知类型">
                 <button type="button" role="tab" aria-selected="true" data-evidence-tab="replay">回放</button>
                 <button type="button" role="tab" aria-selected="false" data-evidence-tab="video">目标识别</button>
-                <button type="button" role="tab" aria-selected="false" data-evidence-tab="defect">缺陷检测</button>
+                <button type="button" role="tab" aria-selected="false" data-evidence-tab="defect">识别与缺陷结果</button>
               </div>
               <div class="evidence-panel" data-evidence-panel="replay">
                 <div class="evidence-replay-heading"><span class="evidence-demo-badge">演示数据</span></div>
@@ -320,13 +320,13 @@
               </div>
               <div class="evidence-panel evidence-empty" data-evidence-panel="video" hidden>
                 <strong>目标识别</strong>
-                <span>等待视频识别接口</span>
-                <p>识别结果将在模块接入后显示</p>
+                <span>等待提交视频任务</span>
+                <p>完成后展示目标关键帧与缺陷检测结果</p>
               </div>
               <div class="evidence-panel evidence-empty" data-evidence-panel="defect" hidden>
-                <strong>缺陷检测</strong>
-                <span>等待缺陷检测接口</span>
-                <p>缺陷图片与检测摘要将在模块接入后显示</p>
+                <strong>识别与缺陷结果</strong>
+                <span>等待感知任务完成</span>
+                <p>完成后展示目标关键帧与缺陷检测结果</p>
               </div>
               <div class="evidence-flight-section">
                 <div class="evidence-flight-title">仿真飞行信息</div>
@@ -336,7 +336,7 @@
                 <dt>风险等级</dt><dd id="inspectCardRiskFs">—</dd>
               </dl>
               <div class="mission-progress mission-progress-slim mission-progress--compact">
-                <span>进度</span>
+                <span>仿真航线回放进度</span>
                 <b id="inspectCardProgressBarTextFs">--</b>
                 <div><i></i></div>
               </div>

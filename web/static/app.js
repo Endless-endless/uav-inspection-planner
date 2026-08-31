@@ -733,15 +733,48 @@ function updateMapModeHint() {
   }
 }
 
-function updateDownloadLinks(outputFiles, pipeline) {
+function isStartEndReplanMission(mission) {
+  const metadata = mission?.metadata || {};
+  return (
+    metadata.source === "plan:start_end" ||
+    metadata.planner === "start_end_replan" ||
+    Boolean(metadata.replan)
+  );
+}
+
+function setMissionDownloadLink(link, href, blocked) {
+  if (!link) return;
+  if (!link.dataset.defaultText) link.dataset.defaultText = link.textContent || "导出任务";
+  if (blocked) {
+    link.removeAttribute("href");
+    link.setAttribute("aria-disabled", "true");
+    link.classList.add("is-disabled");
+    link.title = "当前为重规划任务，暂不提供任务文件导出";
+    link.textContent = "重规划任务暂不导出";
+    return;
+  }
+  link.href = href;
+  link.removeAttribute("aria-disabled");
+  link.classList.remove("is-disabled");
+  link.removeAttribute("title");
+  link.textContent = link.dataset.defaultText;
+}
+
+function updateDownloadLinks(outputFiles, pipeline, mission = getCurrentMission()) {
   const base = "/api/output/";
+  const headerDownload = $("headerDownload");
+  const missionDownload = $("dlMission");
+
+  if (isStartEndReplanMission(mission)) {
+    setMissionDownloadLink(headerDownload, "", true);
+    setMissionDownloadLink(missionDownload, "", true);
+    return;
+  }
 
   if (pipeline === "image") {
     const snap = outputFiles?.mission_snapshot || "latest_image_mission_snapshot.json";
-    const headerDownload = $("headerDownload");
-    const missionDownload = $("dlMission");
-    if (headerDownload) headerDownload.href = base + snap;
-    if (missionDownload) missionDownload.href = base + snap;
+    setMissionDownloadLink(headerDownload, base + snap, false);
+    setMissionDownloadLink(missionDownload, base + snap, false);
     $("dlAnalysis")?.classList.add("hidden");
     $("dlCompare")?.classList.add("hidden");
     $("dlLegacyHtml")?.classList.add("hidden");
@@ -749,12 +782,10 @@ function updateDownloadLinks(outputFiles, pipeline) {
   }
 
   $("dlLegacyHtml")?.classList.add("hidden");
-  const mission = outputFiles?.mission || "latest_mission.json";
-  const headerDownload = $("headerDownload");
-  const missionDownload = $("dlMission");
+  const missionFile = outputFiles?.mission || "latest_mission.json";
   const analysisDownload = $("dlAnalysis");
-  if (headerDownload) headerDownload.href = base + mission;
-  if (missionDownload) missionDownload.href = base + mission;
+  setMissionDownloadLink(headerDownload, base + missionFile, false);
+  setMissionDownloadLink(missionDownload, base + missionFile, false);
   if (analysisDownload) {
     analysisDownload.href = base + (outputFiles?.analysis || "latest_analysis.json");
     analysisDownload.classList.remove("hidden");
@@ -3031,7 +3062,7 @@ async function runStartEndReplan() {
     renderVisitOrder(mission?.visit_order);
     renderMission(mission || normalized);
     renderMeta(mission?.metadata || data.metadata || {});
-    updateDownloadLinks(data.output_files || {}, "image");
+    updateDownloadLinks(data.output_files || {}, "image", mission || normalized);
     updateReplanInputLimits();
 
     const nPts = mission?.inspection_points?.length ?? data.inspection_points?.length ?? 0;
@@ -3097,7 +3128,7 @@ async function runPlanning() {
     renderVisitOrder(mission?.visit_order);
     renderMission(mission || normalized);
     renderMeta(mission?.metadata || data.metadata || {});
-    updateDownloadLinks(data.output_files || {}, pipeline);
+    updateDownloadLinks(data.output_files || {}, pipeline, mission || normalized);
 
     const gen = data.metadata?.image_generation;
     const msg = gen?.generated

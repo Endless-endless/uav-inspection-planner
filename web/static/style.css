@@ -1796,6 +1796,30 @@ img.inspect-flight-img.inspect-snapshot-img {
   border-top: 1px solid rgba(51, 65, 85, 0.8);
 }
 
+.perception-progress-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.45rem;
+  margin-bottom: 0.35rem;
+  color: #cbd5e1;
+  font-size: 0.68rem;
+}
+
+.perception-progress-heading span {
+  color: #64748b;
+  font-size: 0.62rem;
+  text-align: right;
+}
+
+.link-dl.is-disabled,
+.dl-link.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+  pointer-events: none;
+  text-decoration: none;
+}
+
 .perception-status-line {
   display: flex;
   align-items: center;

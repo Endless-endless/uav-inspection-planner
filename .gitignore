@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 *.pyd
@@ -7,6 +8,7 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+node_modules/
 
 # OS
 .DS_Store
@@ -37,6 +39,12 @@ figures/
 /*.mp4
 /*.avi
 /*.mov
+
+# Local model weights
+*.pt
+*.pth
+*.onnx
+*.weights
 
 # Temp / backup
 *.old

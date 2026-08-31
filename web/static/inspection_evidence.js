@@ -58,7 +58,7 @@
     video_running: "视频识别",
     defect_running: "缺陷检测",
     completed: "已完成",
-    completed_with_errors: "部分完成",
+    completed_with_errors: "已完成（部分异常）",
     failed: "失败",
   };
   let lastMissionVersion = -1;
@@ -281,12 +281,13 @@
             <button type="button" class="btn-primary btn-compact" data-perception-start>开始识别</button>
           </div>
           <div class="perception-runtime" aria-live="polite">
+            <div class="perception-progress-heading"><b>感知工作流进度</b><span>与仿真航线回放独立</span></div>
             <div class="perception-status-line"><span class="perception-badge idle" data-perception-status>待命</span><b data-perception-progress-text>0%</b></div>
             <progress data-perception-progress max="100" value="0"></progress>
             <dl class="perception-meta">
               <dt>阶段</dt><dd data-perception-stage>—</dd>
-              <dt>Workflow</dt><dd data-perception-workflow>—</dd>
-              <dt>Video Job</dt><dd data-perception-video-job>—</dd>
+              <dt>工作流 ID</dt><dd data-perception-workflow>—</dd>
+              <dt>视频任务 ID</dt><dd data-perception-video-job>—</dd>
             </dl>
             <p class="perception-error" data-perception-error hidden></p>
           </div>`;
@@ -294,7 +295,7 @@
       if (defectPanel && !defectPanel.dataset.perceptionMounted) {
         defectPanel.dataset.perceptionMounted = "true";
         defectPanel.classList.remove("evidence-empty");
-        defectPanel.innerHTML = '<div class="perception-results" data-perception-results><p class="perception-placeholder">完成视频识别后显示关键帧与缺陷结果</p></div>';
+        defectPanel.innerHTML = '<div class="perception-results" data-perception-results><p class="perception-placeholder">目标关键帧与缺陷检测结果将在感知任务完成后显示</p></div>';
       }
     });
   }
@@ -336,7 +337,7 @@
       element.textContent = `${progress}%`;
     });
     document.querySelectorAll("[data-perception-stage]").forEach((element) => {
-      element.textContent = stage || "—";
+      element.textContent = STATUS_LABELS[stage] || stage || "—";
     });
     document.querySelectorAll("[data-perception-workflow]").forEach((element) => {
       element.textContent = state.workflow_job_id || controller.workflowJobId || "—";
@@ -387,7 +388,8 @@
       const card = document.createElement("article");
       card.className = `perception-frame-card ${frame.status || "unknown"}`;
       appendText(card, "h4", "", frame.frame_id || "未命名帧");
-      appendText(card, "p", "perception-frame-meta", `${Number(frame.timestamp_ms) || 0} ms · ${frame.status || "unknown"}`);
+      const frameStatus = STATUS_LABELS[frame.status] || frame.status || "未知状态";
+      appendText(card, "p", "perception-frame-meta", `${Number(frame.timestamp_ms) || 0} ms · ${frameStatus}`);
       const defect = frame.defect_detection || {};
       appendText(card, "p", "perception-detection-count", `检测数量：${Number(defect.detection_count) || 0}`);
       const detections = Array.isArray(defect.detections) ? defect.detections : [];
