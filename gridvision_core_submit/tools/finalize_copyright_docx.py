@@ -7,8 +7,8 @@ import shutil
 import sys
 from pathlib import Path
 
-SRC = Path(r"D:\Desktop\川大\科研\GridVision_软件著作权代码最终提交版_Consolas版.docx")
-DST = Path(r"D:\Desktop\川大\科研\GridVision_软件著作权代码最终版.docx")
+SRC = Path("GridVision_软件著作权代码最终提交版_Consolas版.docx")
+DST = Path("GridVision_软件著作权代码最终版.docx")
 
 FORBIDDEN_PHRASES = (
     "源文件:",

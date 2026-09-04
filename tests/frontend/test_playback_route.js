@@ -10,7 +10,6 @@ const root = path.resolve(__dirname, "..", "..");
 const appPath = path.join(root, "web", "static", "app.js");
 const playbackPath = path.join(root, "web", "static", "playback.js");
 const indexPath = path.join(root, "web", "index.html");
-const dashboardPath = path.join(root, "result", "web_app", "latest_dashboard.json");
 
 function loadProductionRouteFunctions() {
   const source = fs.readFileSync(appPath, "utf8");
@@ -74,6 +73,46 @@ function frameDistance(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
+function makePointAccessDashboard() {
+  const points = Array.from({ length: 13 }, (_, index) => {
+    const number = index + 1;
+    const pointId = `IP_${String(number).padStart(4, "0")}`;
+    const route = number === 7 ? [60, 10] : [number * 10 - 10, 0];
+    return {
+      point_id: pointId,
+      raw_x: route[0],
+      raw_y: route[1],
+      x: route[0],
+      y: route[1],
+      route_visit_coord: route,
+      segment_id: number <= 6 ? "seg_0000" : number === 7 ? "seg_0001" : "seg_0002",
+      edge_id: "PL_000",
+    };
+  });
+  return {
+    markers: { start: { x: -10, y: 0 } },
+    inspection_points: points,
+    segments: [
+      { segment_id: "seg_0000", type: "inspect", edge_id: "PL_000", geometry_2d: [[0, 0], [60, 0]], length: 60 },
+      {
+        segment_id: "seg_0001",
+        type: "connect",
+        connect_mode: "free_flight",
+        planner: "euclidean",
+        reason: "point_access",
+        fallback_reason: null,
+        inspection_point_id: "IP_0007",
+        physical_id: "PL_000",
+        anchor_coord: [60, 0],
+        raw_coord: [60, 10],
+        geometry_2d: [[60, 0], [60, 10], [60, 0]],
+        length: 20,
+      },
+      { segment_id: "seg_0002", type: "inspect", edge_id: "PL_000", geometry_2d: [[60, 0], [120, 0]], length: 60 },
+    ],
+  };
+}
+
 function testNearestProjection(projectPointOnPolyline) {
   const geometry = [[0, 0], [10, 0], [10, 100], [30, 100]];
   const projected = projectPointOnPolyline(25, 101, geometry);
@@ -84,7 +123,7 @@ function testNearestProjection(projectPointOnPolyline) {
 }
 
 function testChengduRoute(buildMissionRouteSequence, context) {
-  const dashboard = JSON.parse(fs.readFileSync(dashboardPath, "utf8"));
+  const dashboard = makePointAccessDashboard();
   const beforeHash = segmentBusinessHash(dashboard);
   const beforeSegments = JSON.stringify(dashboard.segments);
   const rows = dashboard.inspection_points.map((point, missionIndex) => {
@@ -105,28 +144,37 @@ function testChengduRoute(buildMissionRouteSequence, context) {
     assert.ok(bindings.some((point) => point.point_id === pointId), `${pointId} missing from playback lookup`);
   });
 
-  const expectedRoutes = new Map([
-    ["IP_0005", [276, 216]],
-    ["IP_0007", [1189, 509]],
-    ["IP_0012", [1111, 775]],
-  ]);
+  const expectedRoutes = new Map(
+    dashboard.inspection_points.map((point) => [point.point_id, point.route_visit_coord])
+  );
   expectedRoutes.forEach(([x, y], pointId) => {
     const binding = bindings.find((point) => point.point_id === pointId);
     assert.ok(Math.abs(binding.x - x) <= 1 && Math.abs(binding.y - y) <= 1,
-      `${pointId} must use snapped/projected route coordinate`);
+      `${pointId} must use its authoritative Mission route coordinate`);
     const frameIndex = byId.get(pointId)[0];
     const frame = sequence[frameIndex];
     assert.ok(Math.abs(frame.x - x) <= 1 && Math.abs(frame.y - y) <= 1);
-    if (frameIndex > 0) assert.ok(frameDistance(sequence[frameIndex - 1], frame) <= 5,
-      `${pointId} still jumps in from off-route evidence coordinate`);
-    if (frameIndex + 1 < sequence.length) assert.ok(frameDistance(frame, sequence[frameIndex + 1]) <= 5,
-      `${pointId} still jumps back from off-route evidence coordinate`);
   });
 
   const frame10 = byId.get("IP_0010")[0];
   const frame12 = byId.get("IP_0012")[0];
-  assert.equal(frame10, frame12, "IP_0010/IP_0012 must share one physical route frame");
-  assert.deepEqual(Array.from(sequence[frame10].routePointIds).sort(), ["IP_0010", "IP_0012"]);
+  assert.notEqual(frame10, frame12, "IP_0010/IP_0012 must retain distinct visit frames");
+  assert.deepEqual(Array.from(sequence[frame10].routePointIds), ["IP_0010"]);
+  assert.deepEqual(Array.from(sequence[frame12].routePointIds), ["IP_0012"]);
+
+  const accessFrame = sequence[byId.get("IP_0007")[0]];
+  assert.deepEqual([accessFrame.x, accessFrame.y], [60, 10], "IP_0007 must visit the raw point-access vertex");
+  const accessFrameIndex = byId.get("IP_0007")[0];
+  assert.deepEqual(
+    [sequence[accessFrameIndex - 1].x, sequence[accessFrameIndex - 1].y],
+    [60, 0],
+    "point access must enter from its declared anchor"
+  );
+  assert.deepEqual(
+    [sequence[accessFrameIndex + 1].x, sequence[accessFrameIndex + 1].y],
+    [60, 0],
+    "point access must return to its declared anchor"
+  );
 
   // Speed changes scheduling only; coordinates and point-frame mapping do not
   // depend on playback speed.

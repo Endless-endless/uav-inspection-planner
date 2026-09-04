@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import Counter, defaultdict, deque
 
-CONNECT_CLASSES = {"topology", "free_flight_between_components", "free_flight_endpoint_access", "unexpected_fallback", "unknown"}
+CONNECT_CLASSES = {"topology", "free_flight_between_components", "free_flight_endpoint_access", "point_access", "unexpected_fallback", "unknown"}
 
 def physical_ids(mission):
     return {str(s["edge_id"]) for s in mission.get("segments", []) if s.get("type") == "inspect" and s.get("edge_id")}
@@ -75,6 +75,8 @@ def physical_identity_map(mission):
 
 def classify_connect(segment, identity):
     """Classify by endpoint role and explicit topology provenance, not straightness."""
+    if segment.get("reason") == "point_access":
+        return "point_access", "explicit raw inspection-point access"
     if segment.get("role") in {"from_start", "to_end"}:
         return "free_flight_endpoint_access", "start/end network access"
     src, dst = segment.get("from_edge_id"), segment.get("to_edge_id")

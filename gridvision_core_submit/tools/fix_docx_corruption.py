@@ -10,7 +10,7 @@ from pathlib import Path
 
 from docx import Document
 
-DOCX = Path(r"D:\Desktop\川大\科研\GridVision_软件著作权代码最终版.docx")
+DOCX = Path("GridVision_软件著作权代码最终版.docx")
 SUBMIT = Path(__file__).resolve().parents[1]
 REPAIRS: list[dict] = []
 

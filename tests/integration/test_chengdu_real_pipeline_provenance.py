@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+import app as app_module
 from core.topo_plan import export_grouped_mission_to_json
 from planner.mission_result_builder import build_dashboard_from_mission_json
 from planner.powerline_planner_v3_final import PowerlinePlannerV3
@@ -11,7 +12,7 @@ from tests.helpers.replan_diagnostics import classify_mission_connects, physical
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_PRE_FIX_BUSINESS_HASH = "aa1ae3f3789864d76f76783d96ab47135ed062e9f87e58fe3b0e23e8ead6c8f1"
+EXPECTED_POINT_ACCESS_BUSINESS_HASH = "8c5b3835ab4b37598bff17d7394c5bfb8cc401c5b86e23bffc268d82275b4550"
 PROVENANCE_FIELDS = (
     "connect_mode",
     "planner",
@@ -56,9 +57,16 @@ def _business_hash(mission):
 
 def _run_chengdu_image_pipeline(output_path: Path):
     """Run the production image-planning steps without demo.main's real-result cleanup."""
+    line_image = PROJECT_ROOT / "data" / "chengdu_real_line.png"
     point_image = PROJECT_ROOT / "data" / "chengdu_real_point.png"
     planner = PowerlinePlannerV3(
-        image_path=str(point_image), flight_height=30, weather_scene="calm"
+        image_path=str(line_image),
+        point_image_path=str(point_image),
+        image_alignment=app_module.resolve_image_dataset_profile(
+            "data/chengdu_real_point.png"
+        )["alignment"],
+        flight_height=30,
+        weather_scene="calm",
     )
     planner.inspection_point_source = "image"
     planner.step1_extract_redline_hsv()
@@ -93,6 +101,7 @@ def _run_chengdu_image_pipeline(output_path: Path):
         "image_height": planner.height,
         "image_inspection_overlay": planner.image_inspection_overlay,
         "image_detection_stats": planner.image_detection_stats,
+        "image_alignment": planner.image_alignment_metadata,
         "dataset_type": "real_satellite",
     }
     export_grouped_mission_to_json(
@@ -173,10 +182,11 @@ def test_chengdu_real_image_pipeline_persists_identity_and_provenance(
 
     counts, evidence = classify_mission_connects(mission)
     business_hash = _business_hash(mission)
-    assert business_hash == EXPECTED_PRE_FIX_BUSINESS_HASH
+    assert business_hash == EXPECTED_POINT_ACCESS_BUSINESS_HASH
     assert counts == {
-        "topology": 4,
-        "free_flight_between_components": 3,
+        "topology": 3,
+        "free_flight_between_components": 2,
+        "point_access": 1,
     }, evidence
     assert not topology_without_edges
     assert not component_mode_conflicts
@@ -204,11 +214,11 @@ def test_chengdu_real_image_pipeline_persists_identity_and_provenance(
     print("PHYSICAL_TASK_REGISTRY", json.dumps(registry, ensure_ascii=False, sort_keys=True))
     print("CONNECT_ROWS", json.dumps(connect_rows, ensure_ascii=False, sort_keys=True))
     print("CONNECT_COUNTS", json.dumps({key: counts[key] for key in (
-        "topology", "free_flight_between_components", "free_flight_endpoint_access",
+        "topology", "free_flight_between_components", "free_flight_endpoint_access", "point_access",
         "unexpected_fallback", "unknown"
     )}, sort_keys=True))
     print("TOPOLOGY_WITHOUT_EDGE_EVIDENCE", json.dumps(topology_without_edges))
     print("COMPONENT_MODE_CONFLICTS", json.dumps(component_mode_conflicts))
     print("BUSINESS_HASH", business_hash)
-    print("EXPECTED_PRE_FIX_BUSINESS_HASH", EXPECTED_PRE_FIX_BUSINESS_HASH)
+    print("EXPECTED_POINT_ACCESS_BUSINESS_HASH", EXPECTED_POINT_ACCESS_BUSINESS_HASH)
     print("REAL_RESULT_CHANGED_COUNT", 0)

@@ -6,8 +6,8 @@ import re
 from pathlib import Path
 from docx import Document
 
-DOCX = Path(r"D:\Desktop\川大\科研\GridVision_软件著作权代码最终版.docx")
-ORIG = Path(r"D:\Desktop\川大\科研\GridVision_软件著作权代码最终提交版_Consolas版.docx")
+DOCX = Path("GridVision_软件著作权代码最终版.docx")
+ORIG = Path("GridVision_软件著作权代码最终提交版_Consolas版.docx")
 
 CLEAN_ROOT = Path(__file__).resolve().parents[1] / "clean"
 

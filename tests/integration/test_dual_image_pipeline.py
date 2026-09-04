@@ -20,8 +20,8 @@ from planner.replan_start_end import build_start_end_replan_mission
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 START_XY = [137.0, 1049.0]
 END_XY = [1264.0, 287.0]
-PRE_IDENTITY_FIX_A_GEOMETRY_HASH = "fe3165191af043485b3cb1d8839e826d140fec77937c51c1d289220213710d27"
-PRE_IDENTITY_FIX_B_GEOMETRY_HASH = "53335be7e64ed89205e83ba1c3e0a3ec05d08d14b6a4bd52e0be00bd2da5e7ea"
+POINT_ACCESS_A_GEOMETRY_HASH = "e4694a028b5a866763ced25af69c5060cc4b3f3d3e7a3a8a229b52386a8908c1"
+POINT_ACCESS_B_GEOMETRY_HASH = "3b08225ed5930c0313b266e0b245adfc2b8a03119d9efb93e70c05f7ece692c7"
 
 
 def _tree_hashes(root: Path):
@@ -289,6 +289,31 @@ def test_full_chengdu_dual_image_pipeline_visits_restored_points(tmp_path, monke
     assert by_id["IP_0005"]["snapped_coord"] != [276.0, 216.0]
     assert by_id["IP_0012"]["snapped_coord"] != [1111.0, 775.0]
 
+    access_segments = [
+        segment for segment in mission["segments"]
+        if segment.get("reason") == "point_access"
+    ]
+    assert len(access_segments) == 1
+    access = access_segments[0]
+    assert access["inspection_point_id"] == "IP_0007"
+    assert access["physical_id"] == "PL_000"
+    assert access["connect_mode"] == "free_flight"
+    assert access["planner"] == "euclidean"
+    assert access["fallback_reason"] is None
+    assert access["geometry_2d"][0] == access["anchor_coord"]
+    assert access["geometry_2d"][1] == pytest.approx(by_id["IP_0007"]["raw_coord"])
+    assert access["geometry_2d"][2] == access["anchor_coord"]
+    assert access["raw_coord"] == pytest.approx(by_id["IP_0007"]["raw_coord"])
+    assert access["length"] == pytest.approx(
+        sum(
+            math.dist(left, right)
+            for left, right in zip(access["geometry_2d"], access["geometry_2d"][1:])
+        )
+    )
+    assert len(mission["segments"]) == 13
+    assert sum(segment["type"] == "inspect" for segment in mission["segments"]) == 7
+    assert sum(segment["type"] == "connect" for segment in mission["segments"]) == 6
+
     inspect_segments = [segment for segment in mission["segments"] if segment["type"] == "inspect"]
     distances = {
         point_id: min(
@@ -299,6 +324,16 @@ def test_full_chengdu_dual_image_pipeline_visits_restored_points(tmp_path, monke
     }
     assert distances["IP_0005"] <= 3.0
     assert distances["IP_0012"] <= 3.0
+    mission_distances = {
+        point_id: min(
+            _point_to_polyline_distance(
+                by_id[point_id]["raw_coord"], segment["geometry_2d"]
+            )
+            for segment in mission["segments"]
+        )
+        for point_id in by_id
+    }
+    assert mission_distances["IP_0007"] <= 1e-6
     for left, right in zip(mission["segments"], mission["segments"][1:]):
         assert np.allclose(left["geometry_2d"][-1], right["geometry_2d"][0], atol=1e-6)
 
@@ -311,13 +346,30 @@ def test_full_chengdu_dual_image_pipeline_visits_restored_points(tmp_path, monke
         assert dashboard_segment["type"] == mission_segment["type"]
         assert dashboard_segment["geometry_2d"] == mission_segment["geometry_2d"]
         assert dashboard_segment["length"] == mission_segment["length"]
+    dashboard_access = next(
+        segment for segment in dashboard["segments"]
+        if segment.get("reason") == "point_access"
+    )
+    for field in (
+        "inspection_point_id", "physical_id", "anchor_coord", "raw_coord",
+        "geometry_2d", "length", "connect_mode", "planner", "reason",
+        "fallback_reason",
+    ):
+        assert dashboard_access[field] == access[field]
+    dashboard_points = {
+        point["point_id"]: point for point in dashboard["inspection_points"]
+    }
+    assert dashboard_points["IP_0007"]["segment_id"] == dashboard_access["segment_id"]
+    assert dashboard_points["IP_0007"]["route_visit_coord"] == pytest.approx(
+        by_id["IP_0007"]["raw_coord"]
+    )
     assert {
         point["point_id"]: [point["raw_x"], point["raw_y"]]
         for point in dashboard["inspection_points"]
     } == {
         point_id: row["raw_coord"] for point_id, row in by_id.items()
     }
-    assert _geometry_business_hash(mission) == PRE_IDENTITY_FIX_A_GEOMETRY_HASH
+    assert _geometry_business_hash(mission) == POINT_ACCESS_A_GEOMETRY_HASH
 
     context = build_mission_context(
         mission,
@@ -341,6 +393,24 @@ def test_full_chengdu_dual_image_pipeline_visits_restored_points(tmp_path, monke
     }
     assert rows_b["IP_0012"]["raw"] == pytest.approx([1293.46, 855.54], abs=0.1)
     assert rows_b["IP_0007"]["raw"] == pytest.approx([1139.42, 521.37], abs=0.6)
+    access_segments_b = [
+        segment for segment in mission_b["segments"]
+        if segment.get("reason") == "point_access"
+    ]
+    assert len(access_segments_b) == 1
+    access_b = access_segments_b[0]
+    assert access_b["inspection_point_id"] == "IP_0007"
+    assert access_b["geometry_2d"][1] == pytest.approx(rows_b["IP_0007"]["raw"])
+    assert access_b["length"] == pytest.approx(
+        sum(
+            math.dist(left, right)
+            for left, right in zip(access_b["geometry_2d"], access_b["geometry_2d"][1:])
+        )
+    )
+    assert all(
+        np.allclose(left["geometry_2d"][-1], right["geometry_2d"][0], atol=1e-6)
+        for left, right in zip(mission_b["segments"], mission_b["segments"][1:])
+    )
     assert {
         point["point_id"]: point["image_url"]
         for point in dashboard_b["inspection_points"]
@@ -348,7 +418,7 @@ def test_full_chengdu_dual_image_pipeline_visits_restored_points(tmp_path, monke
         point_id: f"/api/inspection-image/{point_id}.jpg"
         for point_id in rows_b
     }
-    assert _geometry_business_hash(mission_b) == PRE_IDENTITY_FIX_B_GEOMETRY_HASH
+    assert _geometry_business_hash(mission_b) == POINT_ACCESS_B_GEOMETRY_HASH
     after = {str(path): _tree_hashes(path) for path in protected}
     assert after == before
     print("DUAL_IMAGE_COUNTS", json.dumps({
