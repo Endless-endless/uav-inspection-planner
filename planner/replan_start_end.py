@@ -591,19 +591,26 @@ def _topo_pixel_polyline_for_edge(base_mission: Dict[str, Any], eid: str) -> Opt
 
 
 def _baseline_inspect_polyline_for_edge(base_mission: Dict[str, Any], eid: str) -> Optional[List[Point]]:
-    """baseline 中该 edge 最长的一条 inspect geometry。"""
-    best: Optional[List[Point]] = None
-    best_len = -1.0
+    """Reassemble an inspect polyline split by explicit point-access segments."""
+    parts: List[List[Point]] = []
     for seg in base_mission.get("segments", []) or []:
         if seg.get("type") != "inspect" or str(seg.get("edge_id")) != str(eid):
             continue
         geom = seg.get("geometry_2d") or []
         poly = [(float(p[0]), float(p[1])) for p in geom if len(p) >= 2]
-        ln = _path_length(poly)
-        if len(poly) >= 2 and ln > best_len:
-            best_len = ln
-            best = poly
-    return best
+        if len(poly) >= 2:
+            parts.append(poly)
+    if not parts:
+        return None
+    merged = list(parts[0])
+    for part in parts[1:]:
+        if _dist(merged[-1], part[0]) <= 1e-6:
+            merged.extend(part[1:])
+        elif _dist(merged[-1], part[-1]) <= 1e-6:
+            merged.extend(reversed(part[:-1]))
+        else:
+            return max(parts, key=_path_length)
+    return merged
 
 
 def _reference_polyline_for_edge(
@@ -612,6 +619,14 @@ def _reference_polyline_for_edge(
     edge_task_map: Optional[Dict[str, EdgeTask]],
 ) -> Optional[List[Point]]:
     """EdgeTask 像素折线 → topo_edges_pixel → baseline inspect。"""
+    baseline = _baseline_inspect_polyline_for_edge(base_mission, eid)
+    has_point_access = any(
+        segment.get("reason") == "point_access"
+        and str(segment.get("physical_id")) == str(eid)
+        for segment in base_mission.get("segments", []) or []
+    )
+    if has_point_access and baseline and len(baseline) >= 2:
+        return baseline
     if edge_task_map and eid in edge_task_map:
         from core.image_pixel_coords import edge_pixel_polyline
 
@@ -621,7 +636,7 @@ def _reference_polyline_for_edge(
     pl_topo = _topo_pixel_polyline_for_edge(base_mission, eid)
     if pl_topo and len(pl_topo) >= 2:
         return pl_topo
-    return _baseline_inspect_polyline_for_edge(base_mission, eid)
+    return baseline
 
 
 def _candidate_edge_ids_ordered(base_mission: Dict[str, Any]) -> List[str]:
@@ -665,7 +680,13 @@ def _extract_inspect_tasks(
     edge_points: Dict[str, List[Point]] = {}
     for pt in base_mission.get("inspection_points", []) or []:
         eid = pt.get("edge_id")
-        pos = pt.get("pixel_position") or [pt.get("x"), pt.get("y")]
+        detection = pt.get("detection_result") or {}
+        pos = (
+            detection.get("snapped_coord")
+            or pt.get("snapped_coord")
+            or pt.get("pixel_position")
+            or [pt.get("x"), pt.get("y")]
+        )
         if not eid or not pos or len(pos) < 2:
             continue
         edge_points.setdefault(str(eid), []).append((float(pos[0]), float(pos[1])))
@@ -1660,14 +1681,6 @@ def build_start_end_replan_mission(
             "Failed to connect final path to end point"
         )
 
-    inspect_len = sum(
-        s["length"] for s in segments_out if s["type"] == "inspect"
-    )
-    connect_len = sum(
-        s["length"] for s in segments_out if s["type"] == "connect"
-    )
-    total_len = inspect_len + connect_len
-
     base_meta = copy.deepcopy(base_mission.get("metadata") or {})
     ctx = mission_context or {}
     planning_points, resolved_source = _resolve_replan_inspection_points(
@@ -1678,8 +1691,15 @@ def build_start_end_replan_mission(
         spacing=spacing,
         mission_context=ctx,
     )
+    point_access_count = 0
     if is_image_inspection_source(resolved_source):
+        from planner.image_point_access import apply_to_json_segments
+
         resolved_source = "image"
+        segments_out, point_access_count = apply_to_json_segments(
+            segments_out,
+            planning_points,
+        )
         # 底图路径以 baseline 为准，禁止用 planning ctx 覆盖为 test.png 等默认图
         if ctx.get("image_detection_stats") and not base_meta.get("image_detection_stats"):
             base_meta["image_detection_stats"] = copy.deepcopy(ctx.get("image_detection_stats"))
@@ -1689,6 +1709,14 @@ def build_start_end_replan_mission(
     else:
         resolved_source = "spacing"
     base_meta["inspection_point_source"] = resolved_source
+
+    inspect_len = sum(
+        s["length"] for s in segments_out if s["type"] == "inspect"
+    )
+    connect_len = sum(
+        s["length"] for s in segments_out if s["type"] == "connect"
+    )
+    total_len = inspect_len + connect_len
 
     base_stats = copy.deepcopy(base_mission.get("statistics") or {})
 
@@ -1746,6 +1774,7 @@ def build_start_end_replan_mission(
             "topo_reload_image": image_rel,
             "topo_reload_source": src_for_topo,
             "topo_missing_edges": missing_topo_edges[:32],
+            "point_access_count": point_access_count,
         },
     }
     if is_image_inspection_source(resolved_source):

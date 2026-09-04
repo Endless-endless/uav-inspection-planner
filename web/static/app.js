@@ -1893,6 +1893,10 @@ function projectPointOnPolyline(px, py, geom) {
 }
 
 function preferredPlaybackPointXY(point, fallback) {
+  const routeVisit = point?.route_visit_coord;
+  const rvx = Array.isArray(routeVisit) ? Number(routeVisit[0]) : NaN;
+  const rvy = Array.isArray(routeVisit) ? Number(routeVisit[1]) : NaN;
+  if (Number.isFinite(rvx) && Number.isFinite(rvy)) return { x: rvx, y: rvy };
   const snapped = point?.snapped_coord;
   const sx = point?.snapped_x ?? (Array.isArray(snapped) ? snapped[0] : null);
   const sy = point?.snapped_y ?? (Array.isArray(snapped) ? snapped[1] : null);
@@ -2105,6 +2109,10 @@ function buildMissionRouteSequence(mission, rowsWithXY) {
   const sy = Number(markers.start?.y ?? meta.start?.y ?? meta.start_point?.y);
   const segments = mission?.segments || [];
   const dist2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const isPointAccessSegment = (seg) =>
+    seg?.type === "connect" &&
+    seg?.reason === "point_access" &&
+    Boolean(seg?.inspection_point_id);
 
   const inspectPoints = [];
   (rowsWithXY || []).forEach((r, i) => {
@@ -2135,7 +2143,9 @@ function buildMissionRouteSequence(mission, rowsWithXY) {
       }
     }
     const boundSegment = segments.find(
-      (seg) => String(seg.segment_id || "") === boundSeg && seg.type === "inspect"
+      (seg) =>
+        String(seg.segment_id || "") === boundSeg &&
+        (seg.type === "inspect" || isPointAccessSegment(seg))
     );
     const routeXY = projectPlaybackPointToSegment(p, r, boundSegment);
     inspectPoints.push({
@@ -2204,7 +2214,7 @@ function buildMissionRouteSequence(mission, rowsWithXY) {
           : String(seg.type || "move");
     const edgeId = seg.edge_id != null ? String(seg.edge_id) : null;
 
-    if (stype === "inspect") {
+    if (stype === "inspect" || isPointAccessSegment(seg)) {
       const segStartIdx = sequence.length;
       const expanded = expandInspectSegmentByArc(
         seg,

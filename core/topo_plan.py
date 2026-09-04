@@ -19,6 +19,7 @@ Phase 1特点：
 """
 
 from typing import List, Dict, Tuple, Optional, Set
+import math
 import numpy as np
 from collections import deque
 import re
@@ -1260,6 +1261,11 @@ class MissionSegment:
     topo_edge_ids: List[str] = field(default_factory=list)
     from_component_ids: List[int] = field(default_factory=list)
     to_component_ids: List[int] = field(default_factory=list)
+    inspection_point_id: Optional[str] = None
+    physical_id: Optional[str] = None
+    anchor_coord: Optional[Tuple[float, float]] = None
+    raw_coord: Optional[Tuple[float, float]] = None
+    trigger_distance_px: Optional[float] = None
 
     def summary(self) -> str:
         """摘要信息"""
@@ -4501,6 +4507,7 @@ def export_grouped_mission_to_json(
 
     # 5. Mission Segments
     segments_data = []
+    point_access_segment_by_id = {}
     for i, segment in enumerate(mission.segments):
         # 确保 geometry 被正确处理
         geometry_2d = []
@@ -4518,6 +4525,11 @@ def export_grouped_mission_to_json(
             "direction": segment.direction,
             "geometry_2d": geometry_2d
         }
+        if getattr(segment, "reason", None) == "point_access":
+            segment_data["length"] = float(sum(
+                math.hypot(b[0] - a[0], b[1] - a[1])
+                for a, b in zip(geometry_2d, geometry_2d[1:])
+            ))
         if segment.type == "inspect" and segment.edge_id:
             segment_data["physical_id"] = str(segment.edge_id)
         if segment.type == "connect":
@@ -4532,6 +4544,27 @@ def export_grouped_mission_to_json(
                 "from_component_ids": sorted({int(x) for x in (getattr(segment, "from_component_ids", None) or [])}),
                 "to_component_ids": sorted({int(x) for x in (getattr(segment, "to_component_ids", None) or [])}),
             })
+            for key in (
+                "inspection_point_id",
+                "physical_id",
+                "anchor_coord",
+                "raw_coord",
+                "trigger_distance_px",
+            ):
+                value = getattr(segment, key, None)
+                if value is not None:
+                    segment_data[key] = (
+                        [float(value[0]), float(value[1])]
+                        if key in {"anchor_coord", "raw_coord"}
+                        else value
+                    )
+            if (
+                segment_data.get("reason") == "point_access"
+                and segment_data.get("inspection_point_id")
+            ):
+                point_access_segment_by_id[
+                    str(segment_data["inspection_point_id"])
+                ] = segment_data["segment_id"]
 
         # 添加 group_id
         if segment.edge_id and segment.edge_id in mission.edge_to_group:
@@ -4700,6 +4733,49 @@ def export_grouped_mission_to_json(
                 "status": status,
                 "source_reason": source_reason
             }
+            access_segment_id = point_access_segment_by_id.get(stable_point_id)
+            if access_segment_id:
+                point_data["segment_id"] = access_segment_id
+                point_data["route_visit_coord"] = [
+                    round(float(raw_for_identity[0]), 2),
+                    round(float(raw_for_identity[1]), 2),
+                ]
+            else:
+                snapped_for_route = (
+                    (detection_result or {}).get("snapped_coord")
+                    if isinstance(detection_result, dict)
+                    else None
+                ) or pixel_pos
+                matching_segments = [
+                    row for row in segments_data
+                    if row.get("type") == "inspect"
+                    and str(row.get("edge_id")) == str(point_edge_id)
+                ]
+                if matching_segments:
+                    route_x, route_y = float(snapped_for_route[0]), float(snapped_for_route[1])
+
+                    def _distance_to_exported_segment(row):
+                        geom = row.get("geometry_2d") or []
+                        best = float("inf")
+                        for a, b in zip(geom, geom[1:]):
+                            ax, ay = float(a[0]), float(a[1])
+                            bx, by = float(b[0]), float(b[1])
+                            dx, dy = bx - ax, by - ay
+                            denom = dx * dx + dy * dy
+                            t = 0.0 if denom <= 1e-12 else max(
+                                0.0,
+                                min(1.0, ((route_x - ax) * dx + (route_y - ay) * dy) / denom),
+                            )
+                            best = min(
+                                best,
+                                math.hypot(route_x - (ax + t * dx), route_y - (ay + t * dy)),
+                            )
+                        return best
+
+                    point_data["segment_id"] = min(
+                        matching_segments,
+                        key=_distance_to_exported_segment,
+                    )["segment_id"]
             inspection_points_data.append(point_data)
 
     # 7. Full Path

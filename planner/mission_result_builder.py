@@ -227,13 +227,19 @@ def _segment_to_dict(seg: Any, index: int) -> Dict[str, Any]:
         "edge_id": getattr(seg, "edge_id", None),
         "from_edge_id": getattr(seg, "from_edge_id", None),
         "to_edge_id": getattr(seg, "to_edge_id", None),
-        "length": round(float(getattr(seg, "length", 0.0) or 0.0), 2),
+        "length": (
+            float(getattr(seg, "length", 0.0) or 0.0)
+            if getattr(seg, "reason", None) == "point_access"
+            else round(float(getattr(seg, "length", 0.0) or 0.0), 2)
+        ),
         "direction": getattr(seg, "direction", None),
         "geometry_2d": geom_2d,
     }
     for key in (
         "physical_id", "connect_mode", "planner", "reason", "fallback_reason",
         "topo_edge_ids", "from_component_ids", "to_component_ids",
+        "inspection_point_id", "anchor_coord", "raw_coord",
+        "trigger_distance_px",
     ):
         value = getattr(seg, key, None)
         if value is not None:
@@ -484,6 +490,21 @@ def _collect_inspection_points(mission_result: Dict[str, Any]) -> List[Dict[str,
                     row["snap_distance_px"] = float(sdist)
                 except (TypeError, ValueError):
                     pass
+            detection = (
+                pt.get("detection_result")
+                if isinstance(pt, dict)
+                else (getattr(pt, "detection_result", None) or {})
+            ) or {}
+            route_visit = detection.get("route_visit_coord") if isinstance(detection, dict) else None
+            if isinstance(route_visit, (list, tuple)) and len(route_visit) >= 2:
+                row["route_visit_coord"] = [float(route_visit[0]), float(route_visit[1])]
+            for segment_index, segment in enumerate(getattr(mission, "segments", None) or []):
+                if (
+                    getattr(segment, "reason", None) == "point_access"
+                    and str(getattr(segment, "inspection_point_id", "")) == str(pid)
+                ):
+                    row["segment_id"] = f"seg_{segment_index:04d}"
+                    break
             points.append(row)
     return points
 
@@ -554,13 +575,19 @@ def _segments_from_json(data: Dict[str, Any]) -> List[Dict[str, Any]]:
             "edge_id": seg.get("edge_id"),
             "from_edge_id": seg.get("from_edge_id"),
             "to_edge_id": seg.get("to_edge_id"),
-            "length": round(float(seg.get("length", 0)), 2),
+            "length": (
+                float(seg.get("length", 0))
+                if seg.get("reason") == "point_access"
+                else round(float(seg.get("length", 0)), 2)
+            ),
             "direction": seg.get("direction"),
             "geometry_2d": seg.get("geometry_2d") or [],
         }
         for key in (
             "physical_id", "connect_mode", "planner", "reason", "fallback_reason",
             "topo_edge_ids", "from_component_ids", "to_component_ids",
+            "inspection_point_id", "anchor_coord", "raw_coord",
+            "trigger_distance_px",
         ):
             if key in seg:
                 item[key] = seg.get(key)
@@ -578,6 +605,54 @@ def _edge_to_segment_map(segments: List[Dict[str, Any]]) -> Dict[str, str]:
                 mapping[eid] = sid
             mapping[sid] = sid
     return mapping
+
+
+def _resolve_point_segment_id(
+    point: Dict[str, Any],
+    segments: List[Dict[str, Any]],
+    edge_map: Dict[str, str],
+) -> Optional[str]:
+    """Bind a point to its explicit access segment or nearest inspect split."""
+    explicit = str(point.get("segment_id") or "").strip()
+    if explicit and any(str(seg.get("segment_id") or "") == explicit for seg in segments):
+        return explicit
+
+    point_id = str(point.get("point_id") or point.get("id") or "").strip()
+    for segment in segments:
+        if (
+            segment.get("reason") == "point_access"
+            and str(segment.get("inspection_point_id") or "").strip() == point_id
+        ):
+            return str(segment.get("segment_id") or "") or None
+
+    route = point.get("route_visit_coord")
+    if not isinstance(route, (list, tuple)) or len(route) < 2:
+        route = point.get("snapped_coord")
+    if not isinstance(route, (list, tuple)) or len(route) < 2:
+        sx, sy = point.get("snapped_x"), point.get("snapped_y")
+        route = [sx, sy] if sx is not None and sy is not None else None
+    if not isinstance(route, (list, tuple)) or len(route) < 2:
+        route = [point.get("x"), point.get("y")]
+
+    try:
+        x, y = float(route[0]), float(route[1])
+    except (TypeError, ValueError, IndexError):
+        x = y = float("nan")
+
+    edge_id = str(point.get("edge_id") or "")
+    candidates = [
+        segment for segment in segments
+        if segment.get("type") == "inspect"
+        and str(segment.get("edge_id") or segment.get("physical_id") or "") == edge_id
+    ]
+    if candidates and math.isfinite(x) and math.isfinite(y):
+        return str(min(
+            candidates,
+            key=lambda segment: _point_segment_distance(
+                x, y, segment.get("geometry_2d") or []
+            ),
+        ).get("segment_id") or "") or None
+    return edge_map.get(edge_id) if edge_id else None
 
 
 def _scan_inspection_image_catalog(root: Optional[Path]) -> List[Dict[str, str]]:
@@ -644,10 +719,10 @@ def enrich_inspection_points_for_dashboard(
         "snapped_y",
         "raw_coord",
         "snapped_coord",
+        "route_visit_coord",
     }
     for i, pt in enumerate(points):
         eid = pt.get("edge_id")
-        sid = pt.get("segment_id") or (edge_map.get(eid) if eid else None)
         normalized_pid = _normalize_dashboard_inspection_point_id(pt, i)
         identity_xy = (
             float(pt.get("raw_x", pt["x"])),
@@ -691,6 +766,10 @@ def enrich_inspection_points_for_dashboard(
         if sx is None and isinstance(sc, (list, tuple)) and len(sc) >= 2:
             sx = _finite_float(sc[0])
             sy = _finite_float(sc[1])
+        route_visit = pt.get("route_visit_coord")
+        if not isinstance(route_visit, (list, tuple)) or len(route_visit) < 2:
+            route_visit = None
+        sid = _resolve_point_segment_id(pt, segments, edge_map)
 
         meta_inner: Dict[str, Any] = {
             k: v
@@ -700,7 +779,7 @@ def enrich_inspection_points_for_dashboard(
         if sx is not None and sy is not None:
             meta_inner.setdefault("snapped_coord", [float(sx), float(sy)])
 
-        enriched.append({
+        enriched_point = {
             "id": normalized_pid,
             "point_id": normalized_pid,
             "x": x,
@@ -721,7 +800,13 @@ def enrich_inspection_points_for_dashboard(
             "status": status,
             "progress_index": i + 1,
             "metadata": meta_inner,
-        })
+        }
+        if route_visit is not None:
+            enriched_point["route_visit_coord"] = [
+                float(route_visit[0]),
+                float(route_visit[1]),
+            ]
+        enriched.append(enriched_point)
     return enriched
 
 
@@ -770,6 +855,12 @@ def _inspection_points_from_json(
             "raw_coord": dr.get("raw_coord") or list(display),
             "detection_valid": True,
         }
+        route_visit = pt.get("route_visit_coord") or dr.get("route_visit_coord")
+        if isinstance(route_visit, (list, tuple)) and len(route_visit) >= 2:
+            entry["route_visit_coord"] = [
+                float(route_visit[0]),
+                float(route_visit[1]),
+            ]
         if snapped is not None:
             entry["snapped_x"] = float(snapped[0])
             entry["snapped_y"] = float(snapped[1])

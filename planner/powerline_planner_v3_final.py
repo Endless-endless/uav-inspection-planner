@@ -3542,6 +3542,19 @@ class PowerlinePlannerV3:
                     if conn_improve > 0:
                         print(f"  [说明] 新算法未产生改进，保持旧算法")
 
+        if getattr(self, "inspection_point_source", "spacing") == "image":
+            from planner.image_point_access import (
+                POINT_ACCESS_TRIGGER_DISTANCE_PX,
+                apply_to_object_mission,
+            )
+
+            access_count = apply_to_object_mission(final_mission)
+            print(
+                "[point-access] "
+                f"triggered={access_count} "
+                f"source=image threshold_px={POINT_ACCESS_TRIGGER_DISTANCE_PX}"
+            )
+
         # 保存最终结果
         self.grouped_mission = final_mission
         self.global_optimized_mission = final_mission
